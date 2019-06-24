@@ -1,2 +1,0 @@
-# cr
-Automatically generated webrevs
