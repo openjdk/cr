@@ -1,0 +1,1450 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Frames modules/javafx.media/src/main/native/gstreamer/gstreamer-lite/gstreamer/plugins/elements/gsttypefindelement.c</title>
+    <link rel="stylesheet" href="../../../../../../../../../../style.css" />
+    <script type="text/javascript" src="../../../../../../../../../../navigation.js"></script>
+  </head>
+<body onkeypress="keypress(event);">
+<a name="0"></a>
+<hr />
+<pre>   1 /* GStreamer
+   2  * Copyright (C) 2003 Benjamin Otte &lt;in7y118@public.uni-hamburg.de&gt;
+   3  *
+   4  * gsttypefindelement.c: element that detects type of stream
+   5  *
+   6  * This library is free software; you can redistribute it and/or
+   7  * modify it under the terms of the GNU Library General Public
+   8  * License as published by the Free Software Foundation; either
+   9  * version 2 of the License, or (at your option) any later version.
+  10  *
+  11  * This library is distributed in the hope that it will be useful,
+  12  * but WITHOUT ANY WARRANTY; without even the implied warranty of
+  13  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+  14  * Library General Public License for more details.
+  15  *
+  16  * You should have received a copy of the GNU Library General Public
+  17  * License along with this library; if not, write to the
+  18  * Free Software Foundation, Inc., 51 Franklin St, Fifth Floor,
+  19  * Boston, MA 02110-1301, USA.
+  20  */
+  21 /**
+  22  * SECTION:element-typefind
+  23  * @title: typefind
+  24  *
+  25  * Determines the media-type of a stream. It applies typefind functions in the
+  26  * order of their rank. Once the type has been detected it sets its src pad caps
+  27  * to the found media type.
+  28  *
+  29  * Whenever a type is found the #GstTypeFindElement::have-type signal is
+  30  * emitted, either from the streaming thread or the application thread
+  31  * (the latter may happen when typefinding is done pull-based from the
+  32  * state change function).
+  33  *
+  34  * Plugins can register custom typefinders by using #GstTypeFindFactory.
+  35  */
+  36 
+  37 /* FIXME: need a better solution for non-seekable streams */
+  38 
+  39 /* way of operation:
+  40  * 1) get a list of all typefind functions sorted best to worst
+  41  * 2) if all elements have been called with all requested data goto 8
+  42  * 3) call all functions once with all available data
+  43  * 4) if a function returns a value &gt;= PROP_MAXIMUM goto 8 (never implemented))
+  44  * 5) all functions with a result &gt; PROP_MINIMUM or functions that did not get
+  45  *    all requested data (where peek returned NULL) stay in list
+  46  * 6) seek to requested offset of best function that still has open data
+  47  *    requests
+  48  * 7) goto 2
+  49  * 8) take best available result and use its caps
+  50  *
+  51  * The element has two scheduling modes:
+  52  *
+  53  * 1) chain based, it will collect buffers and run the typefind function on
+  54  *    the buffer until something is found.
+  55  * 2) getrange based, it will proxy the getrange function to the sinkpad. It
+  56  *    is assumed that the peer element is happy with whatever format we
+  57  *    eventually read.
+  58  *
+  59  * By default it tries to do pull based typefinding (this avoids joining
+  60  * received buffers and holding them back in store.)
+  61  *
+  62  * When the element has no connected srcpad, and the sinkpad can operate in
+  63  * getrange based mode, the element starts its own task to figure out the
+  64  * type of the stream.
+  65  *
+  66  * Most of the actual implementation is in libs/gst/base/gsttypefindhelper.c.
+  67  */
+  68 
+  69 #ifdef HAVE_CONFIG_H
+  70 #  include &quot;config.h&quot;
+  71 #endif
+  72 
+  73 #include &quot;gst/gst_private.h&quot;
+  74 
+  75 #include &quot;gsttypefindelement.h&quot;
+  76 #include &quot;gst/gst-i18n-lib.h&quot;
+  77 #include &quot;gst/base/gsttypefindhelper.h&quot;
+  78 
+  79 #include &lt;gst/gsttypefind.h&gt;
+  80 #include &lt;gst/gstutils.h&gt;
+  81 #include &lt;gst/gsterror.h&gt;
+  82 
+  83 GST_DEBUG_CATEGORY_STATIC (gst_type_find_element_debug);
+  84 #define GST_CAT_DEFAULT gst_type_find_element_debug
+  85 
+  86 /* generic templates */
+  87 static GstStaticPadTemplate type_find_element_sink_template =
+  88 GST_STATIC_PAD_TEMPLATE (&quot;sink&quot;,
+  89     GST_PAD_SINK,
+  90     GST_PAD_ALWAYS,
+  91     GST_STATIC_CAPS_ANY);
+  92 
+  93 static GstStaticPadTemplate type_find_element_src_template =
+  94 GST_STATIC_PAD_TEMPLATE (&quot;src&quot;,
+  95     GST_PAD_SRC,
+  96     GST_PAD_ALWAYS,
+  97     GST_STATIC_CAPS_ANY);
+  98 
+  99 /* Require at least 2kB of data before we attempt typefinding in chain-mode.
+ 100  * 128kB is massive overkill for the maximum, but doesn&#39;t do any harm */
+ 101 #define TYPE_FIND_MIN_SIZE   (2*1024)
+ 102 #define TYPE_FIND_MAX_SIZE (128*1024)
+ 103 
+ 104 /* TypeFind signals and args */
+ 105 enum
+ 106 {
+ 107   HAVE_TYPE,
+ 108   LAST_SIGNAL
+ 109 };
+ 110 enum
+ 111 {
+ 112   PROP_0,
+ 113   PROP_CAPS,
+ 114   PROP_MINIMUM,
+ 115   PROP_FORCE_CAPS,
+ 116   PROP_LAST
+ 117 };
+ 118 enum
+ 119 {
+ 120   MODE_NORMAL,                  /* act as identity */
+ 121   MODE_TYPEFIND,                /* do typefinding  */
+ 122   MODE_ERROR                    /* had fatal error */
+ 123 };
+ 124 
+ 125 
+ 126 #define _do_init \
+ 127     GST_DEBUG_CATEGORY_INIT (gst_type_find_element_debug, &quot;typefind&quot;,           \
+ 128         GST_DEBUG_BG_YELLOW | GST_DEBUG_FG_GREEN, &quot;type finding element&quot;);
+ 129 #define gst_type_find_element_parent_class parent_class
+ 130 G_DEFINE_TYPE_WITH_CODE (GstTypeFindElement, gst_type_find_element,
+ 131     GST_TYPE_ELEMENT, _do_init);
+ 132 
+ 133 static void gst_type_find_element_dispose (GObject * object);
+ 134 static void gst_type_find_element_set_property (GObject * object,
+ 135     guint prop_id, const GValue * value, GParamSpec * pspec);
+ 136 static void gst_type_find_element_get_property (GObject * object,
+ 137     guint prop_id, GValue * value, GParamSpec * pspec);
+ 138 
+ 139 static gboolean gst_type_find_element_src_event (GstPad * pad,
+ 140     GstObject * parent, GstEvent * event);
+ 141 static gboolean gst_type_find_handle_src_query (GstPad * pad,
+ 142     GstObject * parent, GstQuery * query);
+ 143 
+ 144 static gboolean gst_type_find_element_sink_event (GstPad * pad,
+ 145     GstObject * parent, GstEvent * event);
+ 146 static gboolean gst_type_find_element_setcaps (GstTypeFindElement * typefind,
+ 147     GstCaps * caps);
+ 148 static GstFlowReturn gst_type_find_element_chain (GstPad * sinkpad,
+ 149     GstObject * parent, GstBuffer * buffer);
+ 150 static GstFlowReturn gst_type_find_element_getrange (GstPad * srcpad,
+ 151     GstObject * parent, guint64 offset, guint length, GstBuffer ** buffer);
+ 152 
+ 153 static GstStateChangeReturn
+ 154 gst_type_find_element_change_state (GstElement * element,
+ 155     GstStateChange transition);
+ 156 static gboolean gst_type_find_element_activate_sink (GstPad * pad,
+ 157     GstObject * parent);
+ 158 static gboolean gst_type_find_element_activate_sink_mode (GstPad * pad,
+ 159     GstObject * parent, GstPadMode mode, gboolean active);
+ 160 static gboolean gst_type_find_element_activate_src_mode (GstPad * pad,
+ 161     GstObject * parent, GstPadMode mode, gboolean active);
+ 162 static GstFlowReturn
+ 163 gst_type_find_element_chain_do_typefinding (GstTypeFindElement * typefind,
+ 164     gboolean check_avail, gboolean at_eos);
+ 165 static void gst_type_find_element_send_cached_events (GstTypeFindElement *
+ 166     typefind);
+ 167 
+ 168 static void gst_type_find_element_loop (GstPad * pad);
+ 169 
+ 170 static guint gst_type_find_element_signals[LAST_SIGNAL] = { 0 };
+ 171 
+ 172 static void
+ 173 gst_type_find_element_have_type (GstTypeFindElement * typefind,
+ 174     guint probability, GstCaps * caps)
+ 175 {
+ 176   GstEvent *event;
+ 177 
+ 178   g_assert (caps != NULL);
+ 179 
+ 180   GST_INFO_OBJECT (typefind, &quot;found caps %&quot; GST_PTR_FORMAT &quot;, probability=%u&quot;,
+ 181       caps, probability);
+ 182 
+ 183   /* Do nothing if downstream is pulling from us */
+ 184   if (GST_PAD_MODE (typefind-&gt;src) == GST_PAD_MODE_PULL)
+ 185     return;
+ 186 
+ 187   GST_OBJECT_LOCK (typefind);
+ 188 
+ 189   /* Now actually send the CAPS event downstream.
+ 190    *
+ 191    * Try to directly send the CAPS event downstream that we created in
+ 192    * gst_type_find_element_emit_have_type() if it is still there, instead
+ 193    * of creating a new one. No need to create an equivalent one, replacing
+ 194    * it in the sticky event list and possibly causing renegotiation
+ 195    */
+ 196   event = gst_pad_get_sticky_event (typefind-&gt;src, GST_EVENT_CAPS, 0);
+ 197   if (event) {
+ 198     GstCaps *event_caps;
+ 199 
+ 200     gst_event_parse_caps (event, &amp;event_caps);
+ 201     if (caps != event_caps) {
+ 202       gst_event_unref (event);
+ 203       event = gst_event_new_caps (caps);
+ 204     }
+ 205   } else {
+ 206     event = gst_event_new_caps (caps);
+ 207   }
+ 208 
+ 209   GST_OBJECT_UNLOCK (typefind);
+ 210 
+ 211   gst_pad_push_event (typefind-&gt;src, event);
+ 212 }
+ 213 
+ 214 static void
+ 215 gst_type_find_element_emit_have_type (GstTypeFindElement * typefind,
+ 216     guint probability, GstCaps * caps)
+ 217 {
+ 218   GstEvent *event;
+ 219 
+<a name="1" id="anc1"></a><span class="line-modified"> 220   /* Update caps field immediatly so that caps queries and properties can be</span>
+ 221    * honored in all &quot;have-type&quot; signal handlers.
+ 222    */
+ 223   GST_OBJECT_LOCK (typefind);
+<a name="2" id="anc2"></a><span class="line-modified"> 224   if (typefind-&gt;caps)</span>
+<span class="line-removed"> 225     gst_caps_unref (typefind-&gt;caps);</span>
+<span class="line-removed"> 226   typefind-&gt;caps = gst_caps_ref (caps);</span>
+ 227   GST_OBJECT_UNLOCK (typefind);
+ 228 
+ 229   /* Only store the caps event at this point. We give signal handlers
+ 230    * the chance to look at the caps before they are sent downstream.
+ 231    * They are only forwarded downstream later in the default signal
+ 232    * handler after all application signal handlers
+ 233    */
+ 234   event = gst_event_new_caps (caps);
+ 235   gst_pad_store_sticky_event (typefind-&gt;src, event);
+ 236   gst_event_unref (event);
+ 237 
+ 238   g_signal_emit (typefind, gst_type_find_element_signals[HAVE_TYPE], 0,
+ 239       probability, caps);
+ 240 }
+ 241 
+ 242 static void
+ 243 gst_type_find_element_class_init (GstTypeFindElementClass * typefind_class)
+ 244 {
+ 245   GObjectClass *gobject_class = G_OBJECT_CLASS (typefind_class);
+ 246   GstElementClass *gstelement_class = GST_ELEMENT_CLASS (typefind_class);
+ 247 
+ 248   gobject_class-&gt;set_property = gst_type_find_element_set_property;
+ 249   gobject_class-&gt;get_property = gst_type_find_element_get_property;
+ 250   gobject_class-&gt;dispose = gst_type_find_element_dispose;
+ 251 
+ 252   g_object_class_install_property (gobject_class, PROP_CAPS,
+ 253       g_param_spec_boxed (&quot;caps&quot;, _(&quot;caps&quot;),
+ 254           _(&quot;detected capabilities in stream&quot;), GST_TYPE_CAPS,
+ 255           G_PARAM_READABLE | G_PARAM_STATIC_STRINGS));
+ 256   g_object_class_install_property (gobject_class, PROP_MINIMUM,
+ 257       g_param_spec_uint (&quot;minimum&quot;, _(&quot;minimum&quot;),
+ 258           &quot;minimum probability required to accept caps&quot;, GST_TYPE_FIND_MINIMUM,
+ 259           GST_TYPE_FIND_MAXIMUM, GST_TYPE_FIND_MINIMUM,
+ 260           G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+ 261   g_object_class_install_property (gobject_class, PROP_FORCE_CAPS,
+ 262       g_param_spec_boxed (&quot;force-caps&quot;, _(&quot;force caps&quot;),
+ 263           _(&quot;force caps without doing a typefind&quot;), GST_TYPE_CAPS,
+ 264           G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+ 265   /**
+ 266    * GstTypeFindElement::have-type:
+ 267    * @typefind: the typefind instance
+ 268    * @probability: the probability of the type found
+ 269    * @caps: the caps of the type found
+ 270    *
+ 271    * This signal gets emitted when the type and its probability has
+ 272    * been found.
+ 273    */
+ 274   gst_type_find_element_signals[HAVE_TYPE] = g_signal_new (&quot;have-type&quot;,
+ 275       G_TYPE_FROM_CLASS (typefind_class), G_SIGNAL_RUN_LAST,
+ 276       G_STRUCT_OFFSET (GstTypeFindElementClass, have_type), NULL, NULL,
+ 277       g_cclosure_marshal_generic, G_TYPE_NONE, 2,
+ 278       G_TYPE_UINT, GST_TYPE_CAPS | G_SIGNAL_TYPE_STATIC_SCOPE);
+ 279 
+ 280   typefind_class-&gt;have_type =
+ 281       GST_DEBUG_FUNCPTR (gst_type_find_element_have_type);
+ 282 
+ 283   gst_element_class_set_static_metadata (gstelement_class,
+ 284       &quot;TypeFind&quot;,
+ 285       &quot;Generic&quot;,
+ 286       &quot;Finds the media type of a stream&quot;,
+ 287       &quot;Benjamin Otte &lt;in7y118@public.uni-hamburg.de&gt;&quot;);
+ 288   gst_element_class_add_static_pad_template (gstelement_class,
+ 289       &amp;type_find_element_src_template);
+ 290   gst_element_class_add_static_pad_template (gstelement_class,
+ 291       &amp;type_find_element_sink_template);
+ 292 
+ 293   gstelement_class-&gt;change_state =
+ 294       GST_DEBUG_FUNCPTR (gst_type_find_element_change_state);
+ 295 }
+ 296 
+ 297 static void
+ 298 gst_type_find_element_init (GstTypeFindElement * typefind)
+ 299 {
+ 300   /* sinkpad */
+ 301   typefind-&gt;sink =
+ 302       gst_pad_new_from_static_template (&amp;type_find_element_sink_template,
+ 303       &quot;sink&quot;);
+ 304 
+ 305   gst_pad_set_activate_function (typefind-&gt;sink,
+ 306       GST_DEBUG_FUNCPTR (gst_type_find_element_activate_sink));
+ 307   gst_pad_set_activatemode_function (typefind-&gt;sink,
+ 308       GST_DEBUG_FUNCPTR (gst_type_find_element_activate_sink_mode));
+ 309   gst_pad_set_chain_function (typefind-&gt;sink,
+ 310       GST_DEBUG_FUNCPTR (gst_type_find_element_chain));
+ 311   gst_pad_set_event_function (typefind-&gt;sink,
+ 312       GST_DEBUG_FUNCPTR (gst_type_find_element_sink_event));
+ 313   GST_PAD_SET_PROXY_ALLOCATION (typefind-&gt;sink);
+ 314   gst_element_add_pad (GST_ELEMENT (typefind), typefind-&gt;sink);
+ 315 
+ 316   /* srcpad */
+ 317   typefind-&gt;src =
+ 318       gst_pad_new_from_static_template (&amp;type_find_element_src_template, &quot;src&quot;);
+ 319 
+ 320   gst_pad_set_activatemode_function (typefind-&gt;src,
+ 321       GST_DEBUG_FUNCPTR (gst_type_find_element_activate_src_mode));
+ 322   gst_pad_set_getrange_function (typefind-&gt;src,
+ 323       GST_DEBUG_FUNCPTR (gst_type_find_element_getrange));
+ 324   gst_pad_set_event_function (typefind-&gt;src,
+ 325       GST_DEBUG_FUNCPTR (gst_type_find_element_src_event));
+ 326   gst_pad_set_query_function (typefind-&gt;src,
+ 327       GST_DEBUG_FUNCPTR (gst_type_find_handle_src_query));
+ 328   gst_pad_use_fixed_caps (typefind-&gt;src);
+ 329   gst_element_add_pad (GST_ELEMENT (typefind), typefind-&gt;src);
+ 330 
+ 331   typefind-&gt;mode = MODE_TYPEFIND;
+ 332   typefind-&gt;caps = NULL;
+ 333   typefind-&gt;min_probability = 1;
+ 334 
+ 335   typefind-&gt;adapter = gst_adapter_new ();
+ 336 }
+ 337 
+ 338 static void
+ 339 gst_type_find_element_dispose (GObject * object)
+ 340 {
+ 341   GstTypeFindElement *typefind = GST_TYPE_FIND_ELEMENT (object);
+ 342 
+<a name="3" id="anc3"></a><span class="line-modified"> 343   if (typefind-&gt;adapter) {</span>
+<span class="line-modified"> 344     g_object_unref (typefind-&gt;adapter);</span>
+<span class="line-removed"> 345     typefind-&gt;adapter = NULL;</span>
+<span class="line-removed"> 346   }</span>
+<span class="line-removed"> 347 </span>
+<span class="line-removed"> 348   if (typefind-&gt;force_caps) {</span>
+<span class="line-removed"> 349     gst_caps_unref (typefind-&gt;force_caps);</span>
+<span class="line-removed"> 350     typefind-&gt;force_caps = NULL;</span>
+<span class="line-removed"> 351   }</span>
+ 352 
+ 353   G_OBJECT_CLASS (parent_class)-&gt;dispose (object);
+ 354 }
+ 355 
+ 356 static void
+ 357 gst_type_find_element_set_property (GObject * object, guint prop_id,
+ 358     const GValue * value, GParamSpec * pspec)
+ 359 {
+ 360   GstTypeFindElement *typefind;
+ 361 
+ 362   typefind = GST_TYPE_FIND_ELEMENT (object);
+ 363 
+ 364   switch (prop_id) {
+ 365     case PROP_MINIMUM:
+ 366       typefind-&gt;min_probability = g_value_get_uint (value);
+ 367       break;
+ 368     case PROP_FORCE_CAPS:
+ 369       GST_OBJECT_LOCK (typefind);
+<a name="4" id="anc4"></a><span class="line-modified"> 370       if (typefind-&gt;force_caps)</span>
+<span class="line-removed"> 371         gst_caps_unref (typefind-&gt;force_caps);</span>
+<span class="line-removed"> 372       typefind-&gt;force_caps = g_value_dup_boxed (value);</span>
+ 373       GST_OBJECT_UNLOCK (typefind);
+ 374       break;
+ 375     default:
+ 376       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
+ 377       break;
+ 378   }
+ 379 }
+ 380 
+ 381 static void
+ 382 gst_type_find_element_get_property (GObject * object, guint prop_id,
+ 383     GValue * value, GParamSpec * pspec)
+ 384 {
+ 385   GstTypeFindElement *typefind;
+ 386 
+ 387   typefind = GST_TYPE_FIND_ELEMENT (object);
+ 388 
+ 389   switch (prop_id) {
+ 390     case PROP_CAPS:
+ 391       GST_OBJECT_LOCK (typefind);
+ 392       g_value_set_boxed (value, typefind-&gt;caps);
+ 393       GST_OBJECT_UNLOCK (typefind);
+ 394       break;
+ 395     case PROP_MINIMUM:
+ 396       g_value_set_uint (value, typefind-&gt;min_probability);
+ 397       break;
+ 398     case PROP_FORCE_CAPS:
+ 399       GST_OBJECT_LOCK (typefind);
+ 400       g_value_set_boxed (value, typefind-&gt;force_caps);
+ 401       GST_OBJECT_UNLOCK (typefind);
+ 402       break;
+ 403     default:
+ 404       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
+ 405       break;
+ 406   }
+ 407 }
+ 408 
+ 409 static gboolean
+ 410 gst_type_find_handle_src_query (GstPad * pad, GstObject * parent,
+ 411     GstQuery * query)
+ 412 {
+ 413   GstTypeFindElement *typefind;
+ 414   gboolean res = FALSE;
+ 415 
+ 416   typefind = GST_TYPE_FIND_ELEMENT (parent);
+ 417   GST_DEBUG_OBJECT (typefind, &quot;Handling src query %s&quot;,
+ 418       GST_QUERY_TYPE_NAME (query));
+ 419 
+ 420   switch (GST_QUERY_TYPE (query)) {
+ 421     case GST_QUERY_SCHEDULING:
+ 422       /* FIXME, filter out the scheduling modes that we understand */
+ 423       res = gst_pad_peer_query (typefind-&gt;sink, query);
+ 424       break;
+ 425     case GST_QUERY_CAPS:
+ 426     {
+ 427       GST_DEBUG_OBJECT (typefind,
+ 428           &quot;Got caps query, our caps are %&quot; GST_PTR_FORMAT, typefind-&gt;caps);
+ 429 
+ 430       /* We can hijack caps query if we typefind already */
+ 431       if (typefind-&gt;caps) {
+ 432         gst_query_set_caps_result (query, typefind-&gt;caps);
+ 433         res = TRUE;
+ 434       } else {
+ 435         res = gst_pad_peer_query (typefind-&gt;sink, query);
+ 436       }
+ 437       break;
+ 438     }
+ 439     case GST_QUERY_POSITION:
+ 440     {
+ 441       gint64 peer_pos;
+ 442       GstFormat format;
+ 443 
+ 444       if (!(res = gst_pad_peer_query (typefind-&gt;sink, query)))
+ 445         goto out;
+ 446 
+ 447       gst_query_parse_position (query, &amp;format, &amp;peer_pos);
+ 448 
+ 449       GST_OBJECT_LOCK (typefind);
+ 450       /* FIXME: this code assumes that there&#39;s no discont in the queue */
+ 451       switch (format) {
+ 452         case GST_FORMAT_BYTES:
+ 453           peer_pos -= gst_adapter_available (typefind-&gt;adapter);
+ 454           if (peer_pos &lt; 0)     /* Clamp result to 0 */
+ 455             peer_pos = 0;
+ 456           break;
+ 457         default:
+ 458           /* FIXME */
+ 459           break;
+ 460       }
+ 461       GST_OBJECT_UNLOCK (typefind);
+ 462       gst_query_set_position (query, format, peer_pos);
+ 463       break;
+ 464     }
+ 465     default:
+ 466       res = gst_pad_query_default (pad, parent, query);
+ 467       break;
+ 468   }
+ 469 out:
+ 470   return res;
+ 471 }
+ 472 
+ 473 static gboolean
+ 474 gst_type_find_element_seek (GstTypeFindElement * typefind, GstEvent * event)
+ 475 {
+ 476   GstSeekFlags flags;
+ 477   GstSeekType start_type, stop_type;
+ 478   GstFormat format;
+ 479   gboolean flush;
+ 480   gdouble rate;
+ 481   gint64 start, stop;
+ 482   GstSegment seeksegment = { 0, };
+ 483 
+ 484   gst_event_parse_seek (event, &amp;rate, &amp;format, &amp;flags, &amp;start_type, &amp;start,
+ 485       &amp;stop_type, &amp;stop);
+ 486 
+ 487   /* we can only seek on bytes */
+ 488   if (format != GST_FORMAT_BYTES) {
+ 489     GST_DEBUG_OBJECT (typefind, &quot;Can only seek on BYTES&quot;);
+ 490     return FALSE;
+ 491   }
+ 492 
+ 493   /* copy segment, we need this because we still need the old
+ 494    * segment when we close the current segment. */
+ 495   memcpy (&amp;seeksegment, &amp;typefind-&gt;segment, sizeof (GstSegment));
+ 496 
+ 497   GST_DEBUG_OBJECT (typefind, &quot;configuring seek&quot;);
+ 498   gst_segment_do_seek (&amp;seeksegment, rate, format, flags,
+ 499       start_type, start, stop_type, stop, NULL);
+ 500 
+ 501   flush = ! !(flags &amp; GST_SEEK_FLAG_FLUSH);
+ 502 
+ 503   GST_DEBUG_OBJECT (typefind, &quot;New segment %&quot; GST_SEGMENT_FORMAT, &amp;seeksegment);
+ 504 
+ 505   if (flush) {
+ 506     GST_DEBUG_OBJECT (typefind, &quot;Starting flush&quot;);
+ 507     gst_pad_push_event (typefind-&gt;sink, gst_event_new_flush_start ());
+ 508     gst_pad_push_event (typefind-&gt;src, gst_event_new_flush_start ());
+ 509   } else {
+ 510     GST_DEBUG_OBJECT (typefind, &quot;Non-flushing seek, pausing task&quot;);
+ 511     gst_pad_pause_task (typefind-&gt;sink);
+ 512   }
+ 513 
+ 514   /* now grab the stream lock so that streaming cannot continue, for
+ 515    * non flushing seeks when the element is in PAUSED this could block
+ 516    * forever. */
+ 517   GST_DEBUG_OBJECT (typefind, &quot;Waiting for streaming to stop&quot;);
+ 518   GST_PAD_STREAM_LOCK (typefind-&gt;sink);
+ 519 
+ 520   if (flush) {
+ 521     GST_DEBUG_OBJECT (typefind, &quot;Stopping flush&quot;);
+ 522     gst_pad_push_event (typefind-&gt;sink, gst_event_new_flush_stop (TRUE));
+ 523     gst_pad_push_event (typefind-&gt;src, gst_event_new_flush_stop (TRUE));
+ 524   }
+ 525 
+ 526   /* now update the real segment info */
+ 527   GST_DEBUG_OBJECT (typefind, &quot;Committing new seek segment&quot;);
+ 528   memcpy (&amp;typefind-&gt;segment, &amp;seeksegment, sizeof (GstSegment));
+ 529   typefind-&gt;offset = typefind-&gt;segment.start;
+ 530 
+ 531   /* notify start of new segment */
+ 532   if (typefind-&gt;segment.flags &amp; GST_SEGMENT_FLAG_SEGMENT) {
+ 533     GstMessage *msg;
+ 534 
+ 535     msg = gst_message_new_segment_start (GST_OBJECT (typefind),
+ 536         GST_FORMAT_BYTES, typefind-&gt;segment.start);
+ 537     gst_element_post_message (GST_ELEMENT (typefind), msg);
+ 538   }
+ 539 
+ 540   typefind-&gt;need_segment = TRUE;
+ 541 
+ 542   /* restart our task since it might have been stopped when we did the
+ 543    * flush. */
+ 544   gst_pad_start_task (typefind-&gt;sink,
+ 545       (GstTaskFunction) gst_type_find_element_loop, typefind-&gt;sink, NULL);
+ 546 
+ 547   /* streaming can continue now */
+ 548   GST_PAD_STREAM_UNLOCK (typefind-&gt;sink);
+ 549 
+ 550   return TRUE;
+ 551 }
+ 552 
+ 553 static gboolean
+ 554 gst_type_find_element_src_event (GstPad * pad, GstObject * parent,
+ 555     GstEvent * event)
+ 556 {
+ 557   GstTypeFindElement *typefind = GST_TYPE_FIND_ELEMENT (parent);
+ 558   gboolean result;
+ 559 
+<a name="5" id="anc5"></a>
+
+
+
+
+ 560   if (typefind-&gt;mode != MODE_NORMAL) {
+ 561     /* need to do more? */
+ 562     GST_LOG_OBJECT (typefind, &quot;Still typefinding. Not passing event upstream&quot;);
+ 563     gst_event_unref (event);
+ 564     return FALSE;
+ 565   }
+ 566 
+ 567   /* Only handle seeks here if driving the pipeline */
+ 568   if (typefind-&gt;segment.format != GST_FORMAT_UNDEFINED &amp;&amp;
+ 569       GST_EVENT_TYPE (event) == GST_EVENT_SEEK) {
+ 570     result = gst_type_find_element_seek (typefind, event);
+ 571     gst_event_unref (event);
+ 572     return result;
+ 573   } else {
+ 574     return gst_pad_push_event (typefind-&gt;sink, event);
+ 575   }
+ 576 }
+ 577 
+ 578 static void
+ 579 start_typefinding (GstTypeFindElement * typefind)
+ 580 {
+ 581   GST_DEBUG_OBJECT (typefind, &quot;starting typefinding&quot;);
+ 582 
+ 583   GST_OBJECT_LOCK (typefind);
+ 584   if (typefind-&gt;caps)
+ 585     gst_caps_replace (&amp;typefind-&gt;caps, NULL);
+ 586   typefind-&gt;initial_offset = GST_BUFFER_OFFSET_NONE;
+ 587   GST_OBJECT_UNLOCK (typefind);
+ 588 
+ 589   typefind-&gt;mode = MODE_TYPEFIND;
+ 590 }
+ 591 
+ 592 static void
+ 593 stop_typefinding (GstTypeFindElement * typefind)
+ 594 {
+ 595   GstState state;
+ 596   gboolean push_cached_buffers;
+ 597   gsize avail;
+ 598   GstBuffer *buffer;
+ 599   GstClockTime pts, dts;
+ 600 
+ 601   gst_element_get_state (GST_ELEMENT (typefind), &amp;state, NULL, 0);
+ 602 
+ 603   push_cached_buffers = (state &gt;= GST_STATE_PAUSED &amp;&amp; typefind-&gt;caps);
+ 604 
+ 605   GST_DEBUG_OBJECT (typefind, &quot;stopping typefinding%s&quot;,
+ 606       push_cached_buffers ? &quot; and pushing cached events and buffers&quot; : &quot;&quot;);
+ 607 
+ 608   typefind-&gt;mode = MODE_NORMAL;
+ 609   if (push_cached_buffers)
+ 610     gst_type_find_element_send_cached_events (typefind);
+ 611 
+ 612   GST_OBJECT_LOCK (typefind);
+ 613   avail = gst_adapter_available (typefind-&gt;adapter);
+ 614   if (avail == 0)
+ 615     goto no_data;
+ 616 
+ 617   pts = gst_adapter_prev_pts (typefind-&gt;adapter, NULL);
+ 618   dts = gst_adapter_prev_dts (typefind-&gt;adapter, NULL);
+ 619   buffer = gst_adapter_take_buffer (typefind-&gt;adapter, avail);
+ 620   GST_BUFFER_PTS (buffer) = pts;
+ 621   GST_BUFFER_DTS (buffer) = dts;
+ 622   GST_BUFFER_OFFSET (buffer) = typefind-&gt;initial_offset;
+ 623   GST_OBJECT_UNLOCK (typefind);
+ 624 
+ 625   if (!push_cached_buffers) {
+ 626     gst_buffer_unref (buffer);
+ 627   } else {
+ 628     GstPad *peer = gst_pad_get_peer (typefind-&gt;src);
+ 629 
+ 630     /* make sure the user gets a meaningful error message in this case,
+ 631      * which is not a core bug or bug of any kind (as the default error
+ 632      * message emitted by gstpad.c otherwise would make you think) */
+ 633     if (peer &amp;&amp; GST_PAD_CHAINFUNC (peer) == NULL) {
+ 634       GST_DEBUG_OBJECT (typefind, &quot;upstream only supports push mode, while &quot;
+ 635           &quot;downstream element only works in pull mode, erroring out&quot;);
+ 636       GST_ELEMENT_ERROR (typefind, STREAM, FAILED,
+ 637           (&quot;%s cannot work in push mode. The operation is not supported &quot;
+ 638               &quot;with this source element or protocol.&quot;,
+ 639               G_OBJECT_TYPE_NAME (GST_PAD_PARENT (peer))),
+ 640           (&quot;Downstream pad %s:%s has no chainfunction, and the upstream &quot;
+ 641               &quot;element does not support pull mode&quot;, GST_DEBUG_PAD_NAME (peer)));
+ 642       typefind-&gt;mode = MODE_ERROR;      /* make the chain function error out */
+ 643       gst_buffer_unref (buffer);
+ 644     } else {
+ 645       gst_pad_push (typefind-&gt;src, buffer);
+ 646     }
+ 647     if (peer)
+ 648       gst_object_unref (peer);
+ 649   }
+ 650   return;
+ 651 
+ 652   /* ERRORS */
+ 653 no_data:
+ 654   {
+ 655     GST_DEBUG_OBJECT (typefind, &quot;we have no data to typefind&quot;);
+ 656     GST_OBJECT_UNLOCK (typefind);
+ 657     return;
+ 658   }
+ 659 }
+ 660 
+ 661 static gboolean
+ 662 gst_type_find_element_sink_event (GstPad * pad, GstObject * parent,
+ 663     GstEvent * event)
+ 664 {
+ 665   gboolean res = FALSE;
+ 666   GstTypeFindElement *typefind = GST_TYPE_FIND_ELEMENT (parent);
+ 667 
+ 668   GST_DEBUG_OBJECT (typefind, &quot;got %s event in mode %d&quot;,
+ 669       GST_EVENT_TYPE_NAME (event), typefind-&gt;mode);
+ 670 
+ 671   switch (typefind-&gt;mode) {
+ 672     case MODE_TYPEFIND:
+ 673       switch (GST_EVENT_TYPE (event)) {
+ 674         case GST_EVENT_CAPS:
+ 675         {
+ 676           GstCaps *caps;
+ 677 
+ 678           /* Parse and push out our caps and data */
+ 679           gst_event_parse_caps (event, &amp;caps);
+ 680           res = gst_type_find_element_setcaps (typefind, caps);
+ 681 
+ 682           gst_event_unref (event);
+ 683           break;
+ 684         }
+ 685         case GST_EVENT_GAP:
+ 686         {
+ 687           GST_FIXME_OBJECT (typefind,
+ 688               &quot;GAP events during typefinding not handled properly&quot;);
+ 689 
+ 690           /* FIXME: These would need to be inserted in the stream at
+ 691            * the right position between buffers, but we combine all
+ 692            * buffers with a GstAdapter. Drop the GAP event for now,
+ 693            * which will only cause an implicit GAP between buffers.
+ 694            */
+ 695           gst_event_unref (event);
+ 696           res = TRUE;
+ 697           break;
+ 698         }
+ 699         case GST_EVENT_EOS:
+ 700         {
+ 701           GST_INFO_OBJECT (typefind, &quot;Got EOS and no type found yet&quot;);
+ 702           gst_type_find_element_chain_do_typefinding (typefind, FALSE, TRUE);
+ 703 
+ 704           res = gst_pad_push_event (typefind-&gt;src, event);
+ 705           break;
+ 706         }
+ 707         case GST_EVENT_FLUSH_STOP:{
+ 708           GList *l;
+ 709 
+ 710           GST_OBJECT_LOCK (typefind);
+ 711 
+ 712           for (l = typefind-&gt;cached_events; l; l = l-&gt;next) {
+ 713             if (GST_EVENT_IS_STICKY (l-&gt;data) &amp;&amp;
+ 714                 GST_EVENT_TYPE (l-&gt;data) != GST_EVENT_SEGMENT &amp;&amp;
+ 715                 GST_EVENT_TYPE (l-&gt;data) != GST_EVENT_EOS) {
+ 716               gst_pad_store_sticky_event (typefind-&gt;src, l-&gt;data);
+ 717             }
+ 718             gst_event_unref (l-&gt;data);
+ 719           }
+ 720 
+ 721           g_list_free (typefind-&gt;cached_events);
+ 722           typefind-&gt;cached_events = NULL;
+ 723           gst_adapter_clear (typefind-&gt;adapter);
+ 724           GST_OBJECT_UNLOCK (typefind);
+ 725           /* fall through */
+ 726         }
+ 727         case GST_EVENT_FLUSH_START:
+ 728           res = gst_pad_push_event (typefind-&gt;src, event);
+ 729           break;
+ 730         default:
+ 731           /* Forward events that would happen before the caps event
+ 732            * directly instead of storing them. There&#39;s no reason not
+ 733            * to send them directly and we should only store events
+ 734            * for later sending that would need to come after the caps
+ 735            * event */
+ 736           if (GST_EVENT_TYPE (event) &lt; GST_EVENT_CAPS) {
+ 737             res = gst_pad_push_event (typefind-&gt;src, event);
+ 738           } else {
+ 739             GST_DEBUG_OBJECT (typefind, &quot;Saving %s event to send later&quot;,
+ 740                 GST_EVENT_TYPE_NAME (event));
+ 741             GST_OBJECT_LOCK (typefind);
+ 742             typefind-&gt;cached_events =
+ 743                 g_list_append (typefind-&gt;cached_events, event);
+ 744             GST_OBJECT_UNLOCK (typefind);
+ 745             res = TRUE;
+ 746           }
+ 747           break;
+ 748       }
+ 749       break;
+ 750     case MODE_NORMAL:
+ 751       res = gst_pad_push_event (typefind-&gt;src, event);
+ 752       break;
+ 753     case MODE_ERROR:
+ 754       break;
+ 755     default:
+ 756       g_assert_not_reached ();
+ 757   }
+ 758   return res;
+ 759 }
+ 760 
+ 761 static void
+ 762 gst_type_find_element_send_cached_events (GstTypeFindElement * typefind)
+ 763 {
+ 764   GList *l, *cached_events;
+ 765 
+ 766   GST_OBJECT_LOCK (typefind);
+ 767   cached_events = typefind-&gt;cached_events;
+ 768   typefind-&gt;cached_events = NULL;
+ 769   GST_OBJECT_UNLOCK (typefind);
+ 770 
+ 771   for (l = cached_events; l != NULL; l = l-&gt;next) {
+ 772     GstEvent *event = GST_EVENT (l-&gt;data);
+ 773 
+ 774     GST_DEBUG_OBJECT (typefind, &quot;sending cached %s event&quot;,
+ 775         GST_EVENT_TYPE_NAME (event));
+ 776     gst_pad_push_event (typefind-&gt;src, event);
+ 777   }
+ 778   g_list_free (cached_events);
+ 779 }
+ 780 
+ 781 static gboolean
+ 782 gst_type_find_element_setcaps (GstTypeFindElement * typefind, GstCaps * caps)
+ 783 {
+ 784   /* don&#39;t operate on ANY caps */
+ 785   if (gst_caps_is_any (caps))
+ 786     return TRUE;
+ 787 
+ 788   /* Set to MODE_NORMAL before emitting have-type, in case it triggers a seek */
+ 789   typefind-&gt;mode = MODE_NORMAL;
+ 790   gst_type_find_element_emit_have_type (typefind, GST_TYPE_FIND_MAXIMUM, caps);
+ 791 
+ 792   /* Shortcircuit typefinding if we get caps */
+ 793   GST_DEBUG_OBJECT (typefind, &quot;Skipping typefinding, using caps from &quot;
+ 794       &quot;upstream: %&quot; GST_PTR_FORMAT, caps);
+ 795 
+ 796   stop_typefinding (typefind);
+ 797 
+ 798   return TRUE;
+ 799 }
+ 800 
+ 801 static gchar *
+ 802 gst_type_find_get_extension (GstTypeFindElement * typefind, GstPad * pad)
+ 803 {
+ 804   GstQuery *query;
+ 805   gchar *uri, *result;
+ 806   size_t len;
+ 807   gint find;
+ 808 
+ 809   query = gst_query_new_uri ();
+ 810 
+ 811   /* try getting the caps with an uri query and from the extension */
+ 812   if (!gst_pad_peer_query (pad, query))
+ 813     goto peer_query_failed;
+ 814 
+ 815   gst_query_parse_uri (query, &amp;uri);
+ 816   if (uri == NULL)
+ 817     goto no_uri;
+ 818 
+ 819   GST_DEBUG_OBJECT (typefind, &quot;finding extension of %s&quot;, uri);
+ 820 
+ 821   /* find the extension on the uri, this is everything after a &#39;.&#39; */
+ 822   len = strlen (uri);
+ 823   find = len - 1;
+ 824 
+ 825   while (find &gt;= 0) {
+ 826     if (uri[find] == &#39;.&#39;)
+ 827       break;
+ 828     find--;
+ 829   }
+ 830   if (find &lt; 0)
+ 831     goto no_extension;
+ 832 
+ 833   result = g_strdup (&amp;uri[find + 1]);
+ 834 
+ 835   GST_DEBUG_OBJECT (typefind, &quot;found extension %s&quot;, result);
+ 836   gst_query_unref (query);
+ 837   g_free (uri);
+ 838 
+ 839   return result;
+ 840 
+ 841   /* ERRORS */
+ 842 peer_query_failed:
+ 843   {
+<a name="6" id="anc6"></a><span class="line-modified"> 844     GST_WARNING_OBJECT (typefind, &quot;failed to query peer uri&quot;);</span>
+ 845     gst_query_unref (query);
+ 846     return NULL;
+ 847   }
+ 848 no_uri:
+ 849   {
+<a name="7" id="anc7"></a><span class="line-modified"> 850     GST_WARNING_OBJECT (typefind, &quot;could not parse the peer uri&quot;);</span>
+ 851     gst_query_unref (query);
+ 852     return NULL;
+ 853   }
+ 854 no_extension:
+ 855   {
+<a name="8" id="anc8"></a><span class="line-modified"> 856     GST_WARNING_OBJECT (typefind, &quot;could not find uri extension in %s&quot;, uri);</span>
+ 857     gst_query_unref (query);
+ 858     g_free (uri);
+ 859     return NULL;
+ 860   }
+ 861 }
+ 862 
+ 863 static GstCaps *
+ 864 gst_type_find_guess_by_extension (GstTypeFindElement * typefind, GstPad * pad,
+ 865     GstTypeFindProbability * probability)
+ 866 {
+ 867   gchar *ext;
+ 868   GstCaps *caps;
+ 869 
+ 870   ext = gst_type_find_get_extension (typefind, pad);
+ 871   if (!ext)
+ 872     return NULL;
+ 873 
+ 874   caps = gst_type_find_helper_for_extension (GST_OBJECT_CAST (typefind), ext);
+ 875   if (caps)
+ 876     *probability = GST_TYPE_FIND_MAXIMUM;
+ 877 
+ 878   g_free (ext);
+ 879 
+ 880   return caps;
+ 881 }
+ 882 
+ 883 static GstFlowReturn
+ 884 gst_type_find_element_chain (GstPad * pad, GstObject * parent,
+ 885     GstBuffer * buffer)
+ 886 {
+ 887   GstTypeFindElement *typefind;
+ 888   GstFlowReturn res = GST_FLOW_OK;
+ 889 
+ 890   typefind = GST_TYPE_FIND_ELEMENT (parent);
+ 891 
+ 892   GST_LOG_OBJECT (typefind, &quot;handling buffer in mode %d&quot;, typefind-&gt;mode);
+ 893 
+ 894   switch (typefind-&gt;mode) {
+ 895     case MODE_ERROR:
+ 896       /* we should already have called GST_ELEMENT_ERROR */
+ 897       return GST_FLOW_ERROR;
+ 898     case MODE_NORMAL:
+ 899       /* don&#39;t take object lock as typefind-&gt;caps should not change anymore */
+ 900       return gst_pad_push (typefind-&gt;src, buffer);
+ 901     case MODE_TYPEFIND:
+ 902     {
+ 903       GST_OBJECT_LOCK (typefind);
+ 904       if (typefind-&gt;initial_offset == GST_BUFFER_OFFSET_NONE)
+ 905         typefind-&gt;initial_offset = GST_BUFFER_OFFSET (buffer);
+ 906       gst_adapter_push (typefind-&gt;adapter, buffer);
+ 907       GST_OBJECT_UNLOCK (typefind);
+ 908 
+ 909       res = gst_type_find_element_chain_do_typefinding (typefind, TRUE, FALSE);
+ 910 
+ 911       if (typefind-&gt;mode == MODE_ERROR)
+ 912         res = GST_FLOW_ERROR;
+ 913 
+ 914       break;
+ 915     }
+ 916     default:
+ 917       g_assert_not_reached ();
+ 918       return GST_FLOW_ERROR;
+ 919   }
+ 920 
+ 921   return res;
+ 922 }
+ 923 
+ 924 static GstFlowReturn
+ 925 gst_type_find_element_chain_do_typefinding (GstTypeFindElement * typefind,
+ 926     gboolean check_avail, gboolean at_eos)
+ 927 {
+ 928   GstTypeFindProbability probability;
+ 929   GstCaps *caps = NULL;
+ 930   gsize avail;
+ 931   const guint8 *data;
+ 932   gboolean have_min, have_max;
+<a name="9" id="anc9"></a>
+ 933 
+ 934   GST_OBJECT_LOCK (typefind);
+ 935   if (typefind-&gt;force_caps) {
+ 936     caps = gst_caps_ref (typefind-&gt;force_caps);
+ 937     probability = GST_TYPE_FIND_MAXIMUM;
+ 938   }
+ 939 
+ 940   if (!caps) {
+ 941     avail = gst_adapter_available (typefind-&gt;adapter);
+ 942 
+ 943     if (check_avail) {
+ 944       have_min = avail &gt;= TYPE_FIND_MIN_SIZE;
+ 945       have_max = avail &gt;= TYPE_FIND_MAX_SIZE;
+ 946     } else {
+ 947       have_min = avail &gt; 0;
+ 948       have_max = TRUE;
+ 949     }
+ 950 
+ 951     if (!have_min)
+ 952       goto not_enough_data;
+ 953 
+<a name="10" id="anc10"></a>
+ 954     /* map all available data */
+ 955     data = gst_adapter_map (typefind-&gt;adapter, avail);
+<a name="11" id="anc11"></a><span class="line-modified"> 956     caps = gst_type_find_helper_for_data (GST_OBJECT (typefind),</span>
+<span class="line-modified"> 957         data, avail, &amp;probability);</span>
+ 958     gst_adapter_unmap (typefind-&gt;adapter);
+<a name="12" id="anc12"></a>
+ 959 
+ 960     if (caps == NULL &amp;&amp; have_max)
+ 961       goto no_type_found;
+ 962     else if (caps == NULL)
+ 963       goto wait_for_data;
+ 964 
+ 965     /* found a type */
+ 966     if (probability &lt; typefind-&gt;min_probability)
+ 967       goto low_probability;
+ 968   }
+ 969 
+ 970   GST_OBJECT_UNLOCK (typefind);
+ 971 
+<a name="13" id="anc13"></a><span class="line-modified"> 972   /* probability is good enough too, so let&#39;s make it known ... emiting this</span>
+ 973    * signal calls our object handler which sets the caps. */
+ 974   /* Set to MODE_NORMAL before emitting have-type, in case it triggers a seek */
+ 975   typefind-&gt;mode = MODE_NORMAL;
+ 976   gst_type_find_element_emit_have_type (typefind, probability, caps);
+ 977 
+ 978   /* .. and send out the accumulated data */
+ 979   stop_typefinding (typefind);
+ 980   gst_caps_unref (caps);
+ 981 
+ 982   return GST_FLOW_OK;
+ 983 
+ 984 not_enough_data:
+ 985   {
+ 986     GST_OBJECT_UNLOCK (typefind);
+ 987 
+ 988     if (at_eos) {
+ 989       GST_ELEMENT_ERROR (typefind, STREAM, TYPE_NOT_FOUND,
+ 990           (_(&quot;Stream doesn&#39;t contain enough data.&quot;)),
+ 991           (&quot;Can&#39;t typefind stream&quot;));
+ 992       return GST_FLOW_ERROR;
+ 993     } else {
+<a name="14" id="anc14"></a><span class="line-modified"> 994     GST_DEBUG_OBJECT (typefind, &quot;not enough data for typefinding yet &quot;</span>
+<span class="line-modified"> 995         &quot;(%&quot; G_GSIZE_FORMAT &quot; bytes)&quot;, avail);</span>
+<span class="line-modified"> 996     return GST_FLOW_OK;</span>
+<span class="line-modified"> 997   }</span>
+ 998   }
+ 999 no_type_found:
+1000   {
+1001     GST_OBJECT_UNLOCK (typefind);
+1002     GST_ELEMENT_ERROR (typefind, STREAM, TYPE_NOT_FOUND, (NULL), (NULL));
+1003     stop_typefinding (typefind);
+1004     return GST_FLOW_ERROR;
+1005   }
+1006 wait_for_data:
+1007   {
+1008     GST_OBJECT_UNLOCK (typefind);
+1009 
+1010     if (at_eos) {
+1011       GST_ELEMENT_ERROR (typefind, STREAM, TYPE_NOT_FOUND,
+1012           (_(&quot;Stream doesn&#39;t contain enough data.&quot;)),
+1013           (&quot;Can&#39;t typefind stream&quot;));
+1014       return GST_FLOW_ERROR;
+1015     } else {
+<a name="15" id="anc15"></a><span class="line-modified">1016     GST_DEBUG_OBJECT (typefind,</span>
+<span class="line-modified">1017         &quot;no caps found with %&quot; G_GSIZE_FORMAT &quot; bytes of data, &quot;</span>
+<span class="line-modified">1018         &quot;waiting for more data&quot;, avail);</span>
+<span class="line-modified">1019     return GST_FLOW_OK;</span>
+<span class="line-modified">1020   }</span>
+1021   }
+1022 low_probability:
+1023   {
+1024     GST_DEBUG_OBJECT (typefind, &quot;found caps %&quot; GST_PTR_FORMAT &quot;, but &quot;
+1025         &quot;probability is %u which is lower than the required minimum of %u&quot;,
+1026         caps, probability, typefind-&gt;min_probability);
+1027 
+1028     gst_caps_unref (caps);
+1029 
+1030     if (have_max)
+1031       goto no_type_found;
+1032 
+1033     GST_OBJECT_UNLOCK (typefind);
+1034     GST_DEBUG_OBJECT (typefind, &quot;waiting for more data to try again&quot;);
+1035     return GST_FLOW_OK;
+1036   }
+1037 }
+1038 
+1039 static GstFlowReturn
+1040 gst_type_find_element_getrange (GstPad * srcpad, GstObject * parent,
+1041     guint64 offset, guint length, GstBuffer ** buffer)
+1042 {
+1043   GstTypeFindElement *typefind;
+1044   GstFlowReturn ret;
+1045 
+1046   typefind = GST_TYPE_FIND_ELEMENT (parent);
+1047 
+1048   ret = gst_pad_pull_range (typefind-&gt;sink, offset, length, buffer);
+1049 
+1050   return ret;
+1051 }
+1052 
+1053 static gboolean
+1054 gst_type_find_element_activate_src_mode (GstPad * pad, GstObject * parent,
+1055     GstPadMode mode, gboolean active)
+1056 {
+1057   gboolean res;
+1058   GstTypeFindElement *typefind;
+1059 
+1060   typefind = GST_TYPE_FIND_ELEMENT (parent);
+1061 
+1062   switch (mode) {
+1063     case GST_PAD_MODE_PULL:
+1064       /* make sure our task stops pushing, we can&#39;t call _stop here because this
+1065        * activation might happen from the streaming thread. */
+1066       gst_pad_pause_task (typefind-&gt;sink);
+1067       res = gst_pad_activate_mode (typefind-&gt;sink, mode, active);
+1068       break;
+1069     default:
+1070       res = TRUE;
+1071       break;
+1072   }
+1073   return res;
+1074 }
+1075 
+1076 static void
+1077 gst_type_find_element_loop (GstPad * pad)
+1078 {
+1079   GstTypeFindElement *typefind;
+1080   GstFlowReturn ret = GST_FLOW_OK;
+1081 
+1082   typefind = GST_TYPE_FIND_ELEMENT (GST_PAD_PARENT (pad));
+1083 
+1084   if (typefind-&gt;need_stream_start) {
+1085     gchar *stream_id;
+1086     GstEvent *event;
+1087 
+1088     stream_id = gst_pad_create_stream_id (typefind-&gt;src,
+1089         GST_ELEMENT_CAST (typefind), NULL);
+1090 
+1091     GST_DEBUG_OBJECT (typefind, &quot;Pushing STREAM_START&quot;);
+1092     event = gst_event_new_stream_start (stream_id);
+1093     gst_event_set_group_id (event, gst_util_group_id_next ());
+1094     gst_pad_push_event (typefind-&gt;src, event);
+1095 
+1096     typefind-&gt;need_stream_start = FALSE;
+1097     g_free (stream_id);
+1098   }
+1099 
+1100   if (typefind-&gt;mode == MODE_TYPEFIND) {
+1101     GstPad *peer = NULL;
+1102     GstCaps *found_caps = NULL;
+1103     GstTypeFindProbability probability = GST_TYPE_FIND_NONE;
+1104 
+1105     GST_DEBUG_OBJECT (typefind, &quot;find type in pull mode&quot;);
+1106 
+1107     GST_OBJECT_LOCK (typefind);
+1108     if (typefind-&gt;force_caps) {
+1109       found_caps = gst_caps_ref (typefind-&gt;force_caps);
+1110       probability = GST_TYPE_FIND_MAXIMUM;
+1111     }
+1112     GST_OBJECT_UNLOCK (typefind);
+1113 
+1114     if (!found_caps) {
+1115       peer = gst_pad_get_peer (pad);
+1116       if (peer) {
+1117         gint64 size;
+1118         gchar *ext;
+1119 
+1120         if (!gst_pad_query_duration (peer, GST_FORMAT_BYTES, &amp;size)) {
+1121           GST_WARNING_OBJECT (typefind, &quot;Could not query upstream length!&quot;);
+1122           gst_object_unref (peer);
+1123 
+1124           ret = GST_FLOW_ERROR;
+1125           goto pause;
+1126         }
+1127 
+1128         /* the size if 0, we cannot continue */
+1129         if (size == 0) {
+1130           /* keep message in sync with message in sink event handler */
+1131           GST_ELEMENT_ERROR (typefind, STREAM, TYPE_NOT_FOUND,
+1132               (_(&quot;Stream contains no data.&quot;)), (&quot;Can&#39;t typefind empty stream&quot;));
+1133           gst_object_unref (peer);
+1134           ret = GST_FLOW_ERROR;
+1135           goto pause;
+1136         }
+1137         ext = gst_type_find_get_extension (typefind, pad);
+1138 
+1139         ret =
+1140             gst_type_find_helper_get_range_full (GST_OBJECT_CAST (peer),
+1141             GST_OBJECT_PARENT (peer),
+1142             (GstTypeFindHelperGetRangeFunction) (GST_PAD_GETRANGEFUNC (peer)),
+1143             (guint64) size, ext, &amp;found_caps, &amp;probability);
+1144         g_free (ext);
+1145 
+1146         GST_DEBUG (&quot;Found caps %&quot; GST_PTR_FORMAT, found_caps);
+1147 
+1148         gst_object_unref (peer);
+1149 
+1150         if (ret != GST_FLOW_OK)
+1151           goto pause;
+1152       }
+1153     }
+1154 
+1155     if (!found_caps || probability &lt; typefind-&gt;min_probability) {
+1156       GST_DEBUG (&quot;Trying to guess using extension&quot;);
+1157       gst_caps_replace (&amp;found_caps, NULL);
+1158       found_caps =
+1159           gst_type_find_guess_by_extension (typefind, pad, &amp;probability);
+1160     }
+1161 
+1162     if (!found_caps || probability &lt; typefind-&gt;min_probability) {
+1163       GST_ELEMENT_ERROR (typefind, STREAM, TYPE_NOT_FOUND, (NULL), (NULL));
+1164       gst_caps_replace (&amp;found_caps, NULL);
+1165       ret = GST_FLOW_ERROR;
+1166       goto pause;
+1167     }
+1168 
+<a name="16" id="anc16"></a><span class="line-modified">1169     GST_DEBUG (&quot;Emiting found caps %&quot; GST_PTR_FORMAT, found_caps);</span>
+1170     /* Set to MODE_NORMAL before emitting have-type, in case it triggers a seek */
+1171     typefind-&gt;mode = MODE_NORMAL;
+1172     gst_type_find_element_emit_have_type (typefind, probability, found_caps);
+1173     gst_caps_unref (found_caps);
+1174   } else if (typefind-&gt;mode == MODE_NORMAL) {
+1175     GstBuffer *outbuf = NULL;
+1176 
+1177     if (typefind-&gt;need_segment) {
+1178       typefind-&gt;need_segment = FALSE;
+1179       gst_pad_push_event (typefind-&gt;src,
+1180           gst_event_new_segment (&amp;typefind-&gt;segment));
+1181     }
+1182 
+1183     /* Pull 4k blocks and send downstream */
+1184     ret = gst_pad_pull_range (typefind-&gt;sink, typefind-&gt;offset, 4096, &amp;outbuf);
+1185     if (ret != GST_FLOW_OK)
+1186       goto pause;
+1187 
+1188     typefind-&gt;offset += gst_buffer_get_size (outbuf);
+1189 
+1190     ret = gst_pad_push (typefind-&gt;src, outbuf);
+1191     if (ret != GST_FLOW_OK)
+1192       goto pause;
+1193   } else {
+1194     /* Error out */
+1195     ret = GST_FLOW_ERROR;
+1196     goto pause;
+1197   }
+1198 
+1199   return;
+1200 
+1201 pause:
+1202   {
+1203     const gchar *reason = gst_flow_get_name (ret);
+1204     gboolean push_eos = FALSE;
+1205 
+1206     GST_LOG_OBJECT (typefind, &quot;pausing task, reason %s&quot;, reason);
+1207     gst_pad_pause_task (typefind-&gt;sink);
+1208 
+1209     if (ret == GST_FLOW_EOS) {
+1210       /* perform EOS logic */
+1211 
+1212       if (typefind-&gt;segment.flags &amp; GST_SEGMENT_FLAG_SEGMENT) {
+1213         gint64 stop;
+1214 
+1215         /* for segment playback we need to post when (in stream time)
+1216          * we stopped, this is either stop (when set) or the duration. */
+1217         if ((stop = typefind-&gt;segment.stop) == -1)
+1218           stop = typefind-&gt;offset;
+1219 
+1220         GST_LOG_OBJECT (typefind, &quot;Sending segment done, at end of segment&quot;);
+1221         gst_element_post_message (GST_ELEMENT (typefind),
+1222             gst_message_new_segment_done (GST_OBJECT (typefind),
+1223                 GST_FORMAT_BYTES, stop));
+1224         gst_pad_push_event (typefind-&gt;src,
+1225             gst_event_new_segment_done (GST_FORMAT_BYTES, stop));
+1226       } else {
+1227         push_eos = TRUE;
+1228       }
+1229     } else if (ret == GST_FLOW_NOT_LINKED || ret &lt; GST_FLOW_EOS) {
+1230       /* for fatal errors we post an error message */
+1231       GST_ELEMENT_FLOW_ERROR (typefind, ret);
+1232       push_eos = TRUE;
+1233     }
+1234     if (push_eos) {
+1235       /* send EOS, and prevent hanging if no streams yet */
+1236       GST_LOG_OBJECT (typefind, &quot;Sending EOS, at end of stream&quot;);
+1237       gst_pad_push_event (typefind-&gt;src, gst_event_new_eos ());
+1238     }
+1239     return;
+1240   }
+1241 }
+1242 
+1243 static gboolean
+1244 gst_type_find_element_activate_sink_mode (GstPad * pad, GstObject * parent,
+1245     GstPadMode mode, gboolean active)
+1246 {
+1247   gboolean res;
+1248   GstTypeFindElement *typefind;
+1249 
+1250   typefind = GST_TYPE_FIND_ELEMENT (parent);
+1251 
+1252   switch (mode) {
+1253     case GST_PAD_MODE_PULL:
+1254       if (active) {
+1255         gst_segment_init (&amp;typefind-&gt;segment, GST_FORMAT_BYTES);
+1256         typefind-&gt;need_segment = TRUE;
+1257         typefind-&gt;need_stream_start = TRUE;
+1258         typefind-&gt;offset = 0;
+1259         res = TRUE;
+1260       } else {
+1261         res = gst_pad_stop_task (pad);
+1262         gst_segment_init (&amp;typefind-&gt;segment, GST_FORMAT_UNDEFINED);
+1263       }
+1264       break;
+1265     case GST_PAD_MODE_PUSH:
+1266       if (active) {
+1267         gst_segment_init (&amp;typefind-&gt;segment, GST_FORMAT_UNDEFINED);
+1268         start_typefinding (typefind);
+1269       } else {
+1270         stop_typefinding (typefind);
+1271         gst_segment_init (&amp;typefind-&gt;segment, GST_FORMAT_UNDEFINED);
+1272       }
+1273       res = TRUE;
+1274       break;
+1275     default:
+1276       res = FALSE;
+1277       break;
+1278   }
+1279   return res;
+1280 }
+1281 
+1282 static gboolean
+1283 gst_type_find_element_activate_sink (GstPad * pad, GstObject * parent)
+1284 {
+1285   GstQuery *query;
+1286   gboolean pull_mode;
+1287 
+1288   query = gst_query_new_scheduling ();
+1289 
+1290   if (!gst_pad_peer_query (pad, query)) {
+1291     gst_query_unref (query);
+1292     goto typefind_push;
+1293   }
+1294 
+1295   pull_mode = gst_query_has_scheduling_mode_with_flags (query,
+1296       GST_PAD_MODE_PULL, GST_SCHEDULING_FLAG_SEEKABLE);
+1297 
+1298   gst_query_unref (query);
+1299 
+1300   if (!pull_mode)
+1301     goto typefind_push;
+1302 
+1303   if (!gst_pad_activate_mode (pad, GST_PAD_MODE_PULL, TRUE))
+1304     goto typefind_push;
+1305 
+1306   /* only start our task if we ourselves decide to start in pull mode */
+1307   return gst_pad_start_task (pad, (GstTaskFunction) gst_type_find_element_loop,
+1308       pad, NULL);
+1309 
+1310 typefind_push:
+1311   {
+1312     return gst_pad_activate_mode (pad, GST_PAD_MODE_PUSH, TRUE);
+1313   }
+1314 }
+1315 
+1316 static GstStateChangeReturn
+1317 gst_type_find_element_change_state (GstElement * element,
+1318     GstStateChange transition)
+1319 {
+1320   GstStateChangeReturn ret;
+1321   GstTypeFindElement *typefind;
+1322 
+1323   typefind = GST_TYPE_FIND_ELEMENT (element);
+1324 
+1325 
+1326   ret = GST_ELEMENT_CLASS (parent_class)-&gt;change_state (element, transition);
+1327 
+1328   switch (transition) {
+1329     case GST_STATE_CHANGE_PAUSED_TO_READY:
+1330     case GST_STATE_CHANGE_READY_TO_NULL:
+1331       GST_OBJECT_LOCK (typefind);
+1332       gst_caps_replace (&amp;typefind-&gt;caps, NULL);
+1333 
+1334       g_list_foreach (typefind-&gt;cached_events,
+1335           (GFunc) gst_mini_object_unref, NULL);
+1336       g_list_free (typefind-&gt;cached_events);
+1337       typefind-&gt;cached_events = NULL;
+1338       typefind-&gt;mode = MODE_TYPEFIND;
+1339       GST_OBJECT_UNLOCK (typefind);
+1340       break;
+1341     default:
+1342       break;
+1343   }
+1344 
+1345   return ret;
+1346 }
+<a name="17" id="anc17"></a><b style="font-size: large; color: red">--- EOF ---</b>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+</pre>
+<input id="eof" value="17" type="hidden" />
+</body>
+</html>
