@@ -1,0 +1,547 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>New modules/javafx.web/src/main/native/Source/WebKitLegacy/Storage/StorageAreaSync.cpp</title>
+    <link rel="stylesheet" href="../../../../../../../../style.css" />
+  </head>
+  <body>
+    <pre>
+  1 /*
+  2  * Copyright (C) 2008, 2009, 2010 Apple Inc. All Rights Reserved.
+  3  *
+  4  * Redistribution and use in source and binary forms, with or without
+  5  * modification, are permitted provided that the following conditions
+  6  * are met:
+  7  * 1. Redistributions of source code must retain the above copyright
+  8  *    notice, this list of conditions and the following disclaimer.
+  9  * 2. Redistributions in binary form must reproduce the above copyright
+ 10  *    notice, this list of conditions and the following disclaimer in the
+ 11  *    documentation and/or other materials provided with the distribution.
+ 12  *
+ 13  * THIS SOFTWARE IS PROVIDED BY APPLE INC. ``AS IS&#39;&#39; AND ANY
+ 14  * EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ 15  * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+ 16  * PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL APPLE INC. OR
+ 17  * CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+ 18  * EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+ 19  * PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
+ 20  * PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY
+ 21  * OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ 22  * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ 23  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ 24  */
+ 25 
+ 26 #include &quot;StorageAreaSync.h&quot;
+ 27 
+ 28 #include &quot;StorageAreaImpl.h&quot;
+ 29 #include &quot;StorageSyncManager.h&quot;
+ 30 #include &quot;StorageTracker.h&quot;
+ 31 #include &lt;WebCore/SQLiteDatabaseTracker.h&gt;
+ 32 #include &lt;WebCore/SQLiteStatement.h&gt;
+ 33 #include &lt;WebCore/SQLiteTransaction.h&gt;
+ 34 #include &lt;WebCore/SuddenTermination.h&gt;
+ 35 #include &lt;wtf/FileSystem.h&gt;
+ 36 #include &lt;wtf/MainThread.h&gt;
+ 37 
+ 38 using namespace WebCore;
+ 39 
+ 40 namespace WebKit {
+ 41 
+ 42 // If the StorageArea undergoes rapid changes, don&#39;t sync each change to disk.
+ 43 // Instead, queue up a batch of items to sync and actually do the sync at the following interval.
+ 44 static const Seconds StorageSyncInterval { 1_s };
+ 45 
+ 46 // A sane limit on how many items we&#39;ll schedule to sync all at once.  This makes it
+ 47 // much harder to starve the rest of LocalStorage and the OS&#39;s IO subsystem in general.
+ 48 static const int MaxiumItemsToSync = 100;
+ 49 
+ 50 inline StorageAreaSync::StorageAreaSync(RefPtr&lt;StorageSyncManager&gt;&amp;&amp; storageSyncManager, Ref&lt;StorageAreaImpl&gt;&amp;&amp; storageArea, const String&amp; databaseIdentifier)
+ 51     : m_syncTimer(*this, &amp;StorageAreaSync::syncTimerFired)
+ 52     , m_itemsCleared(false)
+ 53     , m_finalSyncScheduled(false)
+ 54     , m_storageArea(WTFMove(storageArea))
+ 55     , m_syncManager(WTFMove(storageSyncManager))
+ 56     , m_databaseIdentifier(databaseIdentifier.isolatedCopy())
+ 57     , m_clearItemsWhileSyncing(false)
+ 58     , m_syncScheduled(false)
+ 59     , m_syncInProgress(false)
+ 60     , m_databaseOpenFailed(false)
+ 61     , m_syncCloseDatabase(false)
+ 62     , m_importComplete(false)
+ 63 {
+ 64     ASSERT(isMainThread());
+ 65     ASSERT(m_storageArea);
+ 66     ASSERT(m_syncManager);
+ 67 
+ 68     // FIXME: If it can&#39;t import, then the default WebKit behavior should be that of private browsing,
+ 69     // not silently ignoring it. https://bugs.webkit.org/show_bug.cgi?id=25894
+ 70     RefPtr&lt;StorageAreaSync&gt; protector(this);
+ 71     m_syncManager-&gt;dispatch([protector] {
+ 72         protector-&gt;performImport();
+ 73     });
+ 74 }
+ 75 
+ 76 Ref&lt;StorageAreaSync&gt; StorageAreaSync::create(RefPtr&lt;StorageSyncManager&gt;&amp;&amp; storageSyncManager, Ref&lt;StorageAreaImpl&gt;&amp;&amp; storageArea, const String&amp; databaseIdentifier)
+ 77 {
+ 78     return adoptRef(*new StorageAreaSync(WTFMove(storageSyncManager), WTFMove(storageArea), databaseIdentifier));
+ 79 }
+ 80 
+ 81 StorageAreaSync::~StorageAreaSync()
+ 82 {
+ 83     ASSERT(isMainThread());
+ 84     ASSERT(!m_syncTimer.isActive());
+ 85     ASSERT(m_finalSyncScheduled);
+ 86 }
+ 87 
+ 88 void StorageAreaSync::scheduleFinalSync()
+ 89 {
+ 90     ASSERT(isMainThread());
+ 91     // FIXME: We do this to avoid races, but it&#39;d be better to make things safe without blocking.
+ 92     blockUntilImportComplete();
+ 93     m_storageArea = nullptr; // This is done in blockUntilImportComplete() but this is here as a form of documentation that we must be absolutely sure the ref count cycle is broken.
+ 94 
+ 95     if (m_syncTimer.isActive())
+ 96         m_syncTimer.stop();
+ 97     else {
+ 98         // The following is balanced by the call to enableSuddenTermination in the
+ 99         // syncTimerFired function.
+100         disableSuddenTermination();
+101     }
+102     // FIXME: This is synchronous. We should do it on the background process, but
+103     // we should do it safely.
+104     m_finalSyncScheduled = true;
+105     syncTimerFired();
+106 
+107     RefPtr&lt;StorageAreaSync&gt; protector(this);
+108     m_syncManager-&gt;dispatch([protector] {
+109         protector-&gt;deleteEmptyDatabase();
+110     });
+111 }
+112 
+113 void StorageAreaSync::scheduleItemForSync(const String&amp; key, const String&amp; value)
+114 {
+115     ASSERT(isMainThread());
+116     ASSERT(!m_finalSyncScheduled);
+117 
+118     m_changedItems.set(key, value);
+119     if (!m_syncTimer.isActive()) {
+120         m_syncTimer.startOneShot(StorageSyncInterval);
+121 
+122         // The following is balanced by the call to enableSuddenTermination in the
+123         // syncTimerFired function.
+124         disableSuddenTermination();
+125     }
+126 }
+127 
+128 void StorageAreaSync::scheduleClear()
+129 {
+130     ASSERT(isMainThread());
+131     ASSERT(!m_finalSyncScheduled);
+132 
+133     m_changedItems.clear();
+134     m_itemsCleared = true;
+135     if (!m_syncTimer.isActive()) {
+136         m_syncTimer.startOneShot(StorageSyncInterval);
+137 
+138         // The following is balanced by the call to enableSuddenTermination in the
+139         // syncTimerFired function.
+140         disableSuddenTermination();
+141     }
+142 }
+143 
+144 void StorageAreaSync::scheduleCloseDatabase()
+145 {
+146     ASSERT(isMainThread());
+147     ASSERT(!m_finalSyncScheduled);
+148 
+149     if (!m_database.isOpen())
+150         return;
+151 
+152     m_syncCloseDatabase = true;
+153 
+154     if (!m_syncTimer.isActive()) {
+155         m_syncTimer.startOneShot(StorageSyncInterval);
+156 
+157         // The following is balanced by the call to enableSuddenTermination in the
+158         // syncTimerFired function.
+159         disableSuddenTermination();
+160     }
+161 }
+162 
+163 void StorageAreaSync::syncTimerFired()
+164 {
+165     ASSERT(isMainThread());
+166 
+167     bool partialSync = false;
+168     {
+169         LockHolder locker(m_syncLock);
+170 
+171         // Do not schedule another sync if we&#39;re still trying to complete the
+172         // previous one. But, if we&#39;re shutting down, schedule it anyway.
+173         if (m_syncInProgress &amp;&amp; !m_finalSyncScheduled) {
+174             ASSERT(!m_syncTimer.isActive());
+175             m_syncTimer.startOneShot(StorageSyncInterval);
+176             return;
+177         }
+178 
+179         if (m_itemsCleared) {
+180             m_itemsPendingSync.clear();
+181             m_clearItemsWhileSyncing = true;
+182             m_itemsCleared = false;
+183         }
+184 
+185         HashMap&lt;String, String&gt;::iterator changed_it = m_changedItems.begin();
+186         HashMap&lt;String, String&gt;::iterator changed_end = m_changedItems.end();
+187         for (int count = 0; changed_it != changed_end; ++count, ++changed_it) {
+188             if (count &gt;= MaxiumItemsToSync &amp;&amp; !m_finalSyncScheduled) {
+189                 partialSync = true;
+190                 break;
+191             }
+192             m_itemsPendingSync.set(changed_it-&gt;key.isolatedCopy(), changed_it-&gt;value.isolatedCopy());
+193         }
+194 
+195         if (partialSync) {
+196             // We can&#39;t do the fast path of simply clearing all items, so we&#39;ll need to manually
+197             // remove them one by one. Done under lock since m_itemsPendingSync is modified by
+198             // the background thread.
+199             HashMap&lt;String, String&gt;::iterator pending_it = m_itemsPendingSync.begin();
+200             HashMap&lt;String, String&gt;::iterator pending_end = m_itemsPendingSync.end();
+201             for (; pending_it != pending_end; ++pending_it)
+202                 m_changedItems.remove(pending_it-&gt;key);
+203         }
+204 
+205         if (!m_syncScheduled) {
+206             m_syncScheduled = true;
+207 
+208             // The following is balanced by the call to enableSuddenTermination in the
+209             // performSync function.
+210             disableSuddenTermination();
+211 
+212             RefPtr&lt;StorageAreaSync&gt; protector(this);
+213             m_syncManager-&gt;dispatch([protector] {
+214                 protector-&gt;performSync();
+215             });
+216         }
+217     }
+218 
+219     if (partialSync) {
+220         // If we didn&#39;t finish syncing, then we need to finish the job later.
+221         ASSERT(!m_syncTimer.isActive());
+222         m_syncTimer.startOneShot(StorageSyncInterval);
+223     } else {
+224         // The following is balanced by the calls to disableSuddenTermination in the
+225         // scheduleItemForSync, scheduleClear, and scheduleFinalSync functions.
+226         enableSuddenTermination();
+227 
+228         m_changedItems.clear();
+229     }
+230 }
+231 
+232 void StorageAreaSync::openDatabase(OpenDatabaseParamType openingStrategy)
+233 {
+234     ASSERT(!isMainThread());
+235     ASSERT(!m_database.isOpen());
+236     ASSERT(!m_databaseOpenFailed);
+237 
+238     SQLiteTransactionInProgressAutoCounter transactionCounter;
+239 
+240     String databaseFilename = m_syncManager-&gt;fullDatabaseFilename(m_databaseIdentifier);
+241 
+242     if (!FileSystem::fileExists(databaseFilename) &amp;&amp; openingStrategy == SkipIfNonExistent)
+243         return;
+244 
+245     if (databaseFilename.isEmpty()) {
+246         LOG_ERROR(&quot;Filename for local storage database is empty - cannot open for persistent storage&quot;);
+247         markImported();
+248         m_databaseOpenFailed = true;
+249         return;
+250     }
+251 
+252     // A StorageTracker thread may have been scheduled to delete the db we&#39;re
+253     // reopening, so cancel possible deletion.
+254     StorageTracker::tracker().cancelDeletingOrigin(m_databaseIdentifier);
+255 
+256     if (!m_database.open(databaseFilename)) {
+257         LOG_ERROR(&quot;Failed to open database file %s for local storage&quot;, databaseFilename.utf8().data());
+258         markImported();
+259         m_databaseOpenFailed = true;
+260         return;
+261     }
+262 
+263     migrateItemTableIfNeeded();
+264 
+265     if (!m_database.executeCommand(&quot;CREATE TABLE IF NOT EXISTS ItemTable (key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB NOT NULL ON CONFLICT FAIL)&quot;)) {
+266         LOG_ERROR(&quot;Failed to create table ItemTable for local storage&quot;);
+267         markImported();
+268         m_databaseOpenFailed = true;
+269         return;
+270     }
+271 
+272     StorageTracker::tracker().setOriginDetails(m_databaseIdentifier, databaseFilename);
+273 }
+274 
+275 void StorageAreaSync::migrateItemTableIfNeeded()
+276 {
+277     if (!m_database.tableExists(&quot;ItemTable&quot;))
+278         return;
+279 
+280     {
+281         SQLiteStatement query(m_database, &quot;SELECT value FROM ItemTable LIMIT 1&quot;);
+282         // this query isn&#39;t ever executed.
+283         if (query.isColumnDeclaredAsBlob(0))
+284             return;
+285     }
+286 
+287     // alter table for backward compliance, change the value type from TEXT to BLOB.
+288     static const char* commands[] = {
+289         &quot;DROP TABLE IF EXISTS ItemTable2&quot;,
+290         &quot;CREATE TABLE ItemTable2 (key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB NOT NULL ON CONFLICT FAIL)&quot;,
+291         &quot;INSERT INTO ItemTable2 SELECT * from ItemTable&quot;,
+292         &quot;DROP TABLE ItemTable&quot;,
+293         &quot;ALTER TABLE ItemTable2 RENAME TO ItemTable&quot;,
+294         0,
+295     };
+296 
+297     SQLiteTransaction transaction(m_database, false);
+298     transaction.begin();
+299     for (size_t i = 0; commands[i]; ++i) {
+300         if (!m_database.executeCommand(commands[i])) {
+301             LOG_ERROR(&quot;Failed to migrate table ItemTable for local storage when executing: %s&quot;, commands[i]);
+302             transaction.rollback();
+303 
+304             // finally it will try to keep a backup of ItemTable for the future restoration.
+305             // NOTICE: this will essentially DELETE the current database, but that&#39;s better
+306             // than continually hitting this case and never being able to use the local storage.
+307             // if this is ever hit, it&#39;s definitely a bug.
+308             ASSERT_NOT_REACHED();
+309             if (!m_database.executeCommand(&quot;ALTER TABLE ItemTable RENAME TO Backup_ItemTable&quot;))
+310                 LOG_ERROR(&quot;Failed to save ItemTable after migration job failed.&quot;);
+311 
+312             return;
+313         }
+314     }
+315     transaction.commit();
+316 }
+317 
+318 void StorageAreaSync::performImport()
+319 {
+320     ASSERT(!isMainThread());
+321     ASSERT(!m_database.isOpen());
+322 
+323     openDatabase(SkipIfNonExistent);
+324     if (!m_database.isOpen()) {
+325         markImported();
+326         return;
+327     }
+328 
+329     SQLiteStatement query(m_database, &quot;SELECT key, value FROM ItemTable&quot;);
+330     if (query.prepare() != SQLITE_OK) {
+331         LOG_ERROR(&quot;Unable to select items from ItemTable for local storage&quot;);
+332         markImported();
+333         return;
+334     }
+335 
+336     HashMap&lt;String, String&gt; itemMap;
+337 
+338     int result = query.step();
+339     while (result == SQLITE_ROW) {
+340         itemMap.set(query.getColumnText(0), query.getColumnBlobAsString(1));
+341         result = query.step();
+342     }
+343 
+344     if (result != SQLITE_DONE) {
+345         LOG_ERROR(&quot;Error reading items from ItemTable for local storage&quot;);
+346         markImported();
+347         return;
+348     }
+349 
+350     m_storageArea-&gt;importItems(WTFMove(itemMap));
+351 
+352     markImported();
+353 }
+354 
+355 void StorageAreaSync::markImported()
+356 {
+357     LockHolder locker(m_importLock);
+358     m_importComplete = true;
+359     m_importCondition.notifyOne();
+360 }
+361 
+362 // FIXME: In the future, we should allow use of StorageAreas while it&#39;s importing (when safe to do so).
+363 // Blocking everything until the import is complete is by far the simplest and safest thing to do, but
+364 // there is certainly room for safe optimization: Key/length will never be able to make use of such an
+365 // optimization (since the order of iteration can change as items are being added). Get can return any
+366 // item currently in the map. Get/remove can work whether or not it&#39;s in the map, but we&#39;ll need a list
+367 // of items the import should not overwrite. Clear can also work, but it&#39;ll need to kill the import
+368 // job first.
+369 void StorageAreaSync::blockUntilImportComplete()
+370 {
+371     ASSERT(isMainThread());
+372 
+373     // Fast path. We set m_storageArea to 0 only after m_importComplete being true.
+374     if (!m_storageArea)
+375         return;
+376 
+377     LockHolder locker(m_importLock);
+378     while (!m_importComplete)
+379         m_importCondition.wait(m_importLock);
+380     m_storageArea = nullptr;
+381 }
+382 
+383 void StorageAreaSync::sync(bool clearItems, const HashMap&lt;String, String&gt;&amp; items)
+384 {
+385     ASSERT(!isMainThread());
+386 
+387     if (items.isEmpty() &amp;&amp; !clearItems &amp;&amp; !m_syncCloseDatabase)
+388         return;
+389     if (m_databaseOpenFailed)
+390         return;
+391 
+392     if (!m_database.isOpen() &amp;&amp; m_syncCloseDatabase) {
+393         m_syncCloseDatabase = false;
+394         return;
+395     }
+396 
+397     if (!m_database.isOpen())
+398         openDatabase(CreateIfNonExistent);
+399     if (!m_database.isOpen())
+400         return;
+401 
+402     // Closing this db because it is about to be deleted by StorageTracker.
+403     // The delete will be cancelled if StorageAreaSync needs to reopen the db
+404     // to write new items created after the request to delete the db.
+405     if (m_syncCloseDatabase) {
+406         m_syncCloseDatabase = false;
+407         m_database.close();
+408         return;
+409     }
+410 
+411     SQLiteTransactionInProgressAutoCounter transactionCounter;
+412 
+413     // If the clear flag is set, then we clear all items out before we write any new ones in.
+414     if (clearItems) {
+415         SQLiteStatement clear(m_database, &quot;DELETE FROM ItemTable&quot;);
+416         if (clear.prepare() != SQLITE_OK) {
+417             LOG_ERROR(&quot;Failed to prepare clear statement - cannot write to local storage database&quot;);
+418             return;
+419         }
+420 
+421         int result = clear.step();
+422         if (result != SQLITE_DONE) {
+423             LOG_ERROR(&quot;Failed to clear all items in the local storage database - %i&quot;, result);
+424             return;
+425         }
+426     }
+427 
+428     SQLiteStatement insert(m_database, &quot;INSERT INTO ItemTable VALUES (?, ?)&quot;);
+429     if (insert.prepare() != SQLITE_OK) {
+430         LOG_ERROR(&quot;Failed to prepare insert statement - cannot write to local storage database&quot;);
+431         return;
+432     }
+433 
+434     SQLiteStatement remove(m_database, &quot;DELETE FROM ItemTable WHERE key=?&quot;);
+435     if (remove.prepare() != SQLITE_OK) {
+436         LOG_ERROR(&quot;Failed to prepare delete statement - cannot write to local storage database&quot;);
+437         return;
+438     }
+439 
+440     HashMap&lt;String, String&gt;::const_iterator end = items.end();
+441 
+442     SQLiteTransaction transaction(m_database);
+443     transaction.begin();
+444     for (HashMap&lt;String, String&gt;::const_iterator it = items.begin(); it != end; ++it) {
+445         // Based on the null-ness of the second argument, decide whether this is an insert or a delete.
+446         SQLiteStatement&amp; query = it-&gt;value.isNull() ? remove : insert;
+447 
+448         query.bindText(1, it-&gt;key);
+449 
+450         // If the second argument is non-null, we&#39;re doing an insert, so bind it as the value.
+451         if (!it-&gt;value.isNull())
+452             query.bindBlob(2, it-&gt;value);
+453 
+454         int result = query.step();
+455         if (result != SQLITE_DONE) {
+456             LOG_ERROR(&quot;Failed to update item in the local storage database - %i&quot;, result);
+457             break;
+458         }
+459 
+460         query.reset();
+461     }
+462     transaction.commit();
+463 }
+464 
+465 void StorageAreaSync::performSync()
+466 {
+467     ASSERT(!isMainThread());
+468 
+469     bool clearItems;
+470     HashMap&lt;String, String&gt; items;
+471     {
+472         LockHolder locker(m_syncLock);
+473 
+474         ASSERT(m_syncScheduled);
+475 
+476         clearItems = m_clearItemsWhileSyncing;
+477         m_itemsPendingSync.swap(items);
+478 
+479         m_clearItemsWhileSyncing = false;
+480         m_syncScheduled = false;
+481         m_syncInProgress = true;
+482     }
+483 
+484     sync(clearItems, items);
+485 
+486     {
+487         LockHolder locker(m_syncLock);
+488         m_syncInProgress = false;
+489     }
+490 
+491     // The following is balanced by the call to disableSuddenTermination in the
+492     // syncTimerFired function.
+493     enableSuddenTermination();
+494 }
+495 
+496 void StorageAreaSync::deleteEmptyDatabase()
+497 {
+498     ASSERT(!isMainThread());
+499     if (!m_database.isOpen())
+500         return;
+501 
+502     SQLiteStatement query(m_database, &quot;SELECT COUNT(*) FROM ItemTable&quot;);
+503     if (query.prepare() != SQLITE_OK) {
+504         LOG_ERROR(&quot;Unable to count number of rows in ItemTable for local storage&quot;);
+505         return;
+506     }
+507 
+508     int result = query.step();
+509     if (result != SQLITE_ROW) {
+510         LOG_ERROR(&quot;No results when counting number of rows in ItemTable for local storage&quot;);
+511         return;
+512     }
+513 
+514     int count = query.getColumnInt(0);
+515     if (!count) {
+516         query.finalize();
+517         m_database.close();
+518         if (StorageTracker::tracker().isActive()) {
+519             callOnMainThread([databaseIdentifier = m_databaseIdentifier.isolatedCopy()] {
+520                 StorageTracker::tracker().deleteOriginWithIdentifier(databaseIdentifier);
+521             });
+522         } else {
+523             String databaseFilename = m_syncManager-&gt;fullDatabaseFilename(m_databaseIdentifier);
+524             if (!FileSystem::deleteFile(databaseFilename))
+525                 LOG_ERROR(&quot;Failed to delete database file %s\n&quot;, databaseFilename.utf8().data());
+526         }
+527     }
+528 }
+529 
+530 void StorageAreaSync::scheduleSync()
+531 {
+532     syncTimerFired();
+533 }
+534 
+535 } // namespace WebCore
+    </pre>
+  </body>
+</html>
