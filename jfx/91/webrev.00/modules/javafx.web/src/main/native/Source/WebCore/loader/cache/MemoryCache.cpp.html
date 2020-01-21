@@ -1,0 +1,814 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>New modules/javafx.web/src/main/native/Source/WebCore/loader/cache/MemoryCache.cpp</title>
+    <link rel="stylesheet" href="../../../../../../../../../style.css" />
+  </head>
+  <body>
+    <pre>
+  1 /*
+  2     Copyright (C) 1998 Lars Knoll (knoll@mpi-hd.mpg.de)
+  3     Copyright (C) 2001 Dirk Mueller (mueller@kde.org)
+  4     Copyright (C) 2002 Waldo Bastian (bastian@kde.org)
+  5     Copyright (C) 2004, 2005, 2006, 2007, 2008 Apple Inc. All rights reserved.
+  6 
+  7     This library is free software; you can redistribute it and/or
+  8     modify it under the terms of the GNU Library General Public
+  9     License as published by the Free Software Foundation; either
+ 10     version 2 of the License, or (at your option) any later version.
+ 11 
+ 12     This library is distributed in the hope that it will be useful,
+ 13     but WITHOUT ANY WARRANTY; without even the implied warranty of
+ 14     MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ 15     Library General Public License for more details.
+ 16 
+ 17     You should have received a copy of the GNU Library General Public License
+ 18     along with this library; see the file COPYING.LIB.  If not, write to
+ 19     the Free Software Foundation, Inc., 51 Franklin Street, Fifth Floor,
+ 20     Boston, MA 02110-1301, USA.
+ 21 */
+ 22 
+ 23 #include &quot;config.h&quot;
+ 24 #include &quot;MemoryCache.h&quot;
+ 25 
+ 26 #include &quot;BitmapImage.h&quot;
+ 27 #include &quot;CachedImage.h&quot;
+ 28 #include &quot;CachedImageClient.h&quot;
+ 29 #include &quot;CachedResource.h&quot;
+ 30 #include &quot;CachedResourceHandle.h&quot;
+ 31 #include &quot;Document.h&quot;
+ 32 #include &quot;FrameLoader.h&quot;
+ 33 #include &quot;FrameLoaderTypes.h&quot;
+ 34 #include &quot;FrameView.h&quot;
+ 35 #include &quot;Image.h&quot;
+ 36 #include &quot;Logging.h&quot;
+ 37 #include &quot;PublicSuffix.h&quot;
+ 38 #include &quot;SharedBuffer.h&quot;
+ 39 #include &quot;WorkerGlobalScope.h&quot;
+ 40 #include &quot;WorkerLoaderProxy.h&quot;
+ 41 #include &quot;WorkerThread.h&quot;
+ 42 #include &lt;pal/Logging.h&gt;
+ 43 #include &lt;stdio.h&gt;
+ 44 #include &lt;wtf/MathExtras.h&gt;
+ 45 #include &lt;wtf/NeverDestroyed.h&gt;
+ 46 #include &lt;wtf/SetForScope.h&gt;
+ 47 #include &lt;wtf/text/CString.h&gt;
+ 48 
+ 49 namespace WebCore {
+ 50 
+ 51 static const int cDefaultCacheCapacity = 8192 * 1024;
+ 52 static const Seconds cMinDelayBeforeLiveDecodedPrune { 1_s };
+ 53 static const float cTargetPrunePercentage = .95f; // Percentage of capacity toward which we prune, to avoid immediately pruning again.
+ 54 
+ 55 MemoryCache&amp; MemoryCache::singleton()
+ 56 {
+ 57     ASSERT(WTF::isMainThread());
+ 58     static NeverDestroyed&lt;MemoryCache&gt; memoryCache;
+ 59     return memoryCache;
+ 60 }
+ 61 
+ 62 MemoryCache::MemoryCache()
+ 63     : m_capacity(cDefaultCacheCapacity)
+ 64     , m_maxDeadCapacity(cDefaultCacheCapacity)
+ 65     , m_pruneTimer(*this, &amp;MemoryCache::prune)
+ 66 {
+ 67     static_assert(sizeof(long long) &gt; sizeof(unsigned), &quot;Numerical overflow can happen when adjusting the size of the cached memory.&quot;);
+ 68 
+ 69     static std::once_flag onceFlag;
+ 70     std::call_once(onceFlag, [] {
+ 71         PAL::registerNotifyCallback(&quot;com.apple.WebKit.showMemoryCache&quot;, [] {
+ 72             MemoryCache::singleton().dumpStats();
+ 73             MemoryCache::singleton().dumpLRULists(true);
+ 74         });
+ 75     });
+ 76 }
+ 77 
+ 78 auto MemoryCache::sessionResourceMap(PAL::SessionID sessionID) const -&gt; CachedResourceMap*
+ 79 {
+ 80     ASSERT(sessionID.isValid());
+ 81     return m_sessionResources.get(sessionID);
+ 82 }
+ 83 
+ 84 auto MemoryCache::ensureSessionResourceMap(PAL::SessionID sessionID) -&gt; CachedResourceMap&amp;
+ 85 {
+ 86     ASSERT(sessionID.isValid());
+ 87     auto&amp; map = m_sessionResources.add(sessionID, nullptr).iterator-&gt;value;
+ 88     if (!map)
+ 89         map = makeUnique&lt;CachedResourceMap&gt;();
+ 90     return *map;
+ 91 }
+ 92 
+ 93 bool MemoryCache::shouldRemoveFragmentIdentifier(const URL&amp; originalURL)
+ 94 {
+ 95     if (!originalURL.hasFragmentIdentifier())
+ 96         return false;
+ 97     // Strip away fragment identifier from HTTP URLs.
+ 98     // Data URLs must be unmodified. For file and custom URLs clients may expect resources
+ 99     // to be unique even when they differ by the fragment identifier only.
+100     return originalURL.protocolIsInHTTPFamily();
+101 }
+102 
+103 URL MemoryCache::removeFragmentIdentifierIfNeeded(const URL&amp; originalURL)
+104 {
+105     if (!shouldRemoveFragmentIdentifier(originalURL))
+106         return originalURL;
+107     URL url = originalURL;
+108     url.removeFragmentIdentifier();
+109     return url;
+110 }
+111 
+112 bool MemoryCache::add(CachedResource&amp; resource)
+113 {
+114     if (disabled())
+115         return false;
+116 
+117     ASSERT(WTF::isMainThread());
+118 
+119     auto key = std::make_pair(resource.url(), resource.cachePartition());
+120 
+121     ensureSessionResourceMap(resource.sessionID()).set(key, &amp;resource);
+122     resource.setInCache(true);
+123 
+124     resourceAccessed(resource);
+125 
+126     LOG(ResourceLoading, &quot;MemoryCache::add Added &#39;%.255s&#39;, resource %p\n&quot;, resource.url().string().latin1().data(), &amp;resource);
+127     return true;
+128 }
+129 
+130 void MemoryCache::revalidationSucceeded(CachedResource&amp; revalidatingResource, const ResourceResponse&amp; response)
+131 {
+132     ASSERT(response.source() == ResourceResponse::Source::MemoryCacheAfterValidation);
+133     ASSERT(revalidatingResource.resourceToRevalidate());
+134     CachedResource&amp; resource = *revalidatingResource.resourceToRevalidate();
+135     ASSERT(!resource.inCache());
+136     ASSERT(resource.isLoaded());
+137 
+138     // Calling remove() can potentially delete revalidatingResource, which we use
+139     // below. This mustn&#39;t be the case since revalidation means it is loaded
+140     // and so canDelete() is false.
+141     ASSERT(!revalidatingResource.canDelete());
+142 
+143     remove(revalidatingResource);
+144 
+145     auto&amp; resources = ensureSessionResourceMap(resource.sessionID());
+146     auto key = std::make_pair(resource.url(), resource.cachePartition());
+147 
+148     ASSERT(!resources.get(key));
+149     resources.set(key, &amp;resource);
+150     resource.setInCache(true);
+151     resource.updateResponseAfterRevalidation(response);
+152     insertInLRUList(resource);
+153     long long delta = resource.size();
+154     if (resource.decodedSize() &amp;&amp; resource.hasClients())
+155         insertInLiveDecodedResourcesList(resource);
+156     if (delta)
+157         adjustSize(resource.hasClients(), delta);
+158 
+159     revalidatingResource.switchClientsToRevalidatedResource();
+160     ASSERT(!revalidatingResource.m_deleted);
+161     // this deletes the revalidating resource
+162     revalidatingResource.clearResourceToRevalidate();
+163 }
+164 
+165 void MemoryCache::revalidationFailed(CachedResource&amp; revalidatingResource)
+166 {
+167     ASSERT(WTF::isMainThread());
+168     LOG(ResourceLoading, &quot;Revalidation failed for %p&quot;, &amp;revalidatingResource);
+169     ASSERT(revalidatingResource.resourceToRevalidate());
+170     revalidatingResource.clearResourceToRevalidate();
+171 }
+172 
+173 CachedResource* MemoryCache::resourceForRequest(const ResourceRequest&amp; request, PAL::SessionID sessionID)
+174 {
+175     // FIXME: Change all clients to make sure HTTP(s) URLs have no fragment identifiers before calling here.
+176     // CachedResourceLoader is now doing this. Add an assertion once all other clients are doing it too.
+177     auto* resources = sessionResourceMap(sessionID);
+178     if (!resources)
+179         return nullptr;
+180     return resourceForRequestImpl(request, *resources);
+181 }
+182 
+183 CachedResource* MemoryCache::resourceForRequestImpl(const ResourceRequest&amp; request, CachedResourceMap&amp; resources)
+184 {
+185     ASSERT(WTF::isMainThread());
+186     URL url = removeFragmentIdentifierIfNeeded(request.url());
+187 
+188     auto key = std::make_pair(url, request.cachePartition());
+189     return resources.get(key);
+190 }
+191 
+192 unsigned MemoryCache::deadCapacity() const
+193 {
+194     // Dead resource capacity is whatever space is not occupied by live resources, bounded by an independent minimum and maximum.
+195     unsigned capacity = m_capacity - std::min(m_liveSize, m_capacity); // Start with available capacity.
+196     capacity = std::max(capacity, m_minDeadCapacity); // Make sure it&#39;s above the minimum.
+197     capacity = std::min(capacity, m_maxDeadCapacity); // Make sure it&#39;s below the maximum.
+198     return capacity;
+199 }
+200 
+201 unsigned MemoryCache::liveCapacity() const
+202 {
+203     // Live resource capacity is whatever is left over after calculating dead resource capacity.
+204     return m_capacity - deadCapacity();
+205 }
+206 
+207 static CachedImageClient&amp; dummyCachedImageClient()
+208 {
+209     static NeverDestroyed&lt;CachedImageClient&gt; client;
+210     return client;
+211 }
+212 
+213 bool MemoryCache::addImageToCache(NativeImagePtr&amp;&amp; image, const URL&amp; url, const String&amp; domainForCachePartition, const PAL::SessionID&amp; sessionID, const CookieJar* cookieJar)
+214 {
+215     ASSERT(image);
+216     removeImageFromCache(url, domainForCachePartition); // Remove cache entry if it already exists.
+217 
+218     auto bitmapImage = BitmapImage::create(WTFMove(image), nullptr);
+219     auto cachedImage = makeUnique&lt;CachedImage&gt;(url, bitmapImage.ptr(), sessionID, cookieJar, domainForCachePartition);
+220 
+221     cachedImage-&gt;addClient(dummyCachedImageClient());
+222     cachedImage-&gt;setDecodedSize(bitmapImage-&gt;decodedSize());
+223 
+224     return add(*cachedImage.release());
+225 }
+226 
+227 void MemoryCache::removeImageFromCache(const URL&amp; url, const String&amp; domainForCachePartition)
+228 {
+229     auto* resources = sessionResourceMap(PAL::SessionID::defaultSessionID());
+230     if (!resources)
+231         return;
+232 
+233     auto key = std::make_pair(url, ResourceRequest::partitionName(domainForCachePartition));
+234 
+235     CachedResource* resource = resources-&gt;get(key);
+236     if (!resource)
+237         return;
+238 
+239     // A resource exists and is not a manually cached image, so just remove it.
+240     if (!is&lt;CachedImage&gt;(*resource) || !downcast&lt;CachedImage&gt;(*resource).isManuallyCached()) {
+241         remove(*resource);
+242         return;
+243     }
+244 
+245     // Removing the last client of a CachedImage turns the resource
+246     // into a dead resource which will eventually be evicted when
+247     // dead resources are pruned. That might be immediately since
+248     // removing the last client triggers a MemoryCache::prune, so the
+249     // resource may be deleted after this call.
+250     downcast&lt;CachedImage&gt;(*resource).removeClient(dummyCachedImageClient());
+251 }
+252 
+253 void MemoryCache::pruneLiveResources(bool shouldDestroyDecodedDataForAllLiveResources)
+254 {
+255     unsigned capacity = shouldDestroyDecodedDataForAllLiveResources ? 0 : liveCapacity();
+256     if (capacity &amp;&amp; m_liveSize &lt;= capacity)
+257         return;
+258 
+259     unsigned targetSize = static_cast&lt;unsigned&gt;(capacity * cTargetPrunePercentage); // Cut by a percentage to avoid immediately pruning again.
+260 
+261     pruneLiveResourcesToSize(targetSize, shouldDestroyDecodedDataForAllLiveResources);
+262 }
+263 
+264 void MemoryCache::forEachResource(const WTF::Function&lt;void(CachedResource&amp;)&gt;&amp; function)
+265 {
+266     for (auto&amp; unprotectedLRUList : m_allResources) {
+267         for (auto&amp; resource : copyToVector(*unprotectedLRUList))
+268             function(*resource);
+269     }
+270 }
+271 
+272 void MemoryCache::forEachSessionResource(PAL::SessionID sessionID, const WTF::Function&lt;void (CachedResource&amp;)&gt;&amp; function)
+273 {
+274     auto it = m_sessionResources.find(sessionID);
+275     if (it == m_sessionResources.end())
+276         return;
+277 
+278     for (auto&amp; resource : copyToVector(it-&gt;value-&gt;values()))
+279         function(*resource);
+280 }
+281 
+282 void MemoryCache::destroyDecodedDataForAllImages()
+283 {
+284     MemoryCache::singleton().forEachResource([](CachedResource&amp; resource) {
+285         if (!resource.isImage())
+286             return;
+287 
+288         if (auto image = downcast&lt;CachedImage&gt;(resource).image())
+289             image-&gt;destroyDecodedData();
+290     });
+291 }
+292 
+293 void MemoryCache::pruneLiveResourcesToSize(unsigned targetSize, bool shouldDestroyDecodedDataForAllLiveResources)
+294 {
+295     if (m_inPruneResources)
+296         return;
+297 
+298     LOG(ResourceLoading, &quot;MemoryCache::pruneLiveResourcesToSize(%d, shouldDestroyDecodedDataForAllLiveResources = %d)&quot;, targetSize, shouldDestroyDecodedDataForAllLiveResources);
+299 
+300     SetForScope&lt;bool&gt; reentrancyProtector(m_inPruneResources, true);
+301 
+302     MonotonicTime currentTime = FrameView::currentPaintTimeStamp();
+303     if (!currentTime) // In case prune is called directly, outside of a Frame paint.
+304         currentTime = MonotonicTime::now();
+305 
+306     // Destroy any decoded data in live objects that we can.
+307     // Start from the head, since this is the least recently accessed of the objects.
+308 
+309     // The list might not be sorted by the m_lastDecodedAccessTime. The impact
+310     // of this weaker invariant is minor as the below if statement to check the
+311     // elapsedTime will evaluate to false as the currentTime will be a lot
+312     // greater than the current-&gt;m_lastDecodedAccessTime.
+313     // For more details see: https://bugs.webkit.org/show_bug.cgi?id=30209
+314     auto it = m_liveDecodedResources.begin();
+315     while (it != m_liveDecodedResources.end()) {
+316         auto* current = *it;
+317 
+318         LOG(ResourceLoading, &quot; live resource %p %.255s - loaded %d, decodedSize %u&quot;, current, current-&gt;url().string().utf8().data(), current-&gt;isLoaded(), current-&gt;decodedSize());
+319 
+320         // Increment the iterator now because the call to destroyDecodedData() below
+321         // may cause a call to ListHashSet::remove() and invalidate the current
+322         // iterator. Note that this is safe because unlike iteration of most
+323         // WTF Hash data structures, iteration is guaranteed safe against mutation
+324         // of the ListHashSet, except for removal of the item currently pointed to
+325         // by a given iterator.
+326         ++it;
+327 
+328         ASSERT(current-&gt;hasClients());
+329         if (current-&gt;isLoaded() &amp;&amp; current-&gt;decodedSize()) {
+330             // Check to see if the remaining resources are too new to prune.
+331             Seconds elapsedTime = currentTime - current-&gt;m_lastDecodedAccessTime;
+332             if (!shouldDestroyDecodedDataForAllLiveResources &amp;&amp; elapsedTime &lt; cMinDelayBeforeLiveDecodedPrune) {
+333                 LOG(ResourceLoading, &quot; current time is less than min delay before pruning (%.3fms)&quot;, elapsedTime.milliseconds());
+334                 return;
+335             }
+336 
+337             // Destroy our decoded data. This will remove us from m_liveDecodedResources, and possibly move us
+338             // to a different LRU list in m_allResources.
+339             current-&gt;destroyDecodedData();
+340 
+341             if (targetSize &amp;&amp; m_liveSize &lt;= targetSize)
+342                 return;
+343         }
+344     }
+345 }
+346 
+347 void MemoryCache::pruneDeadResources()
+348 {
+349     LOG(ResourceLoading, &quot;MemoryCache::pruneDeadResources&quot;);
+350 
+351     unsigned capacity = deadCapacity();
+352     if (capacity &amp;&amp; m_deadSize &lt;= capacity)
+353         return;
+354 
+355     unsigned targetSize = static_cast&lt;unsigned&gt;(capacity * cTargetPrunePercentage); // Cut by a percentage to avoid immediately pruning again.
+356     pruneDeadResourcesToSize(targetSize);
+357 }
+358 
+359 void MemoryCache::pruneDeadResourcesToSize(unsigned targetSize)
+360 {
+361     if (m_inPruneResources)
+362         return;
+363 
+364     LOG(ResourceLoading, &quot;MemoryCache::pruneDeadResourcesToSize(%d)&quot;, targetSize);
+365 
+366     SetForScope&lt;bool&gt; reentrancyProtector(m_inPruneResources, true);
+367 
+368     if (targetSize &amp;&amp; m_deadSize &lt;= targetSize)
+369         return;
+370 
+371     bool canShrinkLRULists = true;
+372     for (int i = m_allResources.size() - 1; i &gt;= 0; i--) {
+373         // Make a copy of the LRUList first (and ref the resources) as calling
+374         // destroyDecodedData() can alter the LRUList.
+375         auto lruList = copyToVector(*m_allResources[i]);
+376 
+377         LOG(ResourceLoading, &quot; lru list (size %lu) - flushing stage&quot;, lruList.size());
+378 
+379         // First flush all the decoded data in this queue.
+380         // Remove from the head, since this is the least frequently accessed of the objects.
+381         for (auto&amp; resource : lruList) {
+382             LOG(ResourceLoading, &quot; lru resource %p - in cache %d, has clients %d, preloaded %d, loaded %d&quot;, resource, resource-&gt;inCache(), resource-&gt;hasClients(), resource-&gt;isPreloaded(), resource-&gt;isLoaded());
+383             if (!resource-&gt;inCache())
+384                 continue;
+385 
+386             if (!resource-&gt;hasClients() &amp;&amp; !resource-&gt;isPreloaded() &amp;&amp; resource-&gt;isLoaded()) {
+387                 // Destroy our decoded data. This will remove us from
+388                 // m_liveDecodedResources, and possibly move us to a different
+389                 // LRU list in m_allResources.
+390 
+391                 LOG(ResourceLoading, &quot; lru resource %p destroyDecodedData&quot;, resource);
+392 
+393                 resource-&gt;destroyDecodedData();
+394 
+395                 if (targetSize &amp;&amp; m_deadSize &lt;= targetSize)
+396                     return;
+397             }
+398         }
+399 
+400         LOG(ResourceLoading, &quot; lru list (size %lu) - eviction stage&quot;, lruList.size());
+401 
+402         // Now evict objects from this list.
+403         // Remove from the head, since this is the least frequently accessed of the objects.
+404         for (auto&amp; resource : lruList) {
+405             LOG(ResourceLoading, &quot; lru resource %p - in cache %d, has clients %d, preloaded %d, loaded %d&quot;, resource, resource-&gt;inCache(), resource-&gt;hasClients(), resource-&gt;isPreloaded(), resource-&gt;isLoaded());
+406             if (!resource-&gt;inCache())
+407                 continue;
+408 
+409             if (!resource-&gt;hasClients() &amp;&amp; !resource-&gt;isPreloaded() &amp;&amp; !resource-&gt;isCacheValidator()) {
+410                 remove(*resource);
+411                 if (targetSize &amp;&amp; m_deadSize &lt;= targetSize)
+412                     return;
+413             }
+414         }
+415 
+416         // Shrink the vector back down so we don&#39;t waste time inspecting
+417         // empty LRU lists on future prunes.
+418         if (!m_allResources[i]-&gt;isEmpty())
+419             canShrinkLRULists = false;
+420         else if (canShrinkLRULists)
+421             m_allResources.shrink(i);
+422     }
+423 }
+424 
+425 void MemoryCache::setCapacities(unsigned minDeadBytes, unsigned maxDeadBytes, unsigned totalBytes)
+426 {
+427     ASSERT(minDeadBytes &lt;= maxDeadBytes);
+428     ASSERT(maxDeadBytes &lt;= totalBytes);
+429     m_minDeadCapacity = minDeadBytes;
+430     m_maxDeadCapacity = maxDeadBytes;
+431     m_capacity = totalBytes;
+432     prune();
+433 }
+434 
+435 void MemoryCache::remove(CachedResource&amp; resource)
+436 {
+437     ASSERT(WTF::isMainThread());
+438     LOG(ResourceLoading, &quot;Evicting resource %p for &#39;%.255s&#39; from cache&quot;, &amp;resource, resource.url().string().latin1().data());
+439     // The resource may have already been removed by someone other than our caller,
+440     // who needed a fresh copy for a reload. See &lt;http://bugs.webkit.org/show_bug.cgi?id=12479#c6&gt;.
+441     if (auto* resources = sessionResourceMap(resource.sessionID())) {
+442         auto key = std::make_pair(resource.url(), resource.cachePartition());
+443 
+444         if (resource.inCache()) {
+445             // Remove resource from the resource map.
+446             resources-&gt;remove(key);
+447             resource.setInCache(false);
+448 
+449             // If the resource map is now empty, remove it from m_sessionResources.
+450             if (resources-&gt;isEmpty())
+451                 m_sessionResources.remove(resource.sessionID());
+452 
+453             // Remove from the appropriate LRU list.
+454             removeFromLRUList(resource);
+455             removeFromLiveDecodedResourcesList(resource);
+456             adjustSize(resource.hasClients(), -static_cast&lt;long long&gt;(resource.size()));
+457         } else {
+458             ASSERT(resources-&gt;get(key) != &amp;resource);
+459             LOG(ResourceLoading, &quot;  resource %p is not in cache&quot;, &amp;resource);
+460         }
+461     }
+462 
+463     resource.deleteIfPossible();
+464 }
+465 
+466 auto MemoryCache::lruListFor(CachedResource&amp; resource) -&gt; LRUList&amp;
+467 {
+468     unsigned accessCount = std::max(resource.accessCount(), 1U);
+469     unsigned queueIndex = WTF::fastLog2(resource.size() / accessCount);
+470 #ifndef NDEBUG
+471     resource.m_lruIndex = queueIndex;
+472 #endif
+473 
+474     m_allResources.reserveCapacity(queueIndex + 1);
+475     while (m_allResources.size() &lt;= queueIndex)
+476         m_allResources.uncheckedAppend(makeUnique&lt;LRUList&gt;());
+477     return *m_allResources[queueIndex];
+478 }
+479 
+480 void MemoryCache::removeFromLRUList(CachedResource&amp; resource)
+481 {
+482     // If we&#39;ve never been accessed, then we&#39;re brand new and not in any list.
+483     if (!resource.accessCount())
+484         return;
+485 
+486 #if !ASSERT_DISABLED
+487     unsigned oldListIndex = resource.m_lruIndex;
+488 #endif
+489 
+490     LRUList&amp; list = lruListFor(resource);
+491 
+492     // Verify that the list we got is the list we want.
+493     ASSERT(resource.m_lruIndex == oldListIndex);
+494 
+495     bool removed = list.remove(&amp;resource);
+496     ASSERT_UNUSED(removed, removed);
+497 }
+498 
+499 void MemoryCache::insertInLRUList(CachedResource&amp; resource)
+500 {
+501     ASSERT(resource.inCache());
+502     ASSERT(resource.accessCount() &gt; 0);
+503 
+504     auto addResult = lruListFor(resource).add(&amp;resource);
+505     ASSERT_UNUSED(addResult, addResult.isNewEntry);
+506 }
+507 
+508 void MemoryCache::resourceAccessed(CachedResource&amp; resource)
+509 {
+510     ASSERT(resource.inCache());
+511 
+512     // Need to make sure to remove before we increase the access count, since
+513     // the queue will possibly change.
+514     removeFromLRUList(resource);
+515 
+516     // If this is the first time the resource has been accessed, adjust the size of the cache to account for its initial size.
+517     if (!resource.accessCount())
+518         adjustSize(resource.hasClients(), resource.size());
+519 
+520     // Add to our access count.
+521     resource.increaseAccessCount();
+522 
+523     // Now insert into the new queue.
+524     insertInLRUList(resource);
+525 }
+526 
+527 void MemoryCache::removeResourcesWithOrigin(SecurityOrigin&amp; origin)
+528 {
+529     String originPartition = ResourceRequest::partitionName(origin.host());
+530 
+531     Vector&lt;CachedResource*&gt; resourcesWithOrigin;
+532     for (auto&amp; resources : m_sessionResources.values()) {
+533         for (auto&amp; keyValue : *resources) {
+534             auto&amp; resource = *keyValue.value;
+535             auto&amp; partitionName = keyValue.key.second;
+536             if (partitionName == originPartition) {
+537                 resourcesWithOrigin.append(&amp;resource);
+538                 continue;
+539             }
+540             auto resourceOrigin = SecurityOrigin::create(resource.url());
+541             if (resourceOrigin-&gt;equal(&amp;origin))
+542                 resourcesWithOrigin.append(&amp;resource);
+543         }
+544     }
+545 
+546     for (auto* resource : resourcesWithOrigin)
+547         remove(*resource);
+548 }
+549 
+550 void MemoryCache::removeResourcesWithOrigins(PAL::SessionID sessionID, const HashSet&lt;RefPtr&lt;SecurityOrigin&gt;&gt;&amp; origins)
+551 {
+552     auto* resourceMap = sessionResourceMap(sessionID);
+553     if (!resourceMap)
+554         return;
+555 
+556     HashSet&lt;String&gt; originPartitions;
+557 
+558     for (auto&amp; origin : origins)
+559         originPartitions.add(ResourceRequest::partitionName(origin-&gt;host()));
+560 
+561     Vector&lt;CachedResource*&gt; resourcesToRemove;
+562     for (auto&amp; keyValuePair : *resourceMap) {
+563         auto&amp; resource = *keyValuePair.value;
+564         auto&amp; partitionName = keyValuePair.key.second;
+565         if (originPartitions.contains(partitionName)) {
+566             resourcesToRemove.append(&amp;resource);
+567             continue;
+568         }
+569         if (origins.contains(SecurityOrigin::create(resource.url()).ptr()))
+570             resourcesToRemove.append(&amp;resource);
+571     }
+572 
+573     for (auto&amp; resource : resourcesToRemove)
+574         remove(*resource);
+575 }
+576 
+577 void MemoryCache::getOriginsWithCache(SecurityOriginSet&amp; origins)
+578 {
+579     for (auto&amp; resources : m_sessionResources.values()) {
+580         for (auto&amp; keyValue : *resources) {
+581             auto&amp; resource = *keyValue.value;
+582             auto&amp; partitionName = keyValue.key.second;
+583             if (!partitionName.isEmpty())
+584                 origins.add(SecurityOrigin::create(&quot;http&quot;_s, partitionName, 0));
+585             else
+586                 origins.add(SecurityOrigin::create(resource.url()));
+587         }
+588     }
+589 }
+590 
+591 HashSet&lt;RefPtr&lt;SecurityOrigin&gt;&gt; MemoryCache::originsWithCache(PAL::SessionID sessionID) const
+592 {
+593     HashSet&lt;RefPtr&lt;SecurityOrigin&gt;&gt; origins;
+594 
+595     auto it = m_sessionResources.find(sessionID);
+596     if (it != m_sessionResources.end()) {
+597         for (auto&amp; keyValue : *it-&gt;value) {
+598             auto&amp; resource = *keyValue.value;
+599             auto&amp; partitionName = keyValue.key.second;
+600             if (!partitionName.isEmpty())
+601                 origins.add(SecurityOrigin::create(&quot;http&quot;, partitionName, 0));
+602             else
+603                 origins.add(SecurityOrigin::create(resource.url()));
+604         }
+605     }
+606 
+607     return origins;
+608 }
+609 
+610 void MemoryCache::removeFromLiveDecodedResourcesList(CachedResource&amp; resource)
+611 {
+612     m_liveDecodedResources.remove(&amp;resource);
+613 }
+614 
+615 void MemoryCache::insertInLiveDecodedResourcesList(CachedResource&amp; resource)
+616 {
+617     // Make sure we aren&#39;t in the list already.
+618     ASSERT(!m_liveDecodedResources.contains(&amp;resource));
+619     m_liveDecodedResources.add(&amp;resource);
+620 }
+621 
+622 void MemoryCache::addToLiveResourcesSize(CachedResource&amp; resource)
+623 {
+624     m_liveSize += resource.size();
+625     m_deadSize -= resource.size();
+626 }
+627 
+628 void MemoryCache::removeFromLiveResourcesSize(CachedResource&amp; resource)
+629 {
+630     m_liveSize -= resource.size();
+631     m_deadSize += resource.size();
+632 }
+633 
+634 void MemoryCache::adjustSize(bool live, long long delta)
+635 {
+636     if (live) {
+637         ASSERT(delta &gt;= 0 || (static_cast&lt;long long&gt;(m_liveSize) + delta &gt;= 0));
+638         m_liveSize += delta;
+639     } else {
+640         ASSERT(delta &gt;= 0 || (static_cast&lt;long long&gt;(m_deadSize) + delta &gt;= 0));
+641         m_deadSize += delta;
+642     }
+643 }
+644 
+645 void MemoryCache::removeRequestFromSessionCaches(ScriptExecutionContext&amp; context, const ResourceRequest&amp; request)
+646 {
+647     if (is&lt;WorkerGlobalScope&gt;(context)) {
+648         downcast&lt;WorkerGlobalScope&gt;(context).thread().workerLoaderProxy().postTaskToLoader([request = request.isolatedCopy()] (ScriptExecutionContext&amp; context) {
+649             MemoryCache::removeRequestFromSessionCaches(context, request);
+650         });
+651         return;
+652     }
+653 
+654     auto&amp; memoryCache = MemoryCache::singleton();
+655     for (auto&amp; resources : memoryCache.m_sessionResources) {
+656         if (CachedResource* resource = memoryCache.resourceForRequestImpl(request, *resources.value))
+657             memoryCache.remove(*resource);
+658     }
+659 }
+660 
+661 void MemoryCache::TypeStatistic::addResource(CachedResource&amp; resource)
+662 {
+663     count++;
+664     size += resource.size();
+665     liveSize += resource.hasClients() ? resource.size() : 0;
+666     decodedSize += resource.decodedSize();
+667 }
+668 
+669 MemoryCache::Statistics MemoryCache::getStatistics()
+670 {
+671     Statistics stats;
+672 
+673     for (auto&amp; resources : m_sessionResources.values()) {
+674         for (auto* resource : resources-&gt;values()) {
+675             switch (resource-&gt;type()) {
+676             case CachedResource::Type::ImageResource:
+677                 stats.images.addResource(*resource);
+678                 break;
+679             case CachedResource::Type::CSSStyleSheet:
+680                 stats.cssStyleSheets.addResource(*resource);
+681                 break;
+682             case CachedResource::Type::Script:
+683                 stats.scripts.addResource(*resource);
+684                 break;
+685 #if ENABLE(XSLT)
+686             case CachedResource::Type::XSLStyleSheet:
+687                 stats.xslStyleSheets.addResource(*resource);
+688                 break;
+689 #endif
+690 #if ENABLE(SVG_FONTS)
+691             case CachedResource::Type::SVGFontResource:
+692 #endif
+693             case CachedResource::Type::FontResource:
+694                 stats.fonts.addResource(*resource);
+695                 break;
+696             default:
+697                 break;
+698             }
+699         }
+700     }
+701     return stats;
+702 }
+703 
+704 void MemoryCache::setDisabled(bool disabled)
+705 {
+706     m_disabled = disabled;
+707     if (!m_disabled)
+708         return;
+709 
+710     while (!m_sessionResources.isEmpty()) {
+711         auto&amp; resources = *m_sessionResources.begin()-&gt;value;
+712         ASSERT(!resources.isEmpty());
+713         remove(*resources.begin()-&gt;value);
+714     }
+715 }
+716 
+717 void MemoryCache::evictResources()
+718 {
+719     if (disabled())
+720         return;
+721 
+722     setDisabled(true);
+723     setDisabled(false);
+724 }
+725 
+726 void MemoryCache::evictResources(PAL::SessionID sessionID)
+727 {
+728     if (disabled())
+729         return;
+730 
+731     forEachSessionResource(sessionID, [this] (CachedResource&amp; resource) { remove(resource); });
+732 
+733     ASSERT(!m_sessionResources.contains(sessionID));
+734 }
+735 
+736 bool MemoryCache::needsPruning() const
+737 {
+738     return m_liveSize + m_deadSize &gt; m_capacity || m_deadSize &gt; m_maxDeadCapacity;
+739 }
+740 
+741 void MemoryCache::prune()
+742 {
+743     if (!needsPruning())
+744         return;
+745 
+746     pruneDeadResources(); // Prune dead first, in case it was &quot;borrowing&quot; capacity from live.
+747     pruneLiveResources();
+748 }
+749 
+750 void MemoryCache::pruneSoon()
+751 {
+752     if (m_pruneTimer.isActive())
+753         return;
+754     if (!needsPruning())
+755         return;
+756     m_pruneTimer.startOneShot(0_s);
+757 }
+758 
+759 void MemoryCache::dumpStats()
+760 {
+761     Statistics s = getStatistics();
+762     WTFLogAlways(&quot;\nMemory Cache&quot;);
+763     WTFLogAlways(&quot;%-13s %-13s %-13s %-13s %-13s\n&quot;, &quot;&quot;, &quot;Count&quot;, &quot;Size&quot;, &quot;LiveSize&quot;, &quot;DecodedSize&quot;);
+764     WTFLogAlways(&quot;%-13s %-13s %-13s %-13s %-13s\n&quot;, &quot;-------------&quot;, &quot;-------------&quot;, &quot;-------------&quot;, &quot;-------------&quot;, &quot;-------------&quot;);
+765     WTFLogAlways(&quot;%-13s %13d %13d %13d %13d\n&quot;, &quot;Images&quot;, s.images.count, s.images.size, s.images.liveSize, s.images.decodedSize);
+766     WTFLogAlways(&quot;%-13s %13d %13d %13d %13d\n&quot;, &quot;CSS&quot;, s.cssStyleSheets.count, s.cssStyleSheets.size, s.cssStyleSheets.liveSize, s.cssStyleSheets.decodedSize);
+767 #if ENABLE(XSLT)
+768     WTFLogAlways(&quot;%-13s %13d %13d %13d %13d\n&quot;, &quot;XSL&quot;, s.xslStyleSheets.count, s.xslStyleSheets.size, s.xslStyleSheets.liveSize, s.xslStyleSheets.decodedSize);
+769 #endif
+770     WTFLogAlways(&quot;%-13s %13d %13d %13d %13d\n&quot;, &quot;JavaScript&quot;, s.scripts.count, s.scripts.size, s.scripts.liveSize, s.scripts.decodedSize);
+771     WTFLogAlways(&quot;%-13s %13d %13d %13d %13d\n&quot;, &quot;Fonts&quot;, s.fonts.count, s.fonts.size, s.fonts.liveSize, s.fonts.decodedSize);
+772     WTFLogAlways(&quot;%-13s %-13s %-13s %-13s %-13s\n\n&quot;, &quot;-------------&quot;, &quot;-------------&quot;, &quot;-------------&quot;, &quot;-------------&quot;, &quot;-------------&quot;);
+773 
+774     unsigned countTotal = s.images.count + s.cssStyleSheets.count + s.scripts.count + s.fonts.count;
+775     unsigned sizeTotal = s.images.size + s.cssStyleSheets.size + s.scripts.size + s.fonts.size;
+776     unsigned liveSizeTotal = s.images.liveSize + s.cssStyleSheets.liveSize + s.scripts.liveSize + s.fonts.liveSize;
+777     unsigned decodedSizeTotal = s.images.decodedSize + s.cssStyleSheets.decodedSize + s.scripts.decodedSize + s.fonts.decodedSize;
+778 #if ENABLE(XSLT)
+779     countTotal += s.xslStyleSheets.count;
+780     sizeTotal += s.xslStyleSheets.size;
+781     liveSizeTotal += s.xslStyleSheets.liveSize;
+782     decodedSizeTotal += s.xslStyleSheets.decodedSize;
+783 #endif
+784 
+785     WTFLogAlways(&quot;%-13s %13d %11.2fKB %11.2fKB %11.2fKB\n&quot;, &quot;Total&quot;, countTotal, sizeTotal / 1024., liveSizeTotal / 1024., decodedSizeTotal / 1024.);
+786 }
+787 
+788 void MemoryCache::dumpLRULists(bool includeLive) const
+789 {
+790     WTFLogAlways(&quot;LRU-SP lists in eviction order (Kilobytes decoded, Kilobytes encoded, Access count, Referenced):\n&quot;);
+791 
+792     int size = m_allResources.size();
+793     for (int i = size - 1; i &gt;= 0; i--) {
+794         WTFLogAlways(&quot;\nList %d:\n&quot;, i);
+795         for (auto* resource : *m_allResources[i]) {
+796             if (includeLive || !resource-&gt;hasClients())
+797                 WTFLogAlways(&quot;  %p %.255s %.1fK, %.1fK, accesses: %u, clients: %d\n&quot;, resource, resource-&gt;url().string().utf8().data(), resource-&gt;decodedSize() / 1024.0f, (resource-&gt;encodedSize() + resource-&gt;overheadSize()) / 1024.0f, resource-&gt;accessCount(), resource-&gt;numberOfClients());
+798         }
+799     }
+800 }
+801 
+802 } // namespace WebCore
+    </pre>
+  </body>
+</html>
