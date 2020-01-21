@@ -1,0 +1,663 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>New modules/javafx.web/src/main/native/Source/JavaScriptCore/jit/ExecutableAllocator.cpp</title>
+    <link rel="stylesheet" href="../../../../../../../../style.css" />
+  </head>
+  <body>
+    <pre>
+  1 /*
+  2  * Copyright (C) 2008-2019 Apple Inc. All rights reserved.
+  3  *
+  4  * Redistribution and use in source and binary forms, with or without
+  5  * modification, are permitted provided that the following conditions
+  6  * are met:
+  7  * 1. Redistributions of source code must retain the above copyright
+  8  *    notice, this list of conditions and the following disclaimer.
+  9  * 2. Redistributions in binary form must reproduce the above copyright
+ 10  *    notice, this list of conditions and the following disclaimer in the
+ 11  *    documentation and/or other materials provided with the distribution.
+ 12  *
+ 13  * THIS SOFTWARE IS PROVIDED BY APPLE INC. ``AS IS&#39;&#39; AND ANY
+ 14  * EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ 15  * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+ 16  * PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL APPLE INC. OR
+ 17  * CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+ 18  * EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+ 19  * PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
+ 20  * PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY
+ 21  * OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ 22  * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ 23  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ 24  */
+ 25 
+ 26 #include &quot;config.h&quot;
+ 27 #include &quot;ExecutableAllocator.h&quot;
+ 28 
+ 29 #if ENABLE(JIT)
+ 30 
+ 31 #include &quot;CodeProfiling.h&quot;
+ 32 #include &quot;ExecutableAllocationFuzz.h&quot;
+ 33 #include &quot;JSCInlines.h&quot;
+ 34 #include &lt;wtf/FileSystem.h&gt;
+ 35 #include &lt;wtf/MetaAllocator.h&gt;
+ 36 #include &lt;wtf/PageReservation.h&gt;
+ 37 #include &lt;wtf/ProcessID.h&gt;
+ 38 #include &lt;wtf/SystemTracing.h&gt;
+ 39 #include &lt;wtf/WorkQueue.h&gt;
+ 40 
+ 41 #if OS(DARWIN)
+ 42 #include &lt;mach/mach_time.h&gt;
+ 43 #include &lt;sys/mman.h&gt;
+ 44 #endif
+ 45 
+ 46 #if PLATFORM(IOS_FAMILY)
+ 47 #include &lt;wtf/cocoa/Entitlements.h&gt;
+ 48 #endif
+ 49 
+ 50 #include &quot;LinkBuffer.h&quot;
+ 51 #include &quot;MacroAssembler.h&quot;
+ 52 
+ 53 #if PLATFORM(COCOA)
+ 54 #define HAVE_REMAP_JIT 1
+ 55 #endif
+ 56 
+ 57 #if HAVE(REMAP_JIT)
+ 58 #if CPU(ARM64) &amp;&amp; PLATFORM(IOS_FAMILY)
+ 59 #define USE_EXECUTE_ONLY_JIT_WRITE_FUNCTION 1
+ 60 #endif
+ 61 #endif
+ 62 
+ 63 #if OS(DARWIN)
+ 64 #include &lt;mach/mach.h&gt;
+ 65 extern &quot;C&quot; {
+ 66     /* Routine mach_vm_remap */
+ 67 #ifdef mig_external
+ 68     mig_external
+ 69 #else
+ 70     extern
+ 71 #endif /* mig_external */
+ 72     kern_return_t mach_vm_remap
+ 73     (
+ 74      vm_map_t target_task,
+ 75      mach_vm_address_t *target_address,
+ 76      mach_vm_size_t size,
+ 77      mach_vm_offset_t mask,
+ 78      int flags,
+ 79      vm_map_t src_task,
+ 80      mach_vm_address_t src_address,
+ 81      boolean_t copy,
+ 82      vm_prot_t *cur_protection,
+ 83      vm_prot_t *max_protection,
+ 84      vm_inherit_t inheritance
+ 85      );
+ 86 }
+ 87 
+ 88 #endif
+ 89 
+ 90 namespace JSC {
+ 91 
+ 92 using namespace WTF;
+ 93 
+ 94 #if defined(FIXED_EXECUTABLE_MEMORY_POOL_SIZE_IN_MB) &amp;&amp; FIXED_EXECUTABLE_MEMORY_POOL_SIZE_IN_MB &gt; 0
+ 95 static const size_t fixedExecutableMemoryPoolSize = FIXED_EXECUTABLE_MEMORY_POOL_SIZE_IN_MB * 1024 * 1024;
+ 96 #elif CPU(ARM)
+ 97 static const size_t fixedExecutableMemoryPoolSize = 16 * 1024 * 1024;
+ 98 #elif CPU(ARM64)
+ 99 static const size_t fixedExecutableMemoryPoolSize = 128 * 1024 * 1024;
+100 #elif CPU(X86_64)
+101 static const size_t fixedExecutableMemoryPoolSize = 1024 * 1024 * 1024;
+102 #else
+103 static const size_t fixedExecutableMemoryPoolSize = 32 * 1024 * 1024;
+104 #endif
+105 
+106 #if CPU(ARM)
+107 static const double executablePoolReservationFraction = 0.15;
+108 #else
+109 static const double executablePoolReservationFraction = 0.25;
+110 #endif
+111 
+112 #if ENABLE(SEPARATED_WX_HEAP)
+113 JS_EXPORT_PRIVATE bool useFastPermisionsJITCopy { false };
+114 JS_EXPORT_PRIVATE JITWriteSeparateHeapsFunction jitWriteSeparateHeapsFunction;
+115 #endif
+116 
+117 #if !USE(EXECUTE_ONLY_JIT_WRITE_FUNCTION) &amp;&amp; HAVE(REMAP_JIT)
+118 static uintptr_t startOfFixedWritableMemoryPool;
+119 #endif
+120 
+121 class FixedVMPoolExecutableAllocator;
+122 static FixedVMPoolExecutableAllocator* allocator = nullptr;
+123 
+124 static bool s_isJITEnabled = true;
+125 static bool isJITEnabled()
+126 {
+127 #if PLATFORM(IOS_FAMILY) &amp;&amp; (CPU(ARM64) || CPU(ARM))
+128     return processHasEntitlement(&quot;dynamic-codesigning&quot;) &amp;&amp; s_isJITEnabled;
+129 #else
+130     return s_isJITEnabled;
+131 #endif
+132 }
+133 
+134 void ExecutableAllocator::setJITEnabled(bool enabled)
+135 {
+136     ASSERT(!allocator);
+137     if (s_isJITEnabled == enabled)
+138         return;
+139 
+140     s_isJITEnabled = enabled;
+141 
+142 #if PLATFORM(IOS_FAMILY) &amp;&amp; (CPU(ARM64) || CPU(ARM))
+143     if (!enabled) {
+144         constexpr size_t size = 1;
+145         constexpr int protection = PROT_READ | PROT_WRITE | PROT_EXEC;
+146         constexpr int flags = MAP_PRIVATE | MAP_ANON | MAP_JIT;
+147         constexpr int fd = OSAllocator::JSJITCodePages;
+148         void* allocation = mmap(nullptr, size, protection, flags, fd, 0);
+149         const void* executableMemoryAllocationFailure = reinterpret_cast&lt;void*&gt;(-1);
+150         RELEASE_ASSERT_WITH_MESSAGE(allocation &amp;&amp; allocation != executableMemoryAllocationFailure, &quot;We should not have allocated executable memory before disabling the JIT.&quot;);
+151         RELEASE_ASSERT_WITH_MESSAGE(!munmap(allocation, size), &quot;Unmapping executable memory should succeed so we do not have any executable memory in the address space&quot;);
+152         RELEASE_ASSERT_WITH_MESSAGE(mmap(nullptr, size, protection, flags, fd, 0) == executableMemoryAllocationFailure, &quot;Allocating executable memory should fail after setJITEnabled(false) is called.&quot;);
+153     }
+154 #endif
+155 }
+156 
+157 class FixedVMPoolExecutableAllocator final : public MetaAllocator {
+158     WTF_MAKE_FAST_ALLOCATED;
+159 public:
+160     FixedVMPoolExecutableAllocator()
+161         : MetaAllocator(jitAllocationGranule) // round up all allocations to 32 bytes
+162     {
+163         if (!isJITEnabled())
+164             return;
+165 
+166         size_t reservationSize;
+167         if (Options::jitMemoryReservationSize())
+168             reservationSize = Options::jitMemoryReservationSize();
+169         else
+170             reservationSize = fixedExecutableMemoryPoolSize;
+171         reservationSize = std::max(roundUpToMultipleOf(pageSize(), reservationSize), pageSize() * 2);
+172 
+173         auto tryCreatePageReservation = [] (size_t reservationSize) {
+174 #if OS(LINUX)
+175             // If we use uncommitted reservation, mmap operation is recorded with small page size in perf command&#39;s output.
+176             // This makes the following JIT code logging broken and some of JIT code is not recorded correctly.
+177             // To avoid this problem, we use committed reservation if we need perf JITDump logging.
+178             if (Options::logJITCodeForPerf())
+179                 return PageReservation::reserveAndCommitWithGuardPages(reservationSize, OSAllocator::JSJITCodePages, EXECUTABLE_POOL_WRITABLE, true);
+180 #endif
+181             return PageReservation::reserveWithGuardPages(reservationSize, OSAllocator::JSJITCodePages, EXECUTABLE_POOL_WRITABLE, true);
+182         };
+183 
+184         m_reservation = tryCreatePageReservation(reservationSize);
+185         if (m_reservation) {
+186             ASSERT(m_reservation.size() == reservationSize);
+187             void* reservationBase = m_reservation.base();
+188 
+189 #if ENABLE(FAST_JIT_PERMISSIONS) &amp;&amp; !ENABLE(SEPARATED_WX_HEAP)
+190             RELEASE_ASSERT(os_thread_self_restrict_rwx_is_supported());
+191             os_thread_self_restrict_rwx_to_rx();
+192 
+193 #else // not ENABLE(FAST_JIT_PERMISSIONS) or ENABLE(SEPARATED_WX_HEAP)
+194 #if ENABLE(FAST_JIT_PERMISSIONS)
+195             if (os_thread_self_restrict_rwx_is_supported()) {
+196                 useFastPermisionsJITCopy = true;
+197                 os_thread_self_restrict_rwx_to_rx();
+198             } else
+199 #endif
+200             if (Options::useSeparatedWXHeap()) {
+201                 // First page of our JIT allocation is reserved.
+202                 ASSERT(reservationSize &gt;= pageSize() * 2);
+203                 reservationBase = (void*)((uintptr_t)reservationBase + pageSize());
+204                 reservationSize -= pageSize();
+205                 initializeSeparatedWXHeaps(m_reservation.base(), pageSize(), reservationBase, reservationSize);
+206             }
+207 #endif // not ENABLE(FAST_JIT_PERMISSIONS) or ENABLE(SEPARATED_WX_HEAP)
+208 
+209             addFreshFreeSpace(reservationBase, reservationSize);
+210 
+211             ASSERT(bytesReserved() == reservationSize); // Since our executable memory is fixed-sized, bytesReserved is never changed after initialization.
+212 
+213             void* reservationEnd = reinterpret_cast&lt;uint8_t*&gt;(reservationBase) + reservationSize;
+214 
+215             m_memoryStart = MacroAssemblerCodePtr&lt;ExecutableMemoryPtrTag&gt;(tagCodePtr&lt;ExecutableMemoryPtrTag&gt;(reservationBase));
+216             m_memoryEnd = MacroAssemblerCodePtr&lt;ExecutableMemoryPtrTag&gt;(tagCodePtr&lt;ExecutableMemoryPtrTag&gt;(reservationEnd));
+217         }
+218     }
+219 
+220     virtual ~FixedVMPoolExecutableAllocator();
+221 
+222     void* memoryStart() { return m_memoryStart.untaggedExecutableAddress(); }
+223     void* memoryEnd() { return m_memoryEnd.untaggedExecutableAddress(); }
+224     bool isJITPC(void* pc) { return memoryStart() &lt;= pc &amp;&amp; pc &lt; memoryEnd(); }
+225 
+226 protected:
+227     FreeSpacePtr allocateNewSpace(size_t&amp;) override
+228     {
+229         // We&#39;re operating in a fixed pool, so new allocation is always prohibited.
+230         return nullptr;
+231     }
+232 
+233     void notifyNeedPage(void* page, size_t count) override
+234     {
+235 #if USE(MADV_FREE_FOR_JIT_MEMORY)
+236         UNUSED_PARAM(page);
+237         UNUSED_PARAM(count);
+238 #else
+239         m_reservation.commit(page, pageSize() * count);
+240 #endif
+241     }
+242 
+243     void notifyPageIsFree(void* page, size_t count) override
+244     {
+245 #if USE(MADV_FREE_FOR_JIT_MEMORY)
+246         for (;;) {
+247             int result = madvise(page, pageSize() * count, MADV_FREE);
+248             if (!result)
+249                 return;
+250             ASSERT(result == -1);
+251             if (errno != EAGAIN) {
+252                 RELEASE_ASSERT_NOT_REACHED(); // In debug mode, this should be a hard failure.
+253                 break; // In release mode, we should just ignore the error - not returning memory to the OS is better than crashing, especially since we _will_ be able to reuse the memory internally anyway.
+254             }
+255         }
+256 #else
+257         m_reservation.decommit(page, pageSize() * count);
+258 #endif
+259     }
+260 
+261 private:
+262 #if OS(DARWIN) &amp;&amp; HAVE(REMAP_JIT)
+263     void initializeSeparatedWXHeaps(void* stubBase, size_t stubSize, void* jitBase, size_t jitSize)
+264     {
+265         mach_vm_address_t writableAddr = 0;
+266 
+267         // Create a second mapping of the JIT region at a random address.
+268         vm_prot_t cur, max;
+269         int remapFlags = VM_FLAGS_ANYWHERE;
+270 #if defined(VM_FLAGS_RANDOM_ADDR)
+271         remapFlags |= VM_FLAGS_RANDOM_ADDR;
+272 #endif
+273         kern_return_t ret = mach_vm_remap(mach_task_self(), &amp;writableAddr, jitSize, 0,
+274             remapFlags,
+275             mach_task_self(), (mach_vm_address_t)jitBase, FALSE,
+276             &amp;cur, &amp;max, VM_INHERIT_DEFAULT);
+277 
+278         bool remapSucceeded = (ret == KERN_SUCCESS);
+279         if (!remapSucceeded)
+280             return;
+281 
+282         // Assemble a thunk that will serve as the means for writing into the JIT region.
+283         MacroAssemblerCodeRef&lt;JITThunkPtrTag&gt; writeThunk = jitWriteThunkGenerator(reinterpret_cast&lt;void*&gt;(writableAddr), stubBase, stubSize);
+284 
+285         int result = 0;
+286 
+287 #if USE(EXECUTE_ONLY_JIT_WRITE_FUNCTION)
+288         // Prevent reading the write thunk code.
+289         result = vm_protect(mach_task_self(), reinterpret_cast&lt;vm_address_t&gt;(stubBase), stubSize, true, VM_PROT_EXECUTE);
+290         RELEASE_ASSERT(!result);
+291 #endif
+292 
+293         // Prevent writing into the executable JIT mapping.
+294         result = vm_protect(mach_task_self(), reinterpret_cast&lt;vm_address_t&gt;(jitBase), jitSize, true, VM_PROT_READ | VM_PROT_EXECUTE);
+295         RELEASE_ASSERT(!result);
+296 
+297         // Prevent execution in the writable JIT mapping.
+298         result = vm_protect(mach_task_self(), static_cast&lt;vm_address_t&gt;(writableAddr), jitSize, true, VM_PROT_READ | VM_PROT_WRITE);
+299         RELEASE_ASSERT(!result);
+300 
+301         // Zero out writableAddr to avoid leaking the address of the writable mapping.
+302         memset_s(&amp;writableAddr, sizeof(writableAddr), 0, sizeof(writableAddr));
+303 
+304 #if ENABLE(SEPARATED_WX_HEAP)
+305         jitWriteSeparateHeapsFunction = reinterpret_cast&lt;JITWriteSeparateHeapsFunction&gt;(writeThunk.code().executableAddress());
+306 #endif
+307     }
+308 
+309 #if CPU(ARM64) &amp;&amp; USE(EXECUTE_ONLY_JIT_WRITE_FUNCTION)
+310     MacroAssemblerCodeRef&lt;JITThunkPtrTag&gt; jitWriteThunkGenerator(void* writableAddr, void* stubBase, size_t stubSize)
+311     {
+312         using namespace ARM64Registers;
+313         using TrustedImm32 = MacroAssembler::TrustedImm32;
+314 
+315         MacroAssembler jit;
+316 
+317         jit.tagReturnAddress();
+318         jit.move(MacroAssembler::TrustedImmPtr(writableAddr), x7);
+319         jit.addPtr(x7, x0);
+320 
+321         jit.move(x0, x3);
+322         MacroAssembler::Jump smallCopy = jit.branch64(MacroAssembler::Below, x2, MacroAssembler::TrustedImm64(64));
+323 
+324         jit.add64(TrustedImm32(32), x3);
+325         jit.and64(TrustedImm32(-32), x3);
+326         jit.loadPair64(x1, x12, x13);
+327         jit.loadPair64(x1, TrustedImm32(16), x14, x15);
+328         jit.sub64(x3, x0, x5);
+329         jit.addPtr(x5, x1);
+330 
+331         jit.loadPair64(x1, x8, x9);
+332         jit.loadPair64(x1, TrustedImm32(16), x10, x11);
+333         jit.add64(TrustedImm32(32), x1);
+334         jit.sub64(x5, x2);
+335         jit.storePair64(x12, x13, x0);
+336         jit.storePair64(x14, x15, x0, TrustedImm32(16));
+337         MacroAssembler::Jump cleanup = jit.branchSub64(MacroAssembler::BelowOrEqual, TrustedImm32(64), x2);
+338 
+339         MacroAssembler::Label copyLoop = jit.label();
+340         jit.storePair64WithNonTemporalAccess(x8, x9, x3);
+341         jit.storePair64WithNonTemporalAccess(x10, x11, x3, TrustedImm32(16));
+342         jit.add64(TrustedImm32(32), x3);
+343         jit.loadPair64WithNonTemporalAccess(x1, x8, x9);
+344         jit.loadPair64WithNonTemporalAccess(x1, TrustedImm32(16), x10, x11);
+345         jit.add64(TrustedImm32(32), x1);
+346         jit.branchSub64(MacroAssembler::Above, TrustedImm32(32), x2).linkTo(copyLoop, &amp;jit);
+347 
+348         cleanup.link(&amp;jit);
+349         jit.add64(x2, x1);
+350         jit.loadPair64(x1, x12, x13);
+351         jit.loadPair64(x1, TrustedImm32(16), x14, x15);
+352         jit.storePair64(x8, x9, x3);
+353         jit.storePair64(x10, x11, x3, TrustedImm32(16));
+354         jit.addPtr(x2, x3);
+355         jit.storePair64(x12, x13, x3, TrustedImm32(32));
+356         jit.storePair64(x14, x15, x3, TrustedImm32(48));
+357         jit.ret();
+358 
+359         MacroAssembler::Label local0 = jit.label();
+360         jit.load64(x1, PostIndex(8), x6);
+361         jit.store64(x6, x3, PostIndex(8));
+362         smallCopy.link(&amp;jit);
+363         jit.branchSub64(MacroAssembler::AboveOrEqual, TrustedImm32(8), x2).linkTo(local0, &amp;jit);
+364         MacroAssembler::Jump local2 = jit.branchAdd64(MacroAssembler::Equal, TrustedImm32(8), x2);
+365         MacroAssembler::Label local1 = jit.label();
+366         jit.load8(x1, PostIndex(1), x6);
+367         jit.store8(x6, x3, PostIndex(1));
+368         jit.branchSub64(MacroAssembler::NotEqual, TrustedImm32(1), x2).linkTo(local1, &amp;jit);
+369         local2.link(&amp;jit);
+370         jit.ret();
+371 
+372         auto stubBaseCodePtr = MacroAssemblerCodePtr&lt;LinkBufferPtrTag&gt;(tagCodePtr&lt;LinkBufferPtrTag&gt;(stubBase));
+373         LinkBuffer linkBuffer(jit, stubBaseCodePtr, stubSize);
+374         // We don&#39;t use FINALIZE_CODE() for two reasons.
+375         // The first is that we don&#39;t want the writeable address, as disassembled instructions,
+376         // to appear in the console or anywhere in memory, via the PrintStream buffer.
+377         // The second is we can&#39;t guarantee that the code is readable when using the
+378         // asyncDisassembly option as our caller will set our pages execute only.
+379         return linkBuffer.finalizeCodeWithoutDisassembly&lt;JITThunkPtrTag&gt;();
+380     }
+381 #else // not CPU(ARM64) &amp;&amp; USE(EXECUTE_ONLY_JIT_WRITE_FUNCTION)
+382     static void genericWriteToJITRegion(off_t offset, const void* data, size_t dataSize)
+383     {
+384         memcpy((void*)(startOfFixedWritableMemoryPool + offset), data, dataSize);
+385     }
+386 
+387     MacroAssemblerCodeRef&lt;JITThunkPtrTag&gt; jitWriteThunkGenerator(void* address, void*, size_t)
+388     {
+389         startOfFixedWritableMemoryPool = reinterpret_cast&lt;uintptr_t&gt;(address);
+390         void* function = reinterpret_cast&lt;void*&gt;(&amp;genericWriteToJITRegion);
+391 #if CPU(ARM_THUMB2)
+392         // Handle thumb offset
+393         uintptr_t functionAsInt = reinterpret_cast&lt;uintptr_t&gt;(function);
+394         functionAsInt -= 1;
+395         function = reinterpret_cast&lt;void*&gt;(functionAsInt);
+396 #endif
+397         auto codePtr = MacroAssemblerCodePtr&lt;JITThunkPtrTag&gt;(tagCFunctionPtr&lt;JITThunkPtrTag&gt;(function));
+398         return MacroAssemblerCodeRef&lt;JITThunkPtrTag&gt;::createSelfManagedCodeRef(codePtr);
+399     }
+400 #endif // CPU(ARM64) &amp;&amp; USE(EXECUTE_ONLY_JIT_WRITE_FUNCTION)
+401 
+402 #else // OS(DARWIN) &amp;&amp; HAVE(REMAP_JIT)
+403     void initializeSeparatedWXHeaps(void*, size_t, void*, size_t)
+404     {
+405     }
+406 #endif
+407 
+408 private:
+409     PageReservation m_reservation;
+410     MacroAssemblerCodePtr&lt;ExecutableMemoryPtrTag&gt; m_memoryStart;
+411     MacroAssemblerCodePtr&lt;ExecutableMemoryPtrTag&gt; m_memoryEnd;
+412 };
+413 
+414 FixedVMPoolExecutableAllocator::~FixedVMPoolExecutableAllocator()
+415 {
+416     m_reservation.deallocate();
+417 }
+418 
+419 void ExecutableAllocator::initializeUnderlyingAllocator()
+420 {
+421     ASSERT(!allocator);
+422     allocator = new FixedVMPoolExecutableAllocator();
+423     CodeProfiling::notifyAllocator(allocator);
+424 }
+425 
+426 bool ExecutableAllocator::isValid() const
+427 {
+428     if (!allocator)
+429         return Base::isValid();
+430     return !!allocator-&gt;bytesReserved();
+431 }
+432 
+433 bool ExecutableAllocator::underMemoryPressure()
+434 {
+435     if (!allocator)
+436         return Base::underMemoryPressure();
+437     return allocator-&gt;bytesAllocated() &gt; allocator-&gt;bytesReserved() / 2;
+438 }
+439 
+440 double ExecutableAllocator::memoryPressureMultiplier(size_t addedMemoryUsage)
+441 {
+442     if (!allocator)
+443         return Base::memoryPressureMultiplier(addedMemoryUsage);
+444     ASSERT(allocator-&gt;bytesAllocated() &lt;= allocator-&gt;bytesReserved());
+445     size_t bytesAllocated = allocator-&gt;bytesAllocated() + addedMemoryUsage;
+446     size_t bytesAvailable = static_cast&lt;size_t&gt;(
+447         allocator-&gt;bytesReserved() * (1 - executablePoolReservationFraction));
+448     if (bytesAllocated &gt;= bytesAvailable)
+449         bytesAllocated = bytesAvailable;
+450     double result = 1.0;
+451     size_t divisor = bytesAvailable - bytesAllocated;
+452     if (divisor)
+453         result = static_cast&lt;double&gt;(bytesAvailable) / divisor;
+454     if (result &lt; 1.0)
+455         result = 1.0;
+456     return result;
+457 }
+458 
+459 RefPtr&lt;ExecutableMemoryHandle&gt; ExecutableAllocator::allocate(size_t sizeInBytes, void* ownerUID, JITCompilationEffort effort)
+460 {
+461     if (!allocator)
+462         return Base::allocate(sizeInBytes, ownerUID, effort);
+463     if (Options::logExecutableAllocation()) {
+464         MetaAllocator::Statistics stats = allocator-&gt;currentStatistics();
+465         dataLog(&quot;Allocating &quot;, sizeInBytes, &quot; bytes of executable memory with &quot;, stats.bytesAllocated, &quot; bytes allocated, &quot;, stats.bytesReserved, &quot; bytes reserved, and &quot;, stats.bytesCommitted, &quot; committed.\n&quot;);
+466     }
+467 
+468     if (effort != JITCompilationCanFail &amp;&amp; Options::reportMustSucceedExecutableAllocations()) {
+469         dataLog(&quot;Allocating &quot;, sizeInBytes, &quot; bytes of executable memory with JITCompilationMustSucceed.\n&quot;);
+470         WTFReportBacktrace();
+471     }
+472 
+473     if (effort == JITCompilationCanFail
+474         &amp;&amp; doExecutableAllocationFuzzingIfEnabled() == PretendToFailExecutableAllocation)
+475         return nullptr;
+476 
+477     if (effort == JITCompilationCanFail) {
+478         // Don&#39;t allow allocations if we are down to reserve.
+479         size_t bytesAllocated = allocator-&gt;bytesAllocated() + sizeInBytes;
+480         size_t bytesAvailable = static_cast&lt;size_t&gt;(
+481             allocator-&gt;bytesReserved() * (1 - executablePoolReservationFraction));
+482         if (bytesAllocated &gt; bytesAvailable) {
+483             if (Options::logExecutableAllocation())
+484                 dataLog(&quot;Allocation failed because bytes allocated &quot;, bytesAllocated,  &quot; &gt; &quot;, bytesAvailable, &quot; bytes available.\n&quot;);
+485             return nullptr;
+486         }
+487     }
+488 
+489     RefPtr&lt;ExecutableMemoryHandle&gt; result = allocator-&gt;allocate(sizeInBytes, ownerUID);
+490     if (!result) {
+491         if (effort != JITCompilationCanFail) {
+492             dataLog(&quot;Ran out of executable memory while allocating &quot;, sizeInBytes, &quot; bytes.\n&quot;);
+493             CRASH();
+494         }
+495         return nullptr;
+496     }
+497 
+498 #if CPU(ARM64E)
+499     void* start = allocator-&gt;memoryStart();
+500     void* end = allocator-&gt;memoryEnd();
+501     void* resultStart = result-&gt;start().untaggedPtr();
+502     void* resultEnd = result-&gt;end().untaggedPtr();
+503     RELEASE_ASSERT(start &lt;= resultStart &amp;&amp; resultStart &lt; end);
+504     RELEASE_ASSERT(start &lt; resultEnd &amp;&amp; resultEnd &lt;= end);
+505 #endif
+506     return result;
+507 }
+508 
+509 bool ExecutableAllocator::isValidExecutableMemory(const AbstractLocker&amp; locker, void* address)
+510 {
+511     if (!allocator)
+512         return Base::isValidExecutableMemory(locker, address);
+513     return allocator-&gt;isInAllocatedMemory(locker, address);
+514 }
+515 
+516 Lock&amp; ExecutableAllocator::getLock() const
+517 {
+518     if (!allocator)
+519         return Base::getLock();
+520     return allocator-&gt;getLock();
+521 }
+522 
+523 size_t ExecutableAllocator::committedByteCount()
+524 {
+525     if (!allocator)
+526         return Base::committedByteCount();
+527     return allocator-&gt;bytesCommitted();
+528 }
+529 
+530 #if ENABLE(META_ALLOCATOR_PROFILE)
+531 void ExecutableAllocator::dumpProfile()
+532 {
+533     if (!allocator)
+534         return;
+535     allocator-&gt;dumpProfile();
+536 }
+537 #endif
+538 
+539 void* startOfFixedExecutableMemoryPoolImpl()
+540 {
+541     if (!allocator)
+542         return nullptr;
+543     return allocator-&gt;memoryStart();
+544 }
+545 
+546 void* endOfFixedExecutableMemoryPoolImpl()
+547 {
+548     if (!allocator)
+549         return nullptr;
+550     return allocator-&gt;memoryEnd();
+551 }
+552 
+553 bool isJITPC(void* pc)
+554 {
+555     return allocator &amp;&amp; allocator-&gt;isJITPC(pc);
+556 }
+557 
+558 void dumpJITMemory(const void* dst, const void* src, size_t size)
+559 {
+560     ASSERT(Options::dumpJITMemoryPath());
+561 
+562 #if OS(DARWIN)
+563     static int fd = -1;
+564     static uint8_t* buffer;
+565     static constexpr size_t bufferSize = fixedExecutableMemoryPoolSize;
+566     static size_t offset = 0;
+567     static Lock dumpJITMemoryLock;
+568     static bool needsToFlush = false;
+569     static auto flush = [](const AbstractLocker&amp;) {
+570         if (fd == -1) {
+571             String path = Options::dumpJITMemoryPath();
+572             path = path.replace(&quot;%pid&quot;, String::number(getCurrentProcessID()));
+573             fd = open(FileSystem::fileSystemRepresentation(path).data(), O_CREAT | O_TRUNC | O_APPEND | O_WRONLY | O_EXLOCK | O_NONBLOCK, 0666);
+574             RELEASE_ASSERT(fd != -1);
+575         }
+576         write(fd, buffer, offset);
+577         offset = 0;
+578         needsToFlush = false;
+579     };
+580 
+581     static std::once_flag once;
+582     static LazyNeverDestroyed&lt;Ref&lt;WorkQueue&gt;&gt; flushQueue;
+583     std::call_once(once, [] {
+584         buffer = bitwise_cast&lt;uint8_t*&gt;(malloc(bufferSize));
+585         flushQueue.construct(WorkQueue::create(&quot;jsc.dumpJITMemory.queue&quot;, WorkQueue::Type::Serial, WorkQueue::QOS::Background));
+586         std::atexit([] {
+587             LockHolder locker(dumpJITMemoryLock);
+588             flush(locker);
+589             close(fd);
+590             fd = -1;
+591         });
+592     });
+593 
+594     static auto enqueueFlush = [](const AbstractLocker&amp;) {
+595         if (needsToFlush)
+596             return;
+597 
+598         needsToFlush = true;
+599         flushQueue.get()-&gt;dispatchAfter(Seconds(Options::dumpJITMemoryFlushInterval()), [] {
+600             LockHolder locker(dumpJITMemoryLock);
+601             if (!needsToFlush)
+602                 return;
+603             flush(locker);
+604         });
+605     };
+606 
+607     static auto write = [](const AbstractLocker&amp; locker, const void* src, size_t size) {
+608         if (UNLIKELY(offset + size &gt; bufferSize))
+609             flush(locker);
+610         memcpy(buffer + offset, src, size);
+611         offset += size;
+612         enqueueFlush(locker);
+613     };
+614 
+615     LockHolder locker(dumpJITMemoryLock);
+616     uint64_t time = mach_absolute_time();
+617     uint64_t dst64 = bitwise_cast&lt;uintptr_t&gt;(dst);
+618     uint64_t size64 = size;
+619     TraceScope(DumpJITMemoryStart, DumpJITMemoryStop, time, dst64, size64);
+620     write(locker, &amp;time, sizeof(time));
+621     write(locker, &amp;dst64, sizeof(dst64));
+622     write(locker, &amp;size64, sizeof(size64));
+623     write(locker, src, size);
+624 #else
+625     UNUSED_PARAM(dst);
+626     UNUSED_PARAM(src);
+627     UNUSED_PARAM(size);
+628     RELEASE_ASSERT_NOT_REACHED();
+629 #endif
+630 }
+631 
+632 } // namespace JSC
+633 
+634 #endif // ENABLE(JIT)
+635 
+636 namespace JSC {
+637 
+638 static ExecutableAllocator* executableAllocator;
+639 
+640 void ExecutableAllocator::initialize()
+641 {
+642     executableAllocator = new ExecutableAllocator;
+643 }
+644 
+645 ExecutableAllocator&amp; ExecutableAllocator::singleton()
+646 {
+647     ASSERT(executableAllocator);
+648     return *executableAllocator;
+649 }
+650 
+651 } // namespace JSC
+    </pre>
+  </body>
+</html>
