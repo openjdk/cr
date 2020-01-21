@@ -1,0 +1,2893 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>New modules/javafx.web/src/main/native/Source/JavaScriptCore/b3/B3ReduceStrength.cpp</title>
+    <link rel="stylesheet" href="../../../../../../../../style.css" />
+  </head>
+  <body>
+    <pre>
+   1 /*
+   2  * Copyright (C) 2015-2018 Apple Inc. All rights reserved.
+   3  *
+   4  * Redistribution and use in source and binary forms, with or without
+   5  * modification, are permitted provided that the following conditions
+   6  * are met:
+   7  * 1. Redistributions of source code must retain the above copyright
+   8  *    notice, this list of conditions and the following disclaimer.
+   9  * 2. Redistributions in binary form must reproduce the above copyright
+  10  *    notice, this list of conditions and the following disclaimer in the
+  11  *    documentation and/or other materials provided with the distribution.
+  12  *
+  13  * THIS SOFTWARE IS PROVIDED BY APPLE INC. ``AS IS&#39;&#39; AND ANY
+  14  * EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+  15  * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+  16  * PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL APPLE INC. OR
+  17  * CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+  18  * EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+  19  * PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
+  20  * PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY
+  21  * OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+  22  * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+  23  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+  24  */
+  25 
+  26 #include &quot;config.h&quot;
+  27 #include &quot;B3ReduceStrength.h&quot;
+  28 
+  29 #if ENABLE(B3_JIT)
+  30 
+  31 #include &quot;B3AtomicValue.h&quot;
+  32 #include &quot;B3BasicBlockInlines.h&quot;
+  33 #include &quot;B3BlockInsertionSet.h&quot;
+  34 #include &quot;B3ComputeDivisionMagic.h&quot;
+  35 #include &quot;B3Dominators.h&quot;
+  36 #include &quot;B3EliminateDeadCode.h&quot;
+  37 #include &quot;B3InsertionSetInlines.h&quot;
+  38 #include &quot;B3MemoryValueInlines.h&quot;
+  39 #include &quot;B3PhaseScope.h&quot;
+  40 #include &quot;B3PhiChildren.h&quot;
+  41 #include &quot;B3ProcedureInlines.h&quot;
+  42 #include &quot;B3PureCSE.h&quot;
+  43 #include &quot;B3SlotBaseValue.h&quot;
+  44 #include &quot;B3StackSlot.h&quot;
+  45 #include &quot;B3UpsilonValue.h&quot;
+  46 #include &quot;B3ValueKeyInlines.h&quot;
+  47 #include &quot;B3ValueInlines.h&quot;
+  48 #include &quot;B3Variable.h&quot;
+  49 #include &quot;B3VariableValue.h&quot;
+  50 #include &lt;wtf/GraphNodeWorklist.h&gt;
+  51 #include &lt;wtf/HashMap.h&gt;
+  52 #include &lt;wtf/IndexSet.h&gt;
+  53 
+  54 namespace JSC { namespace B3 {
+  55 
+  56 namespace {
+  57 
+  58 // The goal of this phase is to:
+  59 //
+  60 // - Replace operations with less expensive variants. This includes constant folding and classic
+  61 //   strength reductions like turning Mul(x, 1 &lt;&lt; k) into Shl(x, k).
+  62 //
+  63 // - Reassociate constant operations. For example, Load(Add(x, c)) is turned into Load(x, offset = c)
+  64 //   and Add(Add(x, c), d) is turned into Add(x, c + d).
+  65 //
+  66 // - Canonicalize operations. There are some cases where it&#39;s not at all obvious which kind of
+  67 //   operation is less expensive, but it&#39;s useful for subsequent phases - particularly LowerToAir -
+  68 //   to have only one way of representing things.
+  69 //
+  70 // This phase runs to fixpoint. Therefore, the canonicalizations must be designed to be monotonic.
+  71 // For example, if we had a canonicalization that said that Add(x, -c) should be Sub(x, c) and
+  72 // another canonicalization that said that Sub(x, d) should be Add(x, -d), then this phase would end
+  73 // up running forever. We don&#39;t want that.
+  74 //
+  75 // Therefore, we need to prioritize certain canonical forms over others. Naively, we want strength
+  76 // reduction to reduce the number of values, and so a form involving fewer total values is more
+  77 // canonical. But we might break this, for example when reducing strength of Mul(x, 9). This could be
+  78 // better written as Add(Shl(x, 3), x), which also happens to be representable using a single
+  79 // instruction on x86.
+  80 //
+  81 // Here are some of the rules we have:
+  82 //
+  83 // Canonical form of logical not: BitXor(value, 1). We may have to avoid using this form if we don&#39;t
+  84 // know for sure that &#39;value&#39; is 0-or-1 (i.e. returnsBool). In that case we fall back on
+  85 // Equal(value, 0).
+  86 //
+  87 // Canonical form of commutative operations: if the operation involves a constant, the constant must
+  88 // come second. Add(x, constant) is canonical, while Add(constant, x) is not. If there are no
+  89 // constants then the canonical form involves the lower-indexed value first. Given Add(x, y), it&#39;s
+  90 // canonical if x-&gt;index() &lt;= y-&gt;index().
+  91 
+  92 namespace B3ReduceStrengthInternal {
+  93 static const bool verbose = false;
+  94 }
+  95 
+  96 // FIXME: This IntRange stuff should be refactored into a general constant propagator. It&#39;s weird
+  97 // that it&#39;s just sitting here in this file.
+  98 class IntRange {
+  99 public:
+ 100     IntRange()
+ 101     {
+ 102     }
+ 103 
+ 104     IntRange(int64_t min, int64_t max)
+ 105         : m_min(min)
+ 106         , m_max(max)
+ 107     {
+ 108     }
+ 109 
+ 110     template&lt;typename T&gt;
+ 111     static IntRange top()
+ 112     {
+ 113         return IntRange(std::numeric_limits&lt;T&gt;::min(), std::numeric_limits&lt;T&gt;::max());
+ 114     }
+ 115 
+ 116     static IntRange top(Type type)
+ 117     {
+ 118         switch (type.kind()) {
+ 119         case Int32:
+ 120             return top&lt;int32_t&gt;();
+ 121         case Int64:
+ 122             return top&lt;int64_t&gt;();
+ 123         default:
+ 124             RELEASE_ASSERT_NOT_REACHED();
+ 125             return IntRange();
+ 126         }
+ 127     }
+ 128 
+ 129     template&lt;typename T&gt;
+ 130     static IntRange rangeForMask(T mask)
+ 131     {
+ 132         if (!(mask + 1))
+ 133             return top&lt;T&gt;();
+ 134         return IntRange(0, mask);
+ 135     }
+ 136 
+ 137     static IntRange rangeForMask(int64_t mask, Type type)
+ 138     {
+ 139         switch (type.kind()) {
+ 140         case Int32:
+ 141             return rangeForMask&lt;int32_t&gt;(static_cast&lt;int32_t&gt;(mask));
+ 142         case Int64:
+ 143             return rangeForMask&lt;int64_t&gt;(mask);
+ 144         default:
+ 145             RELEASE_ASSERT_NOT_REACHED();
+ 146             return IntRange();
+ 147         }
+ 148     }
+ 149 
+ 150     template&lt;typename T&gt;
+ 151     static IntRange rangeForZShr(int32_t shiftAmount)
+ 152     {
+ 153         typename std::make_unsigned&lt;T&gt;::type mask = 0;
+ 154         mask--;
+ 155         mask &gt;&gt;= shiftAmount;
+ 156         return rangeForMask&lt;T&gt;(static_cast&lt;T&gt;(mask));
+ 157     }
+ 158 
+ 159     static IntRange rangeForZShr(int32_t shiftAmount, Type type)
+ 160     {
+ 161         switch (type.kind()) {
+ 162         case Int32:
+ 163             return rangeForZShr&lt;int32_t&gt;(shiftAmount);
+ 164         case Int64:
+ 165             return rangeForZShr&lt;int64_t&gt;(shiftAmount);
+ 166         default:
+ 167             RELEASE_ASSERT_NOT_REACHED();
+ 168             return IntRange();
+ 169         }
+ 170     }
+ 171 
+ 172     int64_t min() const { return m_min; }
+ 173     int64_t max() const { return m_max; }
+ 174 
+ 175     void dump(PrintStream&amp; out) const
+ 176     {
+ 177         out.print(&quot;[&quot;, m_min, &quot;,&quot;, m_max, &quot;]&quot;);
+ 178     }
+ 179 
+ 180     template&lt;typename T&gt;
+ 181     bool couldOverflowAdd(const IntRange&amp; other)
+ 182     {
+ 183         return sumOverflows&lt;T&gt;(m_min, other.m_min)
+ 184             || sumOverflows&lt;T&gt;(m_min, other.m_max)
+ 185             || sumOverflows&lt;T&gt;(m_max, other.m_min)
+ 186             || sumOverflows&lt;T&gt;(m_max, other.m_max);
+ 187     }
+ 188 
+ 189     bool couldOverflowAdd(const IntRange&amp; other, Type type)
+ 190     {
+ 191         switch (type.kind()) {
+ 192         case Int32:
+ 193             return couldOverflowAdd&lt;int32_t&gt;(other);
+ 194         case Int64:
+ 195             return couldOverflowAdd&lt;int64_t&gt;(other);
+ 196         default:
+ 197             return true;
+ 198         }
+ 199     }
+ 200 
+ 201     template&lt;typename T&gt;
+ 202     bool couldOverflowSub(const IntRange&amp; other)
+ 203     {
+ 204         return differenceOverflows&lt;T&gt;(m_min, other.m_min)
+ 205             || differenceOverflows&lt;T&gt;(m_min, other.m_max)
+ 206             || differenceOverflows&lt;T&gt;(m_max, other.m_min)
+ 207             || differenceOverflows&lt;T&gt;(m_max, other.m_max);
+ 208     }
+ 209 
+ 210     bool couldOverflowSub(const IntRange&amp; other, Type type)
+ 211     {
+ 212         switch (type.kind()) {
+ 213         case Int32:
+ 214             return couldOverflowSub&lt;int32_t&gt;(other);
+ 215         case Int64:
+ 216             return couldOverflowSub&lt;int64_t&gt;(other);
+ 217         default:
+ 218             return true;
+ 219         }
+ 220     }
+ 221 
+ 222     template&lt;typename T&gt;
+ 223     bool couldOverflowMul(const IntRange&amp; other)
+ 224     {
+ 225         return productOverflows&lt;T&gt;(m_min, other.m_min)
+ 226             || productOverflows&lt;T&gt;(m_min, other.m_max)
+ 227             || productOverflows&lt;T&gt;(m_max, other.m_min)
+ 228             || productOverflows&lt;T&gt;(m_max, other.m_max);
+ 229     }
+ 230 
+ 231     bool couldOverflowMul(const IntRange&amp; other, Type type)
+ 232     {
+ 233         switch (type.kind()) {
+ 234         case Int32:
+ 235             return couldOverflowMul&lt;int32_t&gt;(other);
+ 236         case Int64:
+ 237             return couldOverflowMul&lt;int64_t&gt;(other);
+ 238         default:
+ 239             return true;
+ 240         }
+ 241     }
+ 242 
+ 243     template&lt;typename T&gt;
+ 244     IntRange shl(int32_t shiftAmount)
+ 245     {
+ 246         T newMin = static_cast&lt;T&gt;(m_min) &lt;&lt; static_cast&lt;T&gt;(shiftAmount);
+ 247         T newMax = static_cast&lt;T&gt;(m_max) &lt;&lt; static_cast&lt;T&gt;(shiftAmount);
+ 248 
+ 249         if ((newMin &gt;&gt; shiftAmount) != static_cast&lt;T&gt;(m_min))
+ 250             newMin = std::numeric_limits&lt;T&gt;::min();
+ 251         if ((newMax &gt;&gt; shiftAmount) != static_cast&lt;T&gt;(m_max))
+ 252             newMax = std::numeric_limits&lt;T&gt;::max();
+ 253 
+ 254         return IntRange(newMin, newMax);
+ 255     }
+ 256 
+ 257     IntRange shl(int32_t shiftAmount, Type type)
+ 258     {
+ 259         switch (type.kind()) {
+ 260         case Int32:
+ 261             return shl&lt;int32_t&gt;(shiftAmount);
+ 262         case Int64:
+ 263             return shl&lt;int64_t&gt;(shiftAmount);
+ 264         default:
+ 265             RELEASE_ASSERT_NOT_REACHED();
+ 266             return IntRange();
+ 267         }
+ 268     }
+ 269 
+ 270     template&lt;typename T&gt;
+ 271     IntRange sShr(int32_t shiftAmount)
+ 272     {
+ 273         T newMin = static_cast&lt;T&gt;(m_min) &gt;&gt; static_cast&lt;T&gt;(shiftAmount);
+ 274         T newMax = static_cast&lt;T&gt;(m_max) &gt;&gt; static_cast&lt;T&gt;(shiftAmount);
+ 275 
+ 276         return IntRange(newMin, newMax);
+ 277     }
+ 278 
+ 279     IntRange sShr(int32_t shiftAmount, Type type)
+ 280     {
+ 281         switch (type.kind()) {
+ 282         case Int32:
+ 283             return sShr&lt;int32_t&gt;(shiftAmount);
+ 284         case Int64:
+ 285             return sShr&lt;int64_t&gt;(shiftAmount);
+ 286         default:
+ 287             RELEASE_ASSERT_NOT_REACHED();
+ 288             return IntRange();
+ 289         }
+ 290     }
+ 291 
+ 292     template&lt;typename T&gt;
+ 293     IntRange zShr(int32_t shiftAmount)
+ 294     {
+ 295         // This is an awkward corner case for all of the other logic.
+ 296         if (!shiftAmount)
+ 297             return *this;
+ 298 
+ 299         // If the input range may be negative, then all we can say about the output range is that it
+ 300         // will be masked. That&#39;s because -1 right shifted just produces that mask.
+ 301         if (m_min &lt; 0)
+ 302             return rangeForZShr&lt;T&gt;(shiftAmount);
+ 303 
+ 304         // If the input range is non-negative, then this just brings the range closer to zero.
+ 305         typedef typename std::make_unsigned&lt;T&gt;::type UnsignedT;
+ 306         UnsignedT newMin = static_cast&lt;UnsignedT&gt;(m_min) &gt;&gt; static_cast&lt;UnsignedT&gt;(shiftAmount);
+ 307         UnsignedT newMax = static_cast&lt;UnsignedT&gt;(m_max) &gt;&gt; static_cast&lt;UnsignedT&gt;(shiftAmount);
+ 308 
+ 309         return IntRange(newMin, newMax);
+ 310     }
+ 311 
+ 312     IntRange zShr(int32_t shiftAmount, Type type)
+ 313     {
+ 314         switch (type.kind()) {
+ 315         case Int32:
+ 316             return zShr&lt;int32_t&gt;(shiftAmount);
+ 317         case Int64:
+ 318             return zShr&lt;int64_t&gt;(shiftAmount);
+ 319         default:
+ 320             RELEASE_ASSERT_NOT_REACHED();
+ 321             return IntRange();
+ 322         }
+ 323     }
+ 324 
+ 325     template&lt;typename T&gt;
+ 326     IntRange add(const IntRange&amp; other)
+ 327     {
+ 328         if (couldOverflowAdd&lt;T&gt;(other))
+ 329             return top&lt;T&gt;();
+ 330         return IntRange(m_min + other.m_min, m_max + other.m_max);
+ 331     }
+ 332 
+ 333     IntRange add(const IntRange&amp; other, Type type)
+ 334     {
+ 335         switch (type.kind()) {
+ 336         case Int32:
+ 337             return add&lt;int32_t&gt;(other);
+ 338         case Int64:
+ 339             return add&lt;int64_t&gt;(other);
+ 340         default:
+ 341             RELEASE_ASSERT_NOT_REACHED();
+ 342             return IntRange();
+ 343         }
+ 344     }
+ 345 
+ 346     template&lt;typename T&gt;
+ 347     IntRange sub(const IntRange&amp; other)
+ 348     {
+ 349         if (couldOverflowSub&lt;T&gt;(other))
+ 350             return top&lt;T&gt;();
+ 351         return IntRange(m_min - other.m_max, m_max - other.m_min);
+ 352     }
+ 353 
+ 354     IntRange sub(const IntRange&amp; other, Type type)
+ 355     {
+ 356         switch (type.kind()) {
+ 357         case Int32:
+ 358             return sub&lt;int32_t&gt;(other);
+ 359         case Int64:
+ 360             return sub&lt;int64_t&gt;(other);
+ 361         default:
+ 362             RELEASE_ASSERT_NOT_REACHED();
+ 363             return IntRange();
+ 364         }
+ 365     }
+ 366 
+ 367     template&lt;typename T&gt;
+ 368     IntRange mul(const IntRange&amp; other)
+ 369     {
+ 370         if (couldOverflowMul&lt;T&gt;(other))
+ 371             return top&lt;T&gt;();
+ 372         return IntRange(
+ 373             std::min(
+ 374                 std::min(m_min * other.m_min, m_min * other.m_max),
+ 375                 std::min(m_max * other.m_min, m_max * other.m_max)),
+ 376             std::max(
+ 377                 std::max(m_min * other.m_min, m_min * other.m_max),
+ 378                 std::max(m_max * other.m_min, m_max * other.m_max)));
+ 379     }
+ 380 
+ 381     IntRange mul(const IntRange&amp; other, Type type)
+ 382     {
+ 383         switch (type.kind()) {
+ 384         case Int32:
+ 385             return mul&lt;int32_t&gt;(other);
+ 386         case Int64:
+ 387             return mul&lt;int64_t&gt;(other);
+ 388         default:
+ 389             RELEASE_ASSERT_NOT_REACHED();
+ 390             return IntRange();
+ 391         }
+ 392     }
+ 393 
+ 394 private:
+ 395     int64_t m_min { 0 };
+ 396     int64_t m_max { 0 };
+ 397 };
+ 398 
+ 399 class ReduceStrength {
+ 400 public:
+ 401     ReduceStrength(Procedure&amp; proc)
+ 402         : m_proc(proc)
+ 403         , m_insertionSet(proc)
+ 404         , m_blockInsertionSet(proc)
+ 405         , m_root(proc.at(0))
+ 406     {
+ 407     }
+ 408 
+ 409     bool run()
+ 410     {
+ 411         bool result = false;
+ 412         bool first = true;
+ 413         unsigned index = 0;
+ 414         do {
+ 415             m_changed = false;
+ 416             m_changedCFG = false;
+ 417             ++index;
+ 418 
+ 419             if (first)
+ 420                 first = false;
+ 421             else if (B3ReduceStrengthInternal::verbose) {
+ 422                 dataLog(&quot;B3 after iteration #&quot;, index - 1, &quot; of reduceStrength:\n&quot;);
+ 423                 dataLog(m_proc);
+ 424             }
+ 425 
+ 426             simplifyCFG();
+ 427 
+ 428             if (m_changedCFG) {
+ 429                 m_proc.resetReachability();
+ 430                 m_proc.invalidateCFG();
+ 431                 m_changed = true;
+ 432             }
+ 433 
+ 434             // We definitely want to do DCE before we do CSE so that we don&#39;t hoist things. For
+ 435             // example:
+ 436             //
+ 437             // @dead = Mul(@a, @b)
+ 438             // ... lots of control flow and stuff
+ 439             // @thing = Mul(@a, @b)
+ 440             //
+ 441             // If we do CSE before DCE, we will remove @thing and keep @dead. Effectively, we will
+ 442             // &quot;hoist&quot; @thing. On the other hand, if we run DCE before CSE, we will kill @dead and
+ 443             // keep @thing. That&#39;s better, since we usually want things to stay wherever the client
+ 444             // put them. We&#39;re not actually smart enough to move things around at random.
+ 445             m_changed |= eliminateDeadCodeImpl(m_proc);
+ 446             m_valueForConstant.clear();
+ 447 
+ 448             simplifySSA();
+ 449 
+ 450             if (m_proc.optLevel() &gt;= 2) {
+ 451                 m_proc.resetValueOwners();
+ 452                 m_dominators = &amp;m_proc.dominators(); // Recompute if necessary.
+ 453                 m_pureCSE.clear();
+ 454             }
+ 455 
+ 456             for (BasicBlock* block : m_proc.blocksInPreOrder()) {
+ 457                 m_block = block;
+ 458 
+ 459                 for (m_index = 0; m_index &lt; block-&gt;size(); ++m_index) {
+ 460                     if (B3ReduceStrengthInternal::verbose) {
+ 461                         dataLog(
+ 462                             &quot;Looking at &quot;, *block, &quot; #&quot;, m_index, &quot;: &quot;,
+ 463                             deepDump(m_proc, block-&gt;at(m_index)), &quot;\n&quot;);
+ 464                     }
+ 465                     m_value = m_block-&gt;at(m_index);
+ 466                     m_value-&gt;performSubstitution();
+ 467                     reduceValueStrength();
+ 468                     if (m_proc.optLevel() &gt;= 2)
+ 469                         replaceIfRedundant();
+ 470                 }
+ 471                 m_insertionSet.execute(m_block);
+ 472             }
+ 473 
+ 474             m_changedCFG |= m_blockInsertionSet.execute();
+ 475             handleChangedCFGIfNecessary();
+ 476 
+ 477             result |= m_changed;
+ 478         } while (m_changed &amp;&amp; m_proc.optLevel() &gt;= 2);
+ 479 
+ 480         if (m_proc.optLevel() &lt; 2) {
+ 481             m_changedCFG = false;
+ 482             simplifyCFG();
+ 483             handleChangedCFGIfNecessary();
+ 484         }
+ 485 
+ 486         return result;
+ 487     }
+ 488 
+ 489 private:
+ 490     void reduceValueStrength()
+ 491     {
+ 492         switch (m_value-&gt;opcode()) {
+ 493         case Opaque:
+ 494             // Turn this: Opaque(Opaque(value))
+ 495             // Into this: Opaque(value)
+ 496             if (m_value-&gt;child(0)-&gt;opcode() == Opaque) {
+ 497                 replaceWithIdentity(m_value-&gt;child(0));
+ 498                 break;
+ 499             }
+ 500             break;
+ 501 
+ 502         case Add:
+ 503             handleCommutativity();
+ 504 
+ 505             if (m_value-&gt;child(0)-&gt;opcode() == Add &amp;&amp; m_value-&gt;isInteger()) {
+ 506                 // Turn this: Add(Add(value, constant1), constant2)
+ 507                 // Into this: Add(value, constant1 + constant2)
+ 508                 Value* newSum = m_value-&gt;child(1)-&gt;addConstant(m_proc, m_value-&gt;child(0)-&gt;child(1));
+ 509                 if (newSum) {
+ 510                     m_insertionSet.insertValue(m_index, newSum);
+ 511                     m_value-&gt;child(0) = m_value-&gt;child(0)-&gt;child(0);
+ 512                     m_value-&gt;child(1) = newSum;
+ 513                     m_changed = true;
+ 514                     break;
+ 515                 }
+ 516 
+ 517                 // Turn this: Add(Add(value, constant), otherValue)
+ 518                 // Into this: Add(Add(value, otherValue), constant)
+ 519                 if (!m_value-&gt;child(1)-&gt;hasInt() &amp;&amp; m_value-&gt;child(0)-&gt;child(1)-&gt;hasInt()) {
+ 520                     Value* value = m_value-&gt;child(0)-&gt;child(0);
+ 521                     Value* constant = m_value-&gt;child(0)-&gt;child(1);
+ 522                     Value* otherValue = m_value-&gt;child(1);
+ 523                     // This could create duplicate code if Add(value, constant) is used elsewhere.
+ 524                     // However, we already model adding a constant as if it was free in other places
+ 525                     // so let&#39;s just roll with it. The alternative would mean having to do good use
+ 526                     // counts, which reduceStrength() currently doesn&#39;t have.
+ 527                     m_value-&gt;child(0) =
+ 528                         m_insertionSet.insert&lt;Value&gt;(
+ 529                             m_index, Add, m_value-&gt;origin(), value, otherValue);
+ 530                     m_value-&gt;child(1) = constant;
+ 531                     m_changed = true;
+ 532                     break;
+ 533                 }
+ 534             }
+ 535 
+ 536             // Turn this: Add(otherValue, Add(value, constant))
+ 537             // Into this: Add(Add(value, otherValue), constant)
+ 538             if (m_value-&gt;isInteger()
+ 539                 &amp;&amp; !m_value-&gt;child(0)-&gt;hasInt()
+ 540                 &amp;&amp; m_value-&gt;child(1)-&gt;opcode() == Add
+ 541                 &amp;&amp; m_value-&gt;child(1)-&gt;child(1)-&gt;hasInt()) {
+ 542                 Value* value = m_value-&gt;child(1)-&gt;child(0);
+ 543                 Value* constant = m_value-&gt;child(1)-&gt;child(1);
+ 544                 Value* otherValue = m_value-&gt;child(0);
+ 545                 // This creates a duplicate add. That&#39;s dangerous but probably fine, see above.
+ 546                 m_value-&gt;child(0) =
+ 547                     m_insertionSet.insert&lt;Value&gt;(
+ 548                         m_index, Add, m_value-&gt;origin(), value, otherValue);
+ 549                 m_value-&gt;child(1) = constant;
+ 550                 m_changed = true;
+ 551                 break;
+ 552             }
+ 553 
+ 554             // Turn this: Add(constant1, constant2)
+ 555             // Into this: constant1 + constant2
+ 556             if (Value* constantAdd = m_value-&gt;child(0)-&gt;addConstant(m_proc, m_value-&gt;child(1))) {
+ 557                 replaceWithNewValue(constantAdd);
+ 558                 break;
+ 559             }
+ 560 
+ 561             // Turn this: Integer Add(value, value)
+ 562             // Into this: Shl(value, 1)
+ 563             // This is a useful canonicalization. It&#39;s not meant to be a strength reduction.
+ 564             if (m_value-&gt;isInteger() &amp;&amp; m_value-&gt;child(0) == m_value-&gt;child(1)) {
+ 565                 replaceWithNewValue(
+ 566                     m_proc.add&lt;Value&gt;(
+ 567                         Shl, m_value-&gt;origin(), m_value-&gt;child(0),
+ 568                         m_insertionSet.insert&lt;Const32Value&gt;(m_index, m_value-&gt;origin(), 1)));
+ 569                 break;
+ 570             }
+ 571 
+ 572             // Turn this: Add(value, zero)
+ 573             // Into an Identity.
+ 574             //
+ 575             // Addition is subtle with doubles. Zero is not the neutral value, negative zero is:
+ 576             //    0 + 0 = 0
+ 577             //    0 + -0 = 0
+ 578             //    -0 + 0 = 0
+ 579             //    -0 + -0 = -0
+ 580             if (m_value-&gt;child(1)-&gt;isInt(0) || m_value-&gt;child(1)-&gt;isNegativeZero()) {
+ 581                 replaceWithIdentity(m_value-&gt;child(0));
+ 582                 break;
+ 583             }
+ 584 
+ 585             if (m_value-&gt;isInteger()) {
+ 586                 // Turn this: Integer Add(value, Neg(otherValue))
+ 587                 // Into this: Sub(value, otherValue)
+ 588                 if (m_value-&gt;child(1)-&gt;opcode() == Neg) {
+ 589                     replaceWithNew&lt;Value&gt;(Sub, m_value-&gt;origin(), m_value-&gt;child(0), m_value-&gt;child(1)-&gt;child(0));
+ 590                     break;
+ 591                 }
+ 592 
+ 593                 // Turn this: Integer Add(Neg(value), otherValue)
+ 594                 // Into this: Sub(otherValue, value)
+ 595                 if (m_value-&gt;child(0)-&gt;opcode() == Neg) {
+ 596                     replaceWithNew&lt;Value&gt;(Sub, m_value-&gt;origin(), m_value-&gt;child(1), m_value-&gt;child(0)-&gt;child(0));
+ 597                     break;
+ 598                 }
+ 599 
+ 600                 // Turn this: Integer Add(Sub(0, value), -1)
+ 601                 // Into this: BitXor(value, -1)
+ 602                 if (m_value-&gt;child(0)-&gt;opcode() == Sub
+ 603                     &amp;&amp; m_value-&gt;child(1)-&gt;isInt(-1)
+ 604                     &amp;&amp; m_value-&gt;child(0)-&gt;child(0)-&gt;isInt(0)) {
+ 605                     replaceWithNew&lt;Value&gt;(BitXor, m_value-&gt;origin(), m_value-&gt;child(0)-&gt;child(1), m_value-&gt;child(1));
+ 606                     break;
+ 607                 }
+ 608 
+ 609                 if (handleMulDistributivity())
+ 610                     break;
+ 611             }
+ 612 
+ 613             break;
+ 614 
+ 615         case Sub:
+ 616             // Turn this: Sub(constant1, constant2)
+ 617             // Into this: constant1 - constant2
+ 618             if (Value* constantSub = m_value-&gt;child(0)-&gt;subConstant(m_proc, m_value-&gt;child(1))) {
+ 619                 replaceWithNewValue(constantSub);
+ 620                 break;
+ 621             }
+ 622 
+ 623             if (m_value-&gt;isInteger()) {
+ 624                 // Turn this: Sub(value, constant)
+ 625                 // Into this: Add(value, -constant)
+ 626                 if (Value* negatedConstant = m_value-&gt;child(1)-&gt;negConstant(m_proc)) {
+ 627                     m_insertionSet.insertValue(m_index, negatedConstant);
+ 628                     replaceWithNew&lt;Value&gt;(
+ 629                         Add, m_value-&gt;origin(), m_value-&gt;child(0), negatedConstant);
+ 630                     break;
+ 631                 }
+ 632 
+ 633                 // Turn this: Sub(0, value)
+ 634                 // Into this: Neg(value)
+ 635                 if (m_value-&gt;child(0)-&gt;isInt(0)) {
+ 636                     replaceWithNew&lt;Value&gt;(Neg, m_value-&gt;origin(), m_value-&gt;child(1));
+ 637                     break;
+ 638                 }
+ 639 
+ 640                 // Turn this: Sub(value, value)
+ 641                 // Into this: 0
+ 642                 if (m_value-&gt;child(0) == m_value-&gt;child(1)) {
+ 643                     replaceWithNewValue(m_proc.addIntConstant(m_value, 0));
+ 644                     break;
+ 645                 }
+ 646 
+ 647                 // Turn this: Sub(value, Neg(otherValue))
+ 648                 // Into this: Add(value, otherValue)
+ 649                 if (m_value-&gt;child(1)-&gt;opcode() == Neg) {
+ 650                     replaceWithNew&lt;Value&gt;(Add, m_value-&gt;origin(), m_value-&gt;child(0), m_value-&gt;child(1)-&gt;child(0));
+ 651                     break;
+ 652                 }
+ 653 
+ 654                 // Turn this: Sub(Neg(value), value2)
+ 655                 // Into this: Neg(Add(value, value2))
+ 656                 if (m_value-&gt;child(0)-&gt;opcode() == Neg) {
+ 657                     replaceWithNew&lt;Value&gt;(Neg, m_value-&gt;origin(),
+ 658                         m_insertionSet.insert&lt;Value&gt;(m_index, Add, m_value-&gt;origin(), m_value-&gt;child(0)-&gt;child(0), m_value-&gt;child(1)));
+ 659                     break;
+ 660                 }
+ 661 
+ 662                 // Turn this: Sub(Sub(a, b), c)
+ 663                 // Into this: Sub(a, Add(b, c))
+ 664                 if (m_value-&gt;child(0)-&gt;opcode() == Sub) {
+ 665                     replaceWithNew&lt;Value&gt;(Sub, m_value-&gt;origin(), m_value-&gt;child(0)-&gt;child(0),
+ 666                         m_insertionSet.insert&lt;Value&gt;(m_index, Add, m_value-&gt;origin(), m_value-&gt;child(0)-&gt;child(1), m_value-&gt;child(1)));
+ 667                     break;
+ 668                 }
+ 669 
+ 670                 // Turn this: Sub(a, Sub(b, c))
+ 671                 // Into this: Add(Sub(a, b), c)
+ 672                 if (m_value-&gt;child(1)-&gt;opcode() == Sub) {
+ 673                     replaceWithNew&lt;Value&gt;(Add, m_value-&gt;origin(),
+ 674                         m_insertionSet.insert&lt;Value&gt;(m_index, Sub, m_value-&gt;origin(), m_value-&gt;child(0), m_value-&gt;child(1)-&gt;child(0)),
+ 675                         m_value-&gt;child(1)-&gt;child(1));
+ 676                     break;
+ 677                 }
+ 678 
+ 679                 // Turn this: Sub(Add(a, b), c)
+ 680                 // Into this: Add(a, Sub(b, c))
+ 681                 if (m_value-&gt;child(0)-&gt;opcode() == Add) {
+ 682                     replaceWithNew&lt;Value&gt;(Add, m_value-&gt;origin(), m_value-&gt;child(0)-&gt;child(0),
+ 683                         m_insertionSet.insert&lt;Value&gt;(m_index, Sub, m_value-&gt;origin(), m_value-&gt;child(0)-&gt;child(1), m_value-&gt;child(1)));
+ 684                     break;
+ 685                 }
+ 686 
+ 687                 if (handleMulDistributivity())
+ 688                     break;
+ 689             }
+ 690 
+ 691             break;
+ 692 
+ 693         case Neg:
+ 694             // Turn this: Neg(constant)
+ 695             // Into this: -constant
+ 696             if (Value* constant = m_value-&gt;child(0)-&gt;negConstant(m_proc)) {
+ 697                 replaceWithNewValue(constant);
+ 698                 break;
+ 699             }
+ 700 
+ 701             // Turn this: Neg(Neg(value))
+ 702             // Into this: value
+ 703             if (m_value-&gt;child(0)-&gt;opcode() == Neg) {
+ 704                 replaceWithIdentity(m_value-&gt;child(0)-&gt;child(0));
+ 705                 break;
+ 706             }
+ 707 
+ 708             if (m_value-&gt;isInteger()) {
+ 709                 // Turn this: Integer Neg(Sub(value, otherValue))
+ 710                 // Into this: Sub(otherValue, value)
+ 711                 if (m_value-&gt;child(0)-&gt;opcode() == Sub) {
+ 712                     replaceWithNew&lt;Value&gt;(Sub, m_value-&gt;origin(), m_value-&gt;child(0)-&gt;child(1), m_value-&gt;child(0)-&gt;child(0));
+ 713                     break;
+ 714                 }
+ 715 
+ 716                 // Turn this: Integer Neg(Mul(value, c))
+ 717                 // Into this: Mul(value, -c), as long as -c does not overflow
+ 718                 if (m_value-&gt;child(0)-&gt;opcode() == Mul &amp;&amp; m_value-&gt;child(0)-&gt;child(1)-&gt;hasInt()) {
+ 719                     int64_t factor = m_value-&gt;child(0)-&gt;child(1)-&gt;asInt();
+ 720                     if (m_value-&gt;type() == Int32 &amp;&amp; factor != std::numeric_limits&lt;int32_t&gt;::min()) {
+ 721                         Value* newFactor = m_insertionSet.insert&lt;Const32Value&gt;(m_index, m_value-&gt;child(0)-&gt;child(1)-&gt;origin(), -factor);
+ 722                         replaceWithNew&lt;Value&gt;(Mul, m_value-&gt;origin(), m_value-&gt;child(0)-&gt;child(0), newFactor);
+ 723                     } else if (m_value-&gt;type() == Int64 &amp;&amp; factor != std::numeric_limits&lt;int64_t&gt;::min()) {
+ 724                         Value* newFactor = m_insertionSet.insert&lt;Const64Value&gt;(m_index, m_value-&gt;child(0)-&gt;child(1)-&gt;origin(), -factor);
+ 725                         replaceWithNew&lt;Value&gt;(Mul, m_value-&gt;origin(), m_value-&gt;child(0)-&gt;child(0), newFactor);
+ 726                     }
+ 727                 }
+ 728             }
+ 729 
+ 730 
+ 731             break;
+ 732 
+ 733         case Mul:
+ 734             handleCommutativity();
+ 735 
+ 736             // Turn this: Mul(constant1, constant2)
+ 737             // Into this: constant1 * constant2
+ 738             if (Value* value = m_value-&gt;child(0)-&gt;mulConstant(m_proc, m_value-&gt;child(1))) {
+ 739                 replaceWithNewValue(value);
+ 740                 break;
+ 741             }
+ 742 
+ 743             if (m_value-&gt;child(1)-&gt;hasInt()) {
+ 744                 int64_t factor = m_value-&gt;child(1)-&gt;asInt();
+ 745 
+ 746                 // Turn this: Mul(value, 0)
+ 747                 // Into this: 0
+ 748                 // Note that we don&#39;t do this for doubles because that&#39;s wrong. For example, -1 * 0
+ 749                 // and 1 * 0 yield different results.
+ 750                 if (!factor) {
+ 751                     replaceWithIdentity(m_value-&gt;child(1));
+ 752                     break;
+ 753                 }
+ 754 
+ 755                 // Turn this: Mul(value, 1)
+ 756                 // Into this: value
+ 757                 if (factor == 1) {
+ 758                     replaceWithIdentity(m_value-&gt;child(0));
+ 759                     break;
+ 760                 }
+ 761 
+ 762                 // Turn this: Mul(value, -1)
+ 763                 // Into this: Neg(value)
+ 764                 if (factor == -1) {
+ 765                     replaceWithNew&lt;Value&gt;(Neg, m_value-&gt;origin(), m_value-&gt;child(0));
+ 766                     break;
+ 767                 }
+ 768 
+ 769                 // Turn this: Mul(value, constant)
+ 770                 // Into this: Shl(value, log2(constant))
+ 771                 if (hasOneBitSet(factor)) {
+ 772                     unsigned shiftAmount = WTF::fastLog2(static_cast&lt;uint64_t&gt;(factor));
+ 773                     replaceWithNewValue(
+ 774                         m_proc.add&lt;Value&gt;(
+ 775                             Shl, m_value-&gt;origin(), m_value-&gt;child(0),
+ 776                             m_insertionSet.insert&lt;Const32Value&gt;(
+ 777                                 m_index, m_value-&gt;origin(), shiftAmount)));
+ 778                     break;
+ 779                 }
+ 780             } else if (m_value-&gt;child(1)-&gt;hasDouble()) {
+ 781                 double factor = m_value-&gt;child(1)-&gt;asDouble();
+ 782 
+ 783                 // Turn this: Mul(value, 1)
+ 784                 // Into this: value
+ 785                 if (factor == 1) {
+ 786                     replaceWithIdentity(m_value-&gt;child(0));
+ 787                     break;
+ 788                 }
+ 789             }
+ 790 
+ 791             if (m_value-&gt;isInteger()) {
+ 792                 // Turn this: Integer Mul(value, Neg(otherValue))
+ 793                 // Into this: Neg(Mul(value, otherValue))
+ 794                 if (m_value-&gt;child(1)-&gt;opcode() == Neg) {
+ 795                     Value* newMul = m_insertionSet.insert&lt;Value&gt;(m_index, Mul, m_value-&gt;origin(), m_value-&gt;child(0), m_value-&gt;child(1)-&gt;child(0));
+ 796                     replaceWithNew&lt;Value&gt;(Neg, m_value-&gt;origin(), newMul);
+ 797                     break;
+ 798                 }
+ 799                 // Turn this: Integer Mul(Neg(value), otherValue)
+ 800                 // Into this: Neg(Mul(value, value2))
+ 801                 if (m_value-&gt;child(0)-&gt;opcode() == Neg) {
+ 802                     Value* newMul = m_insertionSet.insert&lt;Value&gt;(m_index, Mul, m_value-&gt;origin(), m_value-&gt;child(0)-&gt;child(0), m_value-&gt;child(1));
+ 803                     replaceWithNew&lt;Value&gt;(Neg, m_value-&gt;origin(), newMul);
+ 804                     break;
+ 805                 }
+ 806             }
+ 807 
+ 808             break;
+ 809 
+ 810         case Div:
+ 811             // Turn this: Div(constant1, constant2)
+ 812             // Into this: constant1 / constant2
+ 813             // Note that this uses Div&lt;Chill&gt; semantics. That&#39;s fine, because the rules for Div
+ 814             // are strictly weaker: it has corner cases where it&#39;s allowed to do anything it
+ 815             // likes.
+ 816             if (replaceWithNewValue(m_value-&gt;child(0)-&gt;divConstant(m_proc, m_value-&gt;child(1))))
+ 817                 break;
+ 818 
+ 819             if (m_value-&gt;child(1)-&gt;hasInt()) {
+ 820                 switch (m_value-&gt;child(1)-&gt;asInt()) {
+ 821                 case -1:
+ 822                     // Turn this: Div(value, -1)
+ 823                     // Into this: Neg(value)
+ 824                     replaceWithNewValue(
+ 825                         m_proc.add&lt;Value&gt;(Neg, m_value-&gt;origin(), m_value-&gt;child(0)));
+ 826                     break;
+ 827 
+ 828                 case 0:
+ 829                     // Turn this: Div(value, 0)
+ 830                     // Into this: 0
+ 831                     // We can do this because it&#39;s precisely correct for ChillDiv and for Div we
+ 832                     // are allowed to do whatever we want.
+ 833                     replaceWithIdentity(m_value-&gt;child(1));
+ 834                     break;
+ 835 
+ 836                 case 1:
+ 837                     // Turn this: Div(value, 1)
+ 838                     // Into this: value
+ 839                     replaceWithIdentity(m_value-&gt;child(0));
+ 840                     break;
+ 841 
+ 842                 default:
+ 843                     // Perform super comprehensive strength reduction of division. Currently we
+ 844                     // only do this for 32-bit divisions, since we need a high multiply
+ 845                     // operation. We emulate it using 64-bit multiply. We can&#39;t emulate 64-bit
+ 846                     // high multiply with a 128-bit multiply because we don&#39;t have a 128-bit
+ 847                     // multiply. We could do it with a patchpoint if we cared badly enough.
+ 848 
+ 849                     if (m_value-&gt;type() != Int32)
+ 850                         break;
+ 851 
+ 852                     if (m_proc.optLevel() &lt; 2)
+ 853                         break;
+ 854 
+ 855                     int32_t divisor = m_value-&gt;child(1)-&gt;asInt32();
+ 856                     DivisionMagic&lt;int32_t&gt; magic = computeDivisionMagic(divisor);
+ 857 
+ 858                     // Perform the &quot;high&quot; multiplication. We do it just to get the high bits.
+ 859                     // This is sort of like multiplying by the reciprocal, just more gnarly. It&#39;s
+ 860                     // from Hacker&#39;s Delight and I don&#39;t claim to understand it.
+ 861                     Value* magicQuotient = m_insertionSet.insert&lt;Value&gt;(
+ 862                         m_index, Trunc, m_value-&gt;origin(),
+ 863                         m_insertionSet.insert&lt;Value&gt;(
+ 864                             m_index, ZShr, m_value-&gt;origin(),
+ 865                             m_insertionSet.insert&lt;Value&gt;(
+ 866                                 m_index, Mul, m_value-&gt;origin(),
+ 867                                 m_insertionSet.insert&lt;Value&gt;(
+ 868                                     m_index, SExt32, m_value-&gt;origin(), m_value-&gt;child(0)),
+ 869                                 m_insertionSet.insert&lt;Const64Value&gt;(
+ 870                                     m_index, m_value-&gt;origin(), magic.magicMultiplier)),
+ 871                             m_insertionSet.insert&lt;Const32Value&gt;(
+ 872                                 m_index, m_value-&gt;origin(), 32)));
+ 873 
+ 874                     if (divisor &gt; 0 &amp;&amp; magic.magicMultiplier &lt; 0) {
+ 875                         magicQuotient = m_insertionSet.insert&lt;Value&gt;(
+ 876                             m_index, Add, m_value-&gt;origin(), magicQuotient, m_value-&gt;child(0));
+ 877                     }
+ 878                     if (divisor &lt; 0 &amp;&amp; magic.magicMultiplier &gt; 0) {
+ 879                         magicQuotient = m_insertionSet.insert&lt;Value&gt;(
+ 880                             m_index, Sub, m_value-&gt;origin(), magicQuotient, m_value-&gt;child(0));
+ 881                     }
+ 882                     if (magic.shift &gt; 0) {
+ 883                         magicQuotient = m_insertionSet.insert&lt;Value&gt;(
+ 884                             m_index, SShr, m_value-&gt;origin(), magicQuotient,
+ 885                             m_insertionSet.insert&lt;Const32Value&gt;(
+ 886                                 m_index, m_value-&gt;origin(), magic.shift));
+ 887                     }
+ 888                     replaceWithIdentity(
+ 889                         m_insertionSet.insert&lt;Value&gt;(
+ 890                             m_index, Add, m_value-&gt;origin(), magicQuotient,
+ 891                             m_insertionSet.insert&lt;Value&gt;(
+ 892                                 m_index, ZShr, m_value-&gt;origin(), magicQuotient,
+ 893                                 m_insertionSet.insert&lt;Const32Value&gt;(
+ 894                                     m_index, m_value-&gt;origin(), 31))));
+ 895                     break;
+ 896                 }
+ 897                 break;
+ 898             }
+ 899             break;
+ 900 
+ 901         case UDiv:
+ 902             // Turn this: UDiv(constant1, constant2)
+ 903             // Into this: constant1 / constant2
+ 904             if (replaceWithNewValue(m_value-&gt;child(0)-&gt;uDivConstant(m_proc, m_value-&gt;child(1))))
+ 905                 break;
+ 906 
+ 907             if (m_value-&gt;child(1)-&gt;hasInt()) {
+ 908                 switch (m_value-&gt;child(1)-&gt;asInt()) {
+ 909                 case 0:
+ 910                     // Turn this: UDiv(value, 0)
+ 911                     // Into this: 0
+ 912                     // We can do whatever we want here so we might as well do the chill thing,
+ 913                     // in case we add chill versions of UDiv in the future.
+ 914                     replaceWithIdentity(m_value-&gt;child(1));
+ 915                     break;
+ 916 
+ 917                 case 1:
+ 918                     // Turn this: UDiv(value, 1)
+ 919                     // Into this: value
+ 920                     replaceWithIdentity(m_value-&gt;child(0));
+ 921                     break;
+ 922                 default:
+ 923                     // FIXME: We should do comprehensive strength reduction for unsigned numbers. Likely,
+ 924                     // we will just want copy what llvm does. https://bugs.webkit.org/show_bug.cgi?id=164809
+ 925                     break;
+ 926                 }
+ 927             }
+ 928             break;
+ 929 
+ 930         case Mod:
+ 931             // Turn this: Mod(constant1, constant2)
+ 932             // Into this: constant1 / constant2
+ 933             // Note that this uses Mod&lt;Chill&gt; semantics.
+ 934             if (replaceWithNewValue(m_value-&gt;child(0)-&gt;modConstant(m_proc, m_value-&gt;child(1))))
+ 935                 break;
+ 936 
+ 937             // Modulo by constant is more efficient if we turn it into Div, and then let Div get
+ 938             // optimized.
+ 939             if (m_value-&gt;child(1)-&gt;hasInt()) {
+ 940                 switch (m_value-&gt;child(1)-&gt;asInt()) {
+ 941                 case 0:
+ 942                     // Turn this: Mod(value, 0)
+ 943                     // Into this: 0
+ 944                     // This is correct according to ChillMod semantics.
+ 945                     replaceWithIdentity(m_value-&gt;child(1));
+ 946                     break;
+ 947 
+ 948                 default:
+ 949                     if (m_proc.optLevel() &lt; 2)
+ 950                         break;
+ 951 
+ 952                     // Turn this: Mod(N, D)
+ 953                     // Into this: Sub(N, Mul(Div(N, D), D))
+ 954                     //
+ 955                     // This is a speed-up because we use our existing Div optimizations.
+ 956                     //
+ 957                     // Here&#39;s an easier way to look at it:
+ 958                     //     N % D = N - N / D * D
+ 959                     //
+ 960                     // Note that this does not work for D = 0 and ChillMod. The expected result is 0.
+ 961                     // That&#39;s why we have a special-case above.
+ 962                     //     X % 0 = X - X / 0 * 0 = X     (should be 0)
+ 963                     //
+ 964                     // This does work for the D = -1 special case.
+ 965                     //     -2^31 % -1 = -2^31 - -2^31 / -1 * -1
+ 966                     //                = -2^31 - -2^31 * -1
+ 967                     //                = -2^31 - -2^31
+ 968                     //                = 0
+ 969 
+ 970                     Kind divKind = Div;
+ 971                     divKind.setIsChill(m_value-&gt;isChill());
+ 972 
+ 973                     replaceWithIdentity(
+ 974                         m_insertionSet.insert&lt;Value&gt;(
+ 975                             m_index, Sub, m_value-&gt;origin(),
+ 976                             m_value-&gt;child(0),
+ 977                             m_insertionSet.insert&lt;Value&gt;(
+ 978                                 m_index, Mul, m_value-&gt;origin(),
+ 979                                 m_insertionSet.insert&lt;Value&gt;(
+ 980                                     m_index, divKind, m_value-&gt;origin(),
+ 981                                     m_value-&gt;child(0), m_value-&gt;child(1)),
+ 982                                 m_value-&gt;child(1))));
+ 983                     break;
+ 984                 }
+ 985                 break;
+ 986             }
+ 987 
+ 988             break;
+ 989 
+ 990         case UMod:
+ 991             // Turn this: UMod(constant1, constant2)
+ 992             // Into this: constant1 / constant2
+ 993             replaceWithNewValue(m_value-&gt;child(0)-&gt;uModConstant(m_proc, m_value-&gt;child(1)));
+ 994             // FIXME: We should do what we do for Mod since the same principle applies here.
+ 995             // https://bugs.webkit.org/show_bug.cgi?id=164809
+ 996             break;
+ 997 
+ 998         case BitAnd:
+ 999             handleCommutativity();
+1000 
+1001             // Turn this: BitAnd(constant1, constant2)
+1002             // Into this: constant1 &amp; constant2
+1003             if (Value* constantBitAnd = m_value-&gt;child(0)-&gt;bitAndConstant(m_proc, m_value-&gt;child(1))) {
+1004                 replaceWithNewValue(constantBitAnd);
+1005                 break;
+1006             }
+1007 
+1008             // Turn this: BitAnd(BitAnd(value, constant1), constant2)
+1009             // Into this: BitAnd(value, constant1 &amp; constant2).
+1010             if (m_value-&gt;child(0)-&gt;opcode() == BitAnd) {
+1011                 Value* newConstant = m_value-&gt;child(1)-&gt;bitAndConstant(m_proc, m_value-&gt;child(0)-&gt;child(1));
+1012                 if (newConstant) {
+1013                     m_insertionSet.insertValue(m_index, newConstant);
+1014                     m_value-&gt;child(0) = m_value-&gt;child(0)-&gt;child(0);
+1015                     m_value-&gt;child(1) = newConstant;
+1016                     m_changed = true;
+1017                 }
+1018             }
+1019 
+1020             // Turn this: BitAnd(valueX, valueX)
+1021             // Into this: valueX.
+1022             if (m_value-&gt;child(0) == m_value-&gt;child(1)) {
+1023                 replaceWithIdentity(m_value-&gt;child(0));
+1024                 break;
+1025             }
+1026 
+1027             // Turn this: BitAnd(value, zero-constant)
+1028             // Into this: zero-constant.
+1029             if (m_value-&gt;child(1)-&gt;isInt(0)) {
+1030                 replaceWithIdentity(m_value-&gt;child(1));
+1031                 break;
+1032             }
+1033 
+1034             // Turn this: BitAnd(value, all-ones)
+1035             // Into this: value.
+1036             if ((m_value-&gt;type() == Int64 &amp;&amp; m_value-&gt;child(1)-&gt;isInt(std::numeric_limits&lt;uint64_t&gt;::max()))
+1037                 || (m_value-&gt;type() == Int32 &amp;&amp; m_value-&gt;child(1)-&gt;isInt(std::numeric_limits&lt;uint32_t&gt;::max()))) {
+1038                 replaceWithIdentity(m_value-&gt;child(0));
+1039                 break;
+1040             }
+1041 
+1042             // Turn this: BitAnd(64-bit value, 32 ones)
+1043             // Into this: ZExt32(Trunc(64-bit value))
+1044             if (m_value-&gt;child(1)-&gt;isInt64(0xffffffffllu)) {
+1045                 Value* newValue = m_insertionSet.insert&lt;Value&gt;(
+1046                     m_index, ZExt32, m_value-&gt;origin(),
+1047                     m_insertionSet.insert&lt;Value&gt;(m_index, Trunc, m_value-&gt;origin(), m_value-&gt;child(0)));
+1048                 replaceWithIdentity(newValue);
+1049                 break;
+1050             }
+1051 
+1052             // Turn this: BitAnd(SExt8(value), mask) where (mask &amp; 0xffffff00) == 0
+1053             // Into this: BitAnd(value, mask)
+1054             if (m_value-&gt;child(0)-&gt;opcode() == SExt8 &amp;&amp; m_value-&gt;child(1)-&gt;hasInt32()
+1055                 &amp;&amp; !(m_value-&gt;child(1)-&gt;asInt32() &amp; 0xffffff00)) {
+1056                 m_value-&gt;child(0) = m_value-&gt;child(0)-&gt;child(0);
+1057                 m_changed = true;
+1058                 break;
+1059             }
+1060 
+1061             // Turn this: BitAnd(SExt16(value), mask) where (mask &amp; 0xffff0000) == 0
+1062             // Into this: BitAnd(value, mask)
+1063             if (m_value-&gt;child(0)-&gt;opcode() == SExt16 &amp;&amp; m_value-&gt;child(1)-&gt;hasInt32()
+1064                 &amp;&amp; !(m_value-&gt;child(1)-&gt;asInt32() &amp; 0xffff0000)) {
+1065                 m_value-&gt;child(0) = m_value-&gt;child(0)-&gt;child(0);
+1066                 m_changed = true;
+1067                 break;
+1068             }
+1069 
+1070             // Turn this: BitAnd(SExt32(value), mask) where (mask &amp; 0xffffffff00000000) == 0
+1071             // Into this: BitAnd(ZExt32(value), mask)
+1072             if (m_value-&gt;child(0)-&gt;opcode() == SExt32 &amp;&amp; m_value-&gt;child(1)-&gt;hasInt32()
+1073                 &amp;&amp; !(m_value-&gt;child(1)-&gt;asInt32() &amp; 0xffffffff00000000llu)) {
+1074                 m_value-&gt;child(0) = m_insertionSet.insert&lt;Value&gt;(
+1075                     m_index, ZExt32, m_value-&gt;origin(),
+1076                     m_value-&gt;child(0)-&gt;child(0), m_value-&gt;child(0)-&gt;child(1));
+1077                 m_changed = true;
+1078                 break;
+1079             }
+1080 
+1081             // Turn this: BitAnd(Op(value, constant1), constant2)
+1082             //     where !(constant1 &amp; constant2)
+1083             //       and Op is BitOr or BitXor
+1084             // into this: BitAnd(value, constant2)
+1085             if (m_value-&gt;child(1)-&gt;hasInt()) {
+1086                 int64_t constant2 = m_value-&gt;child(1)-&gt;asInt();
+1087                 switch (m_value-&gt;child(0)-&gt;opcode()) {
+1088                 case BitOr:
+1089                 case BitXor:
+1090                     if (m_value-&gt;child(0)-&gt;child(1)-&gt;hasInt()
+1091                         &amp;&amp; !(m_value-&gt;child(0)-&gt;child(1)-&gt;asInt() &amp; constant2)) {
+1092                         m_value-&gt;child(0) = m_value-&gt;child(0)-&gt;child(0);
+1093                         m_changed = true;
+1094                         break;
+1095                     }
+1096                     break;
+1097                 default:
+1098                     break;
+1099                 }
+1100                 break;
+1101             }
+1102 
+1103             // Turn this: BitAnd(BitXor(x1, allOnes), BitXor(x2, allOnes)
+1104             // Into this: BitXor(BitOr(x1, x2), allOnes)
+1105             // By applying De Morgan laws
+1106             if (m_value-&gt;child(0)-&gt;opcode() == BitXor
+1107                 &amp;&amp; m_value-&gt;child(1)-&gt;opcode() == BitXor
+1108                 &amp;&amp; ((m_value-&gt;type() == Int64
+1109                         &amp;&amp; m_value-&gt;child(0)-&gt;child(1)-&gt;isInt(std::numeric_limits&lt;uint64_t&gt;::max())
+1110                         &amp;&amp; m_value-&gt;child(1)-&gt;child(1)-&gt;isInt(std::numeric_limits&lt;uint64_t&gt;::max()))
+1111                     || (m_value-&gt;type() == Int32
+1112                         &amp;&amp; m_value-&gt;child(0)-&gt;child(1)-&gt;isInt(std::numeric_limits&lt;uint32_t&gt;::max())
+1113                         &amp;&amp; m_value-&gt;child(1)-&gt;child(1)-&gt;isInt(std::numeric_limits&lt;uint32_t&gt;::max())))) {
+1114                 Value* bitOr = m_insertionSet.insert&lt;Value&gt;(m_index, BitOr, m_value-&gt;origin(), m_value-&gt;child(0)-&gt;child(0), m_value-&gt;child(1)-&gt;child(0));
+1115                 replaceWithNew&lt;Value&gt;(BitXor, m_value-&gt;origin(), bitOr, m_value-&gt;child(1)-&gt;child(1));
+1116                 break;
+1117             }
+1118 
+1119             // Turn this: BitAnd(BitXor(x, allOnes), c)
+1120             // Into this: BitXor(BitOr(x, ~c), allOnes)
+1121             // This is a variation on the previous optimization, treating c as if it were BitXor(~c, allOnes)
+1122             // It does not reduce the number of operations, but provides some normalization (we try to get BitXor by allOnes at the outermost point), and some chance to float Xors to a place where they might get eliminated.
+1123             if (m_value-&gt;child(0)-&gt;opcode() == BitXor
+1124                 &amp;&amp; m_value-&gt;child(1)-&gt;hasInt()
+1125                 &amp;&amp; ((m_value-&gt;type() == Int64
+1126                         &amp;&amp; m_value-&gt;child(0)-&gt;child(1)-&gt;isInt(std::numeric_limits&lt;uint64_t&gt;::max()))
+1127                     || (m_value-&gt;type() == Int32
+1128                         &amp;&amp; m_value-&gt;child(0)-&gt;child(1)-&gt;isInt(std::numeric_limits&lt;uint32_t&gt;::max())))) {
+1129                 Value* bitOr = m_insertionSet.insert&lt;Value&gt;(m_index, BitOr, m_value-&gt;origin(), m_value-&gt;child(0)-&gt;child(0), m_value-&gt;child(1)-&gt;bitXorConstant(m_proc, m_value-&gt;child(0)-&gt;child(1)));
+1130                 replaceWithNew&lt;Value&gt;(BitXor, m_value-&gt;origin(), bitOr, m_value-&gt;child(0)-&gt;child(1));
+1131                 break;
+1132             }
+1133 
+1134             break;
+1135 
+1136         case BitOr:
+1137             handleCommutativity();
+1138 
+1139             // Turn this: BitOr(constant1, constant2)
+1140             // Into this: constant1 | constant2
+1141             if (Value* constantBitOr = m_value-&gt;child(0)-&gt;bitOrConstant(m_proc, m_value-&gt;child(1))) {
+1142                 replaceWithNewValue(constantBitOr);
+1143                 break;
+1144             }
+1145 
+1146             // Turn this: BitOr(BitOr(value, constant1), constant2)
+1147             // Into this: BitOr(value, constant1 &amp; constant2).
+1148             if (m_value-&gt;child(0)-&gt;opcode() == BitOr) {
+1149                 Value* newConstant = m_value-&gt;child(1)-&gt;bitOrConstant(m_proc, m_value-&gt;child(0)-&gt;child(1));
+1150                 if (newConstant) {
+1151                     m_insertionSet.insertValue(m_index, newConstant);
+1152                     m_value-&gt;child(0) = m_value-&gt;child(0)-&gt;child(0);
+1153                     m_value-&gt;child(1) = newConstant;
+1154                     m_changed = true;
+1155                 }
+1156             }
+1157 
+1158             // Turn this: BitOr(valueX, valueX)
+1159             // Into this: valueX.
+1160             if (m_value-&gt;child(0) == m_value-&gt;child(1)) {
+1161                 replaceWithIdentity(m_value-&gt;child(0));
+1162                 break;
+1163             }
+1164 
+1165             // Turn this: BitOr(value, zero-constant)
+1166             // Into this: value.
+1167             if (m_value-&gt;child(1)-&gt;isInt(0)) {
+1168                 replaceWithIdentity(m_value-&gt;child(0));
+1169                 break;
+1170             }
+1171 
+1172             // Turn this: BitOr(value, all-ones)
+1173             // Into this: all-ones.
+1174             if ((m_value-&gt;type() == Int64 &amp;&amp; m_value-&gt;child(1)-&gt;isInt(std::numeric_limits&lt;uint64_t&gt;::max()))
+1175                 || (m_value-&gt;type() == Int32 &amp;&amp; m_value-&gt;child(1)-&gt;isInt(std::numeric_limits&lt;uint32_t&gt;::max()))) {
+1176                 replaceWithIdentity(m_value-&gt;child(1));
+1177                 break;
+1178             }
+1179 
+1180             // Turn this: BitOr(BitXor(x1, allOnes), BitXor(x2, allOnes)
+1181             // Into this: BitXor(BitAnd(x1, x2), allOnes)
+1182             // By applying De Morgan laws
+1183             if (m_value-&gt;child(0)-&gt;opcode() == BitXor
+1184                 &amp;&amp; m_value-&gt;child(1)-&gt;opcode() == BitXor
+1185                 &amp;&amp; ((m_value-&gt;type() == Int64
+1186                         &amp;&amp; m_value-&gt;child(0)-&gt;child(1)-&gt;isInt(std::numeric_limits&lt;uint64_t&gt;::max())
+1187                         &amp;&amp; m_value-&gt;child(1)-&gt;child(1)-&gt;isInt(std::numeric_limits&lt;uint64_t&gt;::max()))
+1188                     || (m_value-&gt;type() == Int32
+1189                         &amp;&amp; m_value-&gt;child(0)-&gt;child(1)-&gt;isInt(std::numeric_limits&lt;uint32_t&gt;::max())
+1190                         &amp;&amp; m_value-&gt;child(1)-&gt;child(1)-&gt;isInt(std::numeric_limits&lt;uint32_t&gt;::max())))) {
+1191                 Value* bitAnd = m_insertionSet.insert&lt;Value&gt;(m_index, BitAnd, m_value-&gt;origin(), m_value-&gt;child(0)-&gt;child(0), m_value-&gt;child(1)-&gt;child(0));
+1192                 replaceWithNew&lt;Value&gt;(BitXor, m_value-&gt;origin(), bitAnd, m_value-&gt;child(1)-&gt;child(1));
+1193                 break;
+1194             }
+1195 
+1196             // Turn this: BitOr(BitXor(x, allOnes), c)
+1197             // Into this: BitXor(BitAnd(x, ~c), allOnes)
+1198             // This is a variation on the previous optimization, treating c as if it were BitXor(~c, allOnes)
+1199             // It does not reduce the number of operations, but provides some normalization (we try to get BitXor by allOnes at the outermost point), and some chance to float Xors to a place where they might get eliminated.
+1200             if (m_value-&gt;child(0)-&gt;opcode() == BitXor
+1201                 &amp;&amp; m_value-&gt;child(1)-&gt;hasInt()
+1202                 &amp;&amp; ((m_value-&gt;type() == Int64
+1203                         &amp;&amp; m_value-&gt;child(0)-&gt;child(1)-&gt;isInt(std::numeric_limits&lt;uint64_t&gt;::max()))
+1204                     || (m_value-&gt;type() == Int32
+1205                         &amp;&amp; m_value-&gt;child(0)-&gt;child(1)-&gt;isInt(std::numeric_limits&lt;uint32_t&gt;::max())))) {
+1206                 Value* bitAnd = m_insertionSet.insert&lt;Value&gt;(m_index, BitAnd, m_value-&gt;origin(), m_value-&gt;child(0)-&gt;child(0), m_value-&gt;child(1)-&gt;bitXorConstant(m_proc, m_value-&gt;child(0)-&gt;child(1)));
+1207                 replaceWithNew&lt;Value&gt;(BitXor, m_value-&gt;origin(), bitAnd, m_value-&gt;child(0)-&gt;child(1));
+1208                 break;
+1209             }
+1210 
+1211             if (handleBitAndDistributivity())
+1212                 break;
+1213 
+1214             break;
+1215 
+1216         case BitXor:
+1217             handleCommutativity();
+1218 
+1219             // Turn this: BitXor(constant1, constant2)
+1220             // Into this: constant1 ^ constant2
+1221             if (Value* constantBitXor = m_value-&gt;child(0)-&gt;bitXorConstant(m_proc, m_value-&gt;child(1))) {
+1222                 replaceWithNewValue(constantBitXor);
+1223                 break;
+1224             }
+1225 
+1226             // Turn this: BitXor(BitXor(value, constant1), constant2)
+1227             // Into this: BitXor(value, constant1 ^ constant2).
+1228             if (m_value-&gt;child(0)-&gt;opcode() == BitXor) {
+1229                 Value* newConstant = m_value-&gt;child(1)-&gt;bitXorConstant(m_proc, m_value-&gt;child(0)-&gt;child(1));
+1230                 if (newConstant) {
+1231                     m_insertionSet.insertValue(m_index, newConstant);
+1232                     m_value-&gt;child(0) = m_value-&gt;child(0)-&gt;child(0);
+1233                     m_value-&gt;child(1) = newConstant;
+1234                     m_changed = true;
+1235                 }
+1236             }
+1237 
+1238             // Turn this: BitXor(compare, 1)
+1239             // Into this: invertedCompare
+1240             if (m_value-&gt;child(1)-&gt;isInt32(1)) {
+1241                 if (Value* invertedCompare = m_value-&gt;child(0)-&gt;invertedCompare(m_proc)) {
+1242                     replaceWithNewValue(invertedCompare);
+1243                     break;
+1244                 }
+1245             }
+1246 
+1247             // Turn this: BitXor(valueX, valueX)
+1248             // Into this: zero-constant.
+1249             if (m_value-&gt;child(0) == m_value-&gt;child(1)) {
+1250                 replaceWithNewValue(m_proc.addIntConstant(m_value, 0));
+1251                 break;
+1252             }
+1253 
+1254             // Turn this: BitXor(value, zero-constant)
+1255             // Into this: value.
+1256             if (m_value-&gt;child(1)-&gt;isInt(0)) {
+1257                 replaceWithIdentity(m_value-&gt;child(0));
+1258                 break;
+1259             }
+1260 
+1261             if (handleBitAndDistributivity())
+1262                 break;
+1263 
+1264             break;
+1265 
+1266         case Shl:
+1267             // Turn this: Shl(constant1, constant2)
+1268             // Into this: constant1 &lt;&lt; constant2
+1269             if (Value* constant = m_value-&gt;child(0)-&gt;shlConstant(m_proc, m_value-&gt;child(1))) {
+1270                 replaceWithNewValue(constant);
+1271                 break;
+1272             }
+1273 
+1274             // Turn this: Shl(&lt;S|Z&gt;Shr(@x, @const), @const)
+1275             // Into this: BitAnd(@x, -(1&lt;&lt;@const))
+1276             if ((m_value-&gt;child(0)-&gt;opcode() == SShr || m_value-&gt;child(0)-&gt;opcode() == ZShr)
+1277                 &amp;&amp; m_value-&gt;child(0)-&gt;child(1)-&gt;hasInt()
+1278                 &amp;&amp; m_value-&gt;child(1)-&gt;hasInt()
+1279                 &amp;&amp; m_value-&gt;child(0)-&gt;child(1)-&gt;asInt() == m_value-&gt;child(1)-&gt;asInt()) {
+1280                 int shiftAmount = m_value-&gt;child(1)-&gt;asInt() &amp; (m_value-&gt;type() == Int32 ? 31 : 63);
+1281                 Value* newConst = m_proc.addIntConstant(m_value, - static_cast&lt;int64_t&gt;(1ull &lt;&lt; shiftAmount));
+1282                 m_insertionSet.insertValue(m_index, newConst);
+1283                 replaceWithNew&lt;Value&gt;(BitAnd, m_value-&gt;origin(), m_value-&gt;child(0)-&gt;child(0), newConst);
+1284                 break;
+1285             }
+1286 
+1287             handleShiftAmount();
+1288             break;
+1289 
+1290         case SShr:
+1291             // Turn this: SShr(constant1, constant2)
+1292             // Into this: constant1 &gt;&gt; constant2
+1293             if (Value* constant = m_value-&gt;child(0)-&gt;sShrConstant(m_proc, m_value-&gt;child(1))) {
+1294                 replaceWithNewValue(constant);
+1295                 break;
+1296             }
+1297 
+1298             if (m_value-&gt;child(1)-&gt;hasInt32()
+1299                 &amp;&amp; m_value-&gt;child(0)-&gt;opcode() == Shl
+1300                 &amp;&amp; m_value-&gt;child(0)-&gt;child(1)-&gt;hasInt32()
+1301                 &amp;&amp; m_value-&gt;child(1)-&gt;asInt32() == m_value-&gt;child(0)-&gt;child(1)-&gt;asInt32()) {
+1302                 switch (m_value-&gt;child(1)-&gt;asInt32()) {
+1303                 case 16:
+1304                     if (m_value-&gt;type() == Int32) {
+1305                         // Turn this: SShr(Shl(value, 16), 16)
+1306                         // Into this: SExt16(value)
+1307                         replaceWithNewValue(
+1308                             m_proc.add&lt;Value&gt;(
+1309                                 SExt16, m_value-&gt;origin(), m_value-&gt;child(0)-&gt;child(0)));
+1310                     }
+1311                     break;
+1312 
+1313                 case 24:
+1314                     if (m_value-&gt;type() == Int32) {
+1315                         // Turn this: SShr(Shl(value, 24), 24)
+1316                         // Into this: SExt8(value)
+1317                         replaceWithNewValue(
+1318                             m_proc.add&lt;Value&gt;(
+1319                                 SExt8, m_value-&gt;origin(), m_value-&gt;child(0)-&gt;child(0)));
+1320                     }
+1321                     break;
+1322 
+1323                 case 32:
+1324                     if (m_value-&gt;type() == Int64) {
+1325                         // Turn this: SShr(Shl(value, 32), 32)
+1326                         // Into this: SExt32(Trunc(value))
+1327                         replaceWithNewValue(
+1328                             m_proc.add&lt;Value&gt;(
+1329                                 SExt32, m_value-&gt;origin(),
+1330                                 m_insertionSet.insert&lt;Value&gt;(
+1331                                     m_index, Trunc, m_value-&gt;origin(),
+1332                                     m_value-&gt;child(0)-&gt;child(0))));
+1333                     }
+1334                     break;
+1335 
+1336                 // FIXME: Add cases for 48 and 56, but that would translate to SExt32(SExt8) or
+1337                 // SExt32(SExt16), which we don&#39;t currently lower efficiently.
+1338 
+1339                 default:
+1340                     break;
+1341                 }
+1342 
+1343                 if (m_value-&gt;opcode() != SShr)
+1344                     break;
+1345             }
+1346 
+1347             handleShiftAmount();
+1348             break;
+1349 
+1350         case ZShr:
+1351             // Turn this: ZShr(constant1, constant2)
+1352             // Into this: (unsigned)constant1 &gt;&gt; constant2
+1353             if (Value* constant = m_value-&gt;child(0)-&gt;zShrConstant(m_proc, m_value-&gt;child(1))) {
+1354                 replaceWithNewValue(constant);
+1355                 break;
+1356             }
+1357 
+1358             handleShiftAmount();
+1359             break;
+1360 
+1361         case RotR:
+1362             // Turn this: RotR(constant1, constant2)
+1363             // Into this: (constant1 &gt;&gt; constant2) | (constant1 &lt;&lt; sizeof(constant1) * 8 - constant2)
+1364             if (Value* constant = m_value-&gt;child(0)-&gt;rotRConstant(m_proc, m_value-&gt;child(1))) {
+1365                 replaceWithNewValue(constant);
+1366                 break;
+1367             }
+1368 
+1369             handleShiftAmount();
+1370             break;
+1371 
+1372         case RotL:
+1373             // Turn this: RotL(constant1, constant2)
+1374             // Into this: (constant1 &lt;&lt; constant2) | (constant1 &gt;&gt; sizeof(constant1) * 8 - constant2)
+1375             if (Value* constant = m_value-&gt;child(0)-&gt;rotLConstant(m_proc, m_value-&gt;child(1))) {
+1376                 replaceWithNewValue(constant);
+1377                 break;
+1378             }
+1379 
+1380             handleShiftAmount();
+1381             break;
+1382 
+1383         case Abs:
+1384             // Turn this: Abs(constant)
+1385             // Into this: fabs&lt;value-&gt;type()&gt;(constant)
+1386             if (Value* constant = m_value-&gt;child(0)-&gt;absConstant(m_proc)) {
+1387                 replaceWithNewValue(constant);
+1388                 break;
+1389             }
+1390 
+1391             // Turn this: Abs(Abs(value))
+1392             // Into this: Abs(value)
+1393             if (m_value-&gt;child(0)-&gt;opcode() == Abs) {
+1394                 replaceWithIdentity(m_value-&gt;child(0));
+1395                 break;
+1396             }
+1397 
+1398             // Turn this: Abs(Neg(value))
+1399             // Into this: Abs(value)
+1400             if (m_value-&gt;child(0)-&gt;opcode() == Neg) {
+1401                 m_value-&gt;child(0) = m_value-&gt;child(0)-&gt;child(0);
+1402                 m_changed = true;
+1403                 break;
+1404             }
+1405 
+1406             // Turn this: Abs(BitwiseCast(value))
+1407             // Into this: BitwiseCast(And(value, mask-top-bit))
+1408             if (m_value-&gt;child(0)-&gt;opcode() == BitwiseCast) {
+1409                 Value* mask;
+1410                 if (m_value-&gt;type() == Double)
+1411                     mask = m_insertionSet.insert&lt;Const64Value&gt;(m_index, m_value-&gt;origin(), ~(1ll &lt;&lt; 63));
+1412                 else
+1413                     mask = m_insertionSet.insert&lt;Const32Value&gt;(m_index, m_value-&gt;origin(), ~(1l &lt;&lt; 31));
+1414 
+1415                 Value* bitAnd = m_insertionSet.insert&lt;Value&gt;(m_index, BitAnd, m_value-&gt;origin(),
+1416                     m_value-&gt;child(0)-&gt;child(0),
+1417                     mask);
+1418                 Value* cast = m_insertionSet.insert&lt;Value&gt;(m_index, BitwiseCast, m_value-&gt;origin(), bitAnd);
+1419                 replaceWithIdentity(cast);
+1420                 break;
+1421             }
+1422             break;
+1423 
+1424         case Ceil:
+1425             // Turn this: Ceil(constant)
+1426             // Into this: ceil&lt;value-&gt;type()&gt;(constant)
+1427             if (Value* constant = m_value-&gt;child(0)-&gt;ceilConstant(m_proc)) {
+1428                 replaceWithNewValue(constant);
+1429                 break;
+1430             }
+1431 
+1432             // Turn this: Ceil(roundedValue)
+1433             // Into this: roundedValue
+1434             if (m_value-&gt;child(0)-&gt;isRounded()) {
+1435                 replaceWithIdentity(m_value-&gt;child(0));
+1436                 break;
+1437             }
+1438             break;
+1439 
+1440         case Floor:
+1441             // Turn this: Floor(constant)
+1442             // Into this: floor&lt;value-&gt;type()&gt;(constant)
+1443             if (Value* constant = m_value-&gt;child(0)-&gt;floorConstant(m_proc)) {
+1444                 replaceWithNewValue(constant);
+1445                 break;
+1446             }
+1447 
+1448             // Turn this: Floor(roundedValue)
+1449             // Into this: roundedValue
+1450             if (m_value-&gt;child(0)-&gt;isRounded()) {
+1451                 replaceWithIdentity(m_value-&gt;child(0));
+1452                 break;
+1453             }
+1454             break;
+1455 
+1456         case Sqrt:
+1457             // Turn this: Sqrt(constant)
+1458             // Into this: sqrt&lt;value-&gt;type()&gt;(constant)
+1459             if (Value* constant = m_value-&gt;child(0)-&gt;sqrtConstant(m_proc)) {
+1460                 replaceWithNewValue(constant);
+1461                 break;
+1462             }
+1463             break;
+1464 
+1465         case BitwiseCast:
+1466             // Turn this: BitwiseCast(constant)
+1467             // Into this: bitwise_cast&lt;value-&gt;type()&gt;(constant)
+1468             if (Value* constant = m_value-&gt;child(0)-&gt;bitwiseCastConstant(m_proc)) {
+1469                 replaceWithNewValue(constant);
+1470                 break;
+1471             }
+1472 
+1473             // Turn this: BitwiseCast(BitwiseCast(value))
+1474             // Into this: value
+1475             if (m_value-&gt;child(0)-&gt;opcode() == BitwiseCast) {
+1476                 replaceWithIdentity(m_value-&gt;child(0)-&gt;child(0));
+1477                 break;
+1478             }
+1479             break;
+1480 
+1481         case SExt8:
+1482             // Turn this: SExt8(constant)
+1483             // Into this: static_cast&lt;int8_t&gt;(constant)
+1484             if (m_value-&gt;child(0)-&gt;hasInt32()) {
+1485                 int32_t result = static_cast&lt;int8_t&gt;(m_value-&gt;child(0)-&gt;asInt32());
+1486                 replaceWithNewValue(m_proc.addIntConstant(m_value, result));
+1487                 break;
+1488             }
+1489 
+1490             // Turn this: SExt8(SExt8(value))
+1491             //   or this: SExt8(SExt16(value))
+1492             // Into this: SExt8(value)
+1493             if (m_value-&gt;child(0)-&gt;opcode() == SExt8 || m_value-&gt;child(0)-&gt;opcode() == SExt16) {
+1494                 m_value-&gt;child(0) = m_value-&gt;child(0)-&gt;child(0);
+1495                 m_changed = true;
+1496             }
+1497 
+1498             if (m_value-&gt;child(0)-&gt;opcode() == BitAnd &amp;&amp; m_value-&gt;child(0)-&gt;child(1)-&gt;hasInt32()) {
+1499                 Value* input = m_value-&gt;child(0)-&gt;child(0);
+1500                 int32_t mask = m_value-&gt;child(0)-&gt;child(1)-&gt;asInt32();
+1501 
+1502                 // Turn this: SExt8(BitAnd(input, mask)) where (mask &amp; 0xff) == 0xff
+1503                 // Into this: SExt8(input)
+1504                 if ((mask &amp; 0xff) == 0xff) {
+1505                     m_value-&gt;child(0) = input;
+1506                     m_changed = true;
+1507                     break;
+1508                 }
+1509 
+1510                 // Turn this: SExt8(BitAnd(input, mask)) where (mask &amp; 0x80) == 0
+1511                 // Into this: BitAnd(input, const &amp; 0x7f)
+1512                 if (!(mask &amp; 0x80)) {
+1513                     replaceWithNewValue(
+1514                         m_proc.add&lt;Value&gt;(
+1515                             BitAnd, m_value-&gt;origin(), input,
+1516                             m_insertionSet.insert&lt;Const32Value&gt;(
+1517                                 m_index, m_value-&gt;origin(), mask &amp; 0x7f)));
+1518                     break;
+1519                 }
+1520             }
+1521 
+1522             if (!m_proc.hasQuirks()) {
+1523                 // Turn this: SExt8(AtomicXchg___)
+1524                 // Into this: AtomicXchg___
+1525                 if (isAtomicXchg(m_value-&gt;child(0)-&gt;opcode())
+1526                     &amp;&amp; m_value-&gt;child(0)-&gt;as&lt;AtomicValue&gt;()-&gt;accessWidth() == Width8) {
+1527                     replaceWithIdentity(m_value-&gt;child(0));
+1528                     break;
+1529                 }
+1530             }
+1531             break;
+1532 
+1533         case SExt16:
+1534             // Turn this: SExt16(constant)
+1535             // Into this: static_cast&lt;int16_t&gt;(constant)
+1536             if (m_value-&gt;child(0)-&gt;hasInt32()) {
+1537                 int32_t result = static_cast&lt;int16_t&gt;(m_value-&gt;child(0)-&gt;asInt32());
+1538                 replaceWithNewValue(m_proc.addIntConstant(m_value, result));
+1539                 break;
+1540             }
+1541 
+1542             // Turn this: SExt16(SExt16(value))
+1543             // Into this: SExt16(value)
+1544             if (m_value-&gt;child(0)-&gt;opcode() == SExt16) {
+1545                 m_value-&gt;child(0) = m_value-&gt;child(0)-&gt;child(0);
+1546                 m_changed = true;
+1547             }
+1548 
+1549             // Turn this: SExt16(SExt8(value))
+1550             // Into this: SExt8(value)
+1551             if (m_value-&gt;child(0)-&gt;opcode() == SExt8) {
+1552                 replaceWithIdentity(m_value-&gt;child(0));
+1553                 break;
+1554             }
+1555 
+1556             if (m_value-&gt;child(0)-&gt;opcode() == BitAnd &amp;&amp; m_value-&gt;child(0)-&gt;child(1)-&gt;hasInt32()) {
+1557                 Value* input = m_value-&gt;child(0)-&gt;child(0);
+1558                 int32_t mask = m_value-&gt;child(0)-&gt;child(1)-&gt;asInt32();
+1559 
+1560                 // Turn this: SExt16(BitAnd(input, mask)) where (mask &amp; 0xffff) == 0xffff
+1561                 // Into this: SExt16(input)
+1562                 if ((mask &amp; 0xffff) == 0xffff) {
+1563                     m_value-&gt;child(0) = input;
+1564                     m_changed = true;
+1565                     break;
+1566                 }
+1567 
+1568                 // Turn this: SExt16(BitAnd(input, mask)) where (mask &amp; 0x8000) == 0
+1569                 // Into this: BitAnd(input, const &amp; 0x7fff)
+1570                 if (!(mask &amp; 0x8000)) {
+1571                     replaceWithNewValue(
+1572                         m_proc.add&lt;Value&gt;(
+1573                             BitAnd, m_value-&gt;origin(), input,
+1574                             m_insertionSet.insert&lt;Const32Value&gt;(
+1575                                 m_index, m_value-&gt;origin(), mask &amp; 0x7fff)));
+1576                     break;
+1577                 }
+1578             }
+1579 
+1580             if (!m_proc.hasQuirks()) {
+1581                 // Turn this: SExt16(AtomicXchg___)
+1582                 // Into this: AtomicXchg___
+1583                 if (isAtomicXchg(m_value-&gt;child(0)-&gt;opcode())
+1584                     &amp;&amp; m_value-&gt;child(0)-&gt;as&lt;AtomicValue&gt;()-&gt;accessWidth() == Width16) {
+1585                     replaceWithIdentity(m_value-&gt;child(0));
+1586                     break;
+1587                 }
+1588             }
+1589             break;
+1590 
+1591         case SExt32:
+1592             // Turn this: SExt32(constant)
+1593             // Into this: static_cast&lt;int64_t&gt;(constant)
+1594             if (m_value-&gt;child(0)-&gt;hasInt32()) {
+1595                 replaceWithNewValue(m_proc.addIntConstant(m_value, m_value-&gt;child(0)-&gt;asInt32()));
+1596                 break;
+1597             }
+1598 
+1599             // Turn this: SExt32(BitAnd(input, mask)) where (mask &amp; 0x80000000) == 0
+1600             // Into this: ZExt32(BitAnd(input, mask))
+1601             if (m_value-&gt;child(0)-&gt;opcode() == BitAnd &amp;&amp; m_value-&gt;child(0)-&gt;child(1)-&gt;hasInt32()
+1602                 &amp;&amp; !(m_value-&gt;child(0)-&gt;child(1)-&gt;asInt32() &amp; 0x80000000)) {
+1603                 replaceWithNewValue(
+1604                     m_proc.add&lt;Value&gt;(
+1605                         ZExt32, m_value-&gt;origin(), m_value-&gt;child(0)));
+1606                 break;
+1607             }
+1608             break;
+1609 
+1610         case ZExt32:
+1611             // Turn this: ZExt32(constant)
+1612             // Into this: static_cast&lt;uint64_t&gt;(static_cast&lt;uint32_t&gt;(constant))
+1613             if (m_value-&gt;child(0)-&gt;hasInt32()) {
+1614                 replaceWithNewValue(
+1615                     m_proc.addIntConstant(
+1616                         m_value,
+1617                         static_cast&lt;uint64_t&gt;(static_cast&lt;uint32_t&gt;(m_value-&gt;child(0)-&gt;asInt32()))));
+1618                 break;
+1619             }
+1620             break;
+1621 
+1622         case Trunc:
+1623             // Turn this: Trunc(constant)
+1624             // Into this: static_cast&lt;int32_t&gt;(constant)
+1625             if (m_value-&gt;child(0)-&gt;hasInt64() || m_value-&gt;child(0)-&gt;hasDouble()) {
+1626                 replaceWithNewValue(
+1627                     m_proc.addIntConstant(m_value, static_cast&lt;int32_t&gt;(m_value-&gt;child(0)-&gt;asInt64())));
+1628                 break;
+1629             }
+1630 
+1631             // Turn this: Trunc(SExt32(value)) or Trunc(ZExt32(value))
+1632             // Into this: value
+1633             if (m_value-&gt;child(0)-&gt;opcode() == SExt32 || m_value-&gt;child(0)-&gt;opcode() == ZExt32) {
+1634                 replaceWithIdentity(m_value-&gt;child(0)-&gt;child(0));
+1635                 break;
+1636             }
+1637 
+1638             // Turn this: Trunc(Op(value, constant))
+1639             //     where !(constant &amp; 0xffffffff)
+1640             //       and Op is Add, Sub, BitOr, or BitXor
+1641             // into this: Trunc(value)
+1642             switch (m_value-&gt;child(0)-&gt;opcode()) {
+1643             case Add:
+1644             case Sub:
+1645             case BitOr:
+1646             case BitXor:
+1647                 if (m_value-&gt;child(0)-&gt;child(1)-&gt;hasInt64()
+1648                     &amp;&amp; !(m_value-&gt;child(0)-&gt;child(1)-&gt;asInt64() &amp; 0xffffffffll)) {
+1649                     m_value-&gt;child(0) = m_value-&gt;child(0)-&gt;child(0);
+1650                     m_changed = true;
+1651                     break;
+1652                 }
+1653                 break;
+1654             default:
+1655                 break;
+1656             }
+1657             break;
+1658 
+1659         case IToD:
+1660             // Turn this: IToD(constant)
+1661             // Into this: ConstDouble(constant)
+1662             if (Value* constant = m_value-&gt;child(0)-&gt;iToDConstant(m_proc)) {
+1663                 replaceWithNewValue(constant);
+1664                 break;
+1665             }
+1666             break;
+1667 
+1668         case IToF:
+1669             // Turn this: IToF(constant)
+1670             // Into this: ConstFloat(constant)
+1671             if (Value* constant = m_value-&gt;child(0)-&gt;iToFConstant(m_proc)) {
+1672                 replaceWithNewValue(constant);
+1673                 break;
+1674             }
+1675             break;
+1676 
+1677         case FloatToDouble:
+1678             // Turn this: FloatToDouble(constant)
+1679             // Into this: ConstDouble(constant)
+1680             if (Value* constant = m_value-&gt;child(0)-&gt;floatToDoubleConstant(m_proc)) {
+1681                 replaceWithNewValue(constant);
+1682                 break;
+1683             }
+1684             break;
+1685 
+1686         case DoubleToFloat:
+1687             // Turn this: DoubleToFloat(FloatToDouble(value))
+1688             // Into this: value
+1689             if (m_value-&gt;child(0)-&gt;opcode() == FloatToDouble) {
+1690                 replaceWithIdentity(m_value-&gt;child(0)-&gt;child(0));
+1691                 break;
+1692             }
+1693 
+1694             // Turn this: DoubleToFloat(constant)
+1695             // Into this: ConstFloat(constant)
+1696             if (Value* constant = m_value-&gt;child(0)-&gt;doubleToFloatConstant(m_proc)) {
+1697                 replaceWithNewValue(constant);
+1698                 break;
+1699             }
+1700             break;
+1701 
+1702         case Select:
+1703             // Turn this: Select(constant, a, b)
+1704             // Into this: constant ? a : b
+1705             if (m_value-&gt;child(0)-&gt;hasInt32()) {
+1706                 replaceWithIdentity(
+1707                     m_value-&gt;child(0)-&gt;asInt32() ? m_value-&gt;child(1) : m_value-&gt;child(2));
+1708                 break;
+1709             }
+1710 
+1711             // Turn this: Select(Equal(x, 0), a, b)
+1712             // Into this: Select(x, b, a)
+1713             if (m_value-&gt;child(0)-&gt;opcode() == Equal &amp;&amp; m_value-&gt;child(0)-&gt;child(1)-&gt;isInt(0)) {
+1714                 m_value-&gt;child(0) = m_value-&gt;child(0)-&gt;child(0);
+1715                 std::swap(m_value-&gt;child(1), m_value-&gt;child(2));
+1716                 m_changed = true;
+1717                 break;
+1718             }
+1719 
+1720             // Turn this: Select(BitXor(bool, 1), a, b)
+1721             // Into this: Select(bool, b, a)
+1722             if (m_value-&gt;child(0)-&gt;opcode() == BitXor
+1723                 &amp;&amp; m_value-&gt;child(0)-&gt;child(1)-&gt;isInt32(1)
+1724                 &amp;&amp; m_value-&gt;child(0)-&gt;child(0)-&gt;returnsBool()) {
+1725                 m_value-&gt;child(0) = m_value-&gt;child(0)-&gt;child(0);
+1726                 std::swap(m_value-&gt;child(1), m_value-&gt;child(2));
+1727                 m_changed = true;
+1728                 break;
+1729             }
+1730 
+1731             // Turn this: Select(BitAnd(bool, xyz1), a, b)
+1732             // Into this: Select(bool, a, b)
+1733             if (m_value-&gt;child(0)-&gt;opcode() == BitAnd
+1734                 &amp;&amp; m_value-&gt;child(0)-&gt;child(1)-&gt;hasInt()
+1735                 &amp;&amp; m_value-&gt;child(0)-&gt;child(1)-&gt;asInt() &amp; 1
+1736                 &amp;&amp; m_value-&gt;child(0)-&gt;child(0)-&gt;returnsBool()) {
+1737                 m_value-&gt;child(0) = m_value-&gt;child(0)-&gt;child(0);
+1738                 m_changed = true;
+1739                 break;
+1740             }
+1741 
+1742             // Turn this: Select(stuff, x, x)
+1743             // Into this: x
+1744             if (m_value-&gt;child(1) == m_value-&gt;child(2)) {
+1745                 replaceWithIdentity(m_value-&gt;child(1));
+1746                 break;
+1747             }
+1748             break;
+1749 
+1750         case Load8Z:
+1751         case Load8S:
+1752         case Load16Z:
+1753         case Load16S:
+1754         case Load:
+1755         case Store8:
+1756         case Store16:
+1757         case Store: {
+1758             Value* address = m_value-&gt;lastChild();
+1759             MemoryValue* memory = m_value-&gt;as&lt;MemoryValue&gt;();
+1760 
+1761             // Turn this: Load(Add(address, offset1), offset = offset2)
+1762             // Into this: Load(address, offset = offset1 + offset2)
+1763             //
+1764             // Also turns this: Store(value, Add(address, offset1), offset = offset2)
+1765             // Into this: Store(value, address, offset = offset1 + offset2)
+1766             if (address-&gt;opcode() == Add &amp;&amp; address-&gt;child(1)-&gt;hasIntPtr()) {
+1767                 intptr_t offset = address-&gt;child(1)-&gt;asIntPtr();
+1768                 if (!sumOverflows&lt;intptr_t&gt;(offset, memory-&gt;offset())) {
+1769                     offset += memory-&gt;offset();
+1770                     Value::OffsetType smallOffset = static_cast&lt;Value::OffsetType&gt;(offset);
+1771                     if (smallOffset == offset) {
+1772                         address = address-&gt;child(0);
+1773                         memory-&gt;lastChild() = address;
+1774                         memory-&gt;setOffset(smallOffset);
+1775                         m_changed = true;
+1776                     }
+1777                 }
+1778             }
+1779 
+1780             // Turn this: Load(constant1, offset = constant2)
+1781             // Into this: Load(constant1 + constant2)
+1782             //
+1783             // This is a fun canonicalization. It purely regresses naively generated code. We rely
+1784             // on constant materialization to be smart enough to materialize this constant the smart
+1785             // way. We want this canonicalization because we want to know if two memory accesses see
+1786             // the same address.
+1787             if (memory-&gt;offset()) {
+1788                 if (Value* newAddress = address-&gt;addConstant(m_proc, memory-&gt;offset())) {
+1789                     m_insertionSet.insertValue(m_index, newAddress);
+1790                     address = newAddress;
+1791                     memory-&gt;lastChild() = newAddress;
+1792                     memory-&gt;setOffset(0);
+1793                     m_changed = true;
+1794                 }
+1795             }
+1796 
+1797             break;
+1798         }
+1799 
+1800         case CCall: {
+1801             // Turn this: Call(fmod, constant1, constant2)
+1802             // Into this: fcall-constant(constant1, constant2)
+1803             auto* fmodDouble = tagCFunctionPtr&lt;double (*)(double, double)&gt;(fmod, B3CCallPtrTag);
+1804             if (m_value-&gt;type() == Double
+1805                 &amp;&amp; m_value-&gt;numChildren() == 3
+1806                 &amp;&amp; m_value-&gt;child(0)-&gt;isIntPtr(reinterpret_cast&lt;intptr_t&gt;(fmodDouble))
+1807                 &amp;&amp; m_value-&gt;child(1)-&gt;type() == Double
+1808                 &amp;&amp; m_value-&gt;child(2)-&gt;type() == Double) {
+1809                 replaceWithNewValue(m_value-&gt;child(1)-&gt;modConstant(m_proc, m_value-&gt;child(2)));
+1810             }
+1811             break;
+1812         }
+1813         case Equal:
+1814             handleCommutativity();
+1815 
+1816             // Turn this: Equal(bool, 0)
+1817             // Into this: BitXor(bool, 1)
+1818             if (m_value-&gt;child(0)-&gt;returnsBool() &amp;&amp; m_value-&gt;child(1)-&gt;isInt32(0)) {
+1819                 replaceWithNew&lt;Value&gt;(
+1820                     BitXor, m_value-&gt;origin(), m_value-&gt;child(0),
+1821                     m_insertionSet.insert&lt;Const32Value&gt;(m_index, m_value-&gt;origin(), 1));
+1822                 break;
+1823             }
+1824 
+1825             // Turn this Equal(bool, 1)
+1826             // Into this: bool
+1827             if (m_value-&gt;child(0)-&gt;returnsBool() &amp;&amp; m_value-&gt;child(1)-&gt;isInt32(1)) {
+1828                 replaceWithIdentity(m_value-&gt;child(0));
+1829                 break;
+1830             }
+1831 
+1832             // Turn this: Equal(const1, const2)
+1833             // Into this: const1 == const2
+1834             replaceWithNewValue(
+1835                 m_proc.addBoolConstant(
+1836                     m_value-&gt;origin(),
+1837                     m_value-&gt;child(0)-&gt;equalConstant(m_value-&gt;child(1))));
+1838             break;
+1839 
+1840         case NotEqual:
+1841             handleCommutativity();
+1842 
+1843             if (m_value-&gt;child(0)-&gt;returnsBool()) {
+1844                 // Turn this: NotEqual(bool, 0)
+1845                 // Into this: bool
+1846                 if (m_value-&gt;child(1)-&gt;isInt32(0)) {
+1847                     replaceWithIdentity(m_value-&gt;child(0));
+1848                     break;
+1849                 }
+1850 
+1851                 // Turn this: NotEqual(bool, 1)
+1852                 // Into this: Equal(bool, 0)
+1853                 if (m_value-&gt;child(1)-&gt;isInt32(1)) {
+1854                     replaceWithNew&lt;Value&gt;(
+1855                         Equal, m_value-&gt;origin(), m_value-&gt;child(0),
+1856                         m_insertionSet.insertIntConstant(m_index, m_value-&gt;origin(), Int32, 0));
+1857                     break;
+1858                 }
+1859             }
+1860 
+1861             // Turn this: NotEqual(const1, const2)
+1862             // Into this: const1 != const2
+1863             replaceWithNewValue(
+1864                 m_proc.addBoolConstant(
+1865                     m_value-&gt;origin(),
+1866                     m_value-&gt;child(0)-&gt;notEqualConstant(m_value-&gt;child(1))));
+1867             break;
+1868 
+1869         case LessThan:
+1870         case GreaterThan:
+1871         case LessEqual:
+1872         case GreaterEqual:
+1873         case Above:
+1874         case Below:
+1875         case AboveEqual:
+1876         case BelowEqual: {
+1877             CanonicalizedComparison comparison = canonicalizeComparison(m_value);
+1878             TriState result = MixedTriState;
+1879             switch (comparison.opcode) {
+1880             case LessThan:
+1881                 result = comparison.operands[1]-&gt;greaterThanConstant(comparison.operands[0]);
+1882                 break;
+1883             case GreaterThan:
+1884                 result = comparison.operands[1]-&gt;lessThanConstant(comparison.operands[0]);
+1885                 break;
+1886             case LessEqual:
+1887                 result = comparison.operands[1]-&gt;greaterEqualConstant(comparison.operands[0]);
+1888                 break;
+1889             case GreaterEqual:
+1890                 result = comparison.operands[1]-&gt;lessEqualConstant(comparison.operands[0]);
+1891                 break;
+1892             case Above:
+1893                 result = comparison.operands[1]-&gt;belowConstant(comparison.operands[0]);
+1894                 break;
+1895             case Below:
+1896                 result = comparison.operands[1]-&gt;aboveConstant(comparison.operands[0]);
+1897                 break;
+1898             case AboveEqual:
+1899                 result = comparison.operands[1]-&gt;belowEqualConstant(comparison.operands[0]);
+1900                 break;
+1901             case BelowEqual:
+1902                 result = comparison.operands[1]-&gt;aboveEqualConstant(comparison.operands[0]);
+1903                 break;
+1904             default:
+1905                 RELEASE_ASSERT_NOT_REACHED();
+1906                 break;
+1907             }
+1908 
+1909             if (auto* constant = m_proc.addBoolConstant(m_value-&gt;origin(), result)) {
+1910                 replaceWithNewValue(constant);
+1911                 break;
+1912             }
+1913             if (comparison.opcode != m_value-&gt;opcode()) {
+1914                 replaceWithNew&lt;Value&gt;(comparison.opcode, m_value-&gt;origin(), comparison.operands[0], comparison.operands[1]);
+1915                 break;
+1916             }
+1917             break;
+1918         }
+1919 
+1920         case EqualOrUnordered:
+1921             handleCommutativity();
+1922 
+1923             // Turn this: Equal(const1, const2)
+1924             // Into this: isunordered(const1, const2) || const1 == const2.
+1925             // Turn this: Equal(value, const_NaN)
+1926             // Into this: 1.
+1927             replaceWithNewValue(
+1928                 m_proc.addBoolConstant(
+1929                     m_value-&gt;origin(),
+1930                     m_value-&gt;child(1)-&gt;equalOrUnorderedConstant(m_value-&gt;child(0))));
+1931             break;
+1932 
+1933         case CheckAdd: {
+1934             if (replaceWithNewValue(m_value-&gt;child(0)-&gt;checkAddConstant(m_proc, m_value-&gt;child(1))))
+1935                 break;
+1936 
+1937             handleCommutativity();
+1938 
+1939             if (m_value-&gt;child(1)-&gt;isInt(0)) {
+1940                 replaceWithIdentity(m_value-&gt;child(0));
+1941                 break;
+1942             }
+1943 
+1944             IntRange leftRange = rangeFor(m_value-&gt;child(0));
+1945             IntRange rightRange = rangeFor(m_value-&gt;child(1));
+1946             if (!leftRange.couldOverflowAdd(rightRange, m_value-&gt;type())) {
+1947                 replaceWithNewValue(
+1948                     m_proc.add&lt;Value&gt;(Add, m_value-&gt;origin(), m_value-&gt;child(0), m_value-&gt;child(1)));
+1949                 break;
+1950             }
+1951             break;
+1952         }
+1953 
+1954         case CheckSub: {
+1955             if (replaceWithNewValue(m_value-&gt;child(0)-&gt;checkSubConstant(m_proc, m_value-&gt;child(1))))
+1956                 break;
+1957 
+1958             if (m_value-&gt;child(1)-&gt;isInt(0)) {
+1959                 replaceWithIdentity(m_value-&gt;child(0));
+1960                 break;
+1961             }
+1962 
+1963             if (Value* negatedConstant = m_value-&gt;child(1)-&gt;checkNegConstant(m_proc)) {
+1964                 m_insertionSet.insertValue(m_index, negatedConstant);
+1965                 m_value-&gt;as&lt;CheckValue&gt;()-&gt;convertToAdd();
+1966                 m_value-&gt;child(1) = negatedConstant;
+1967                 m_changed = true;
+1968                 break;
+1969             }
+1970 
+1971             IntRange leftRange = rangeFor(m_value-&gt;child(0));
+1972             IntRange rightRange = rangeFor(m_value-&gt;child(1));
+1973             if (!leftRange.couldOverflowSub(rightRange, m_value-&gt;type())) {
+1974                 replaceWithNewValue(
+1975                     m_proc.add&lt;Value&gt;(Sub, m_value-&gt;origin(), m_value-&gt;child(0), m_value-&gt;child(1)));
+1976                 break;
+1977             }
+1978             break;
+1979         }
+1980 
+1981         case CheckMul: {
+1982             if (replaceWithNewValue(m_value-&gt;child(0)-&gt;checkMulConstant(m_proc, m_value-&gt;child(1))))
+1983                 break;
+1984 
+1985             handleCommutativity();
+1986 
+1987             if (m_value-&gt;child(1)-&gt;hasInt()) {
+1988                 bool modified = true;
+1989                 switch (m_value-&gt;child(1)-&gt;asInt()) {
+1990                 case 0:
+1991                     replaceWithNewValue(m_proc.addIntConstant(m_value, 0));
+1992                     break;
+1993                 case 1:
+1994                     replaceWithIdentity(m_value-&gt;child(0));
+1995                     break;
+1996                 case 2:
+1997                     m_value-&gt;as&lt;CheckValue&gt;()-&gt;convertToAdd();
+1998                     m_value-&gt;child(1) = m_value-&gt;child(0);
+1999                     m_changed = true;
+2000                     break;
+2001                 default:
+2002                     modified = false;
+2003                     break;
+2004                 }
+2005                 if (modified)
+2006                     break;
+2007             }
+2008 
+2009             IntRange leftRange = rangeFor(m_value-&gt;child(0));
+2010             IntRange rightRange = rangeFor(m_value-&gt;child(1));
+2011             if (!leftRange.couldOverflowMul(rightRange, m_value-&gt;type())) {
+2012                 replaceWithNewValue(
+2013                     m_proc.add&lt;Value&gt;(Mul, m_value-&gt;origin(), m_value-&gt;child(0), m_value-&gt;child(1)));
+2014                 break;
+2015             }
+2016             break;
+2017         }
+2018 
+2019         case Check: {
+2020             CheckValue* checkValue = m_value-&gt;as&lt;CheckValue&gt;();
+2021 
+2022             if (checkValue-&gt;child(0)-&gt;isLikeZero()) {
+2023                 checkValue-&gt;replaceWithNop();
+2024                 m_changed = true;
+2025                 break;
+2026             }
+2027 
+2028             if (checkValue-&gt;child(0)-&gt;isLikeNonZero()) {
+2029                 PatchpointValue* patchpoint =
+2030                     m_insertionSet.insert&lt;PatchpointValue&gt;(m_index, Void, checkValue-&gt;origin());
+2031 
+2032                 patchpoint-&gt;effects = Effects();
+2033                 patchpoint-&gt;effects.reads = HeapRange::top();
+2034                 patchpoint-&gt;effects.exitsSideways = true;
+2035 
+2036                 for (unsigned i = 1; i &lt; checkValue-&gt;numChildren(); ++i)
+2037                     patchpoint-&gt;append(checkValue-&gt;constrainedChild(i));
+2038 
+2039                 patchpoint-&gt;setGenerator(checkValue-&gt;generator());
+2040 
+2041                 // Replace the rest of the block with an Oops.
+2042                 for (unsigned i = m_index + 1; i &lt; m_block-&gt;size() - 1; ++i)
+2043                     m_block-&gt;at(i)-&gt;replaceWithBottom(m_insertionSet, m_index);
+2044                 m_block-&gt;last()-&gt;replaceWithOops(m_block);
+2045                 m_block-&gt;last()-&gt;setOrigin(checkValue-&gt;origin());
+2046 
+2047                 // Replace ourselves last.
+2048                 checkValue-&gt;replaceWithNop();
+2049                 m_changedCFG = true;
+2050                 break;
+2051             }
+2052 
+2053             if (checkValue-&gt;child(0)-&gt;opcode() == NotEqual
+2054                 &amp;&amp; checkValue-&gt;child(0)-&gt;child(1)-&gt;isInt(0)) {
+2055                 checkValue-&gt;child(0) = checkValue-&gt;child(0)-&gt;child(0);
+2056                 m_changed = true;
+2057             }
+2058 
+2059             if (m_proc.optLevel() &lt; 2)
+2060                 break;
+2061 
+2062             // If we are checking some bounded-size SSA expression that leads to a Select that
+2063             // has a constant as one of its results, then turn the Select into a Branch and split
+2064             // the code between the Check and the Branch. For example, this:
+2065             //
+2066             //     @a = Select(@p, @x, 42)
+2067             //     @b = Add(@a, 35)
+2068             //     Check(@b)
+2069             //
+2070             // becomes this:
+2071             //
+2072             //     Branch(@p, #truecase, #falsecase)
+2073             //
+2074             //   BB#truecase:
+2075             //     @b_truecase = Add(@x, 35)
+2076             //     Check(@b_truecase)
+2077             //     Upsilon(@x, ^a)
+2078             //     Upsilon(@b_truecase, ^b)
+2079             //     Jump(#continuation)
+2080             //
+2081             //   BB#falsecase:
+2082             //     @b_falsecase = Add(42, 35)
+2083             //     Check(@b_falsecase)
+2084             //     Upsilon(42, ^a)
+2085             //     Upsilon(@b_falsecase, ^b)
+2086             //     Jump(#continuation)
+2087             //
+2088             //   BB#continuation:
+2089             //     @a = Phi()
+2090             //     @b = Phi()
+2091             //
+2092             // The goal of this optimization is to kill a lot of code in one of those basic
+2093             // blocks. This is pretty much guaranteed since one of those blocks will replace all
+2094             // uses of the Select with a constant, and that constant will be transitively used
+2095             // from the check.
+2096             static const unsigned selectSpecializationBound = 3;
+2097             Value* select = findRecentNodeMatching(
+2098                 m_value-&gt;child(0), selectSpecializationBound,
+2099                 [&amp;] (Value* value) -&gt; bool {
+2100                     return value-&gt;opcode() == Select
+2101                         &amp;&amp; (value-&gt;child(1)-&gt;isConstant() &amp;&amp; value-&gt;child(2)-&gt;isConstant());
+2102                 });
+2103 
+2104             if (select) {
+2105                 specializeSelect(select);
+2106                 break;
+2107             }
+2108             break;
+2109         }
+2110 
+2111         case Branch: {
+2112             // Turn this: Branch(NotEqual(x, 0))
+2113             // Into this: Branch(x)
+2114             if (m_value-&gt;child(0)-&gt;opcode() == NotEqual &amp;&amp; m_value-&gt;child(0)-&gt;child(1)-&gt;isInt(0)) {
+2115                 m_value-&gt;child(0) = m_value-&gt;child(0)-&gt;child(0);
+2116                 m_changed = true;
+2117             }
+2118 
+2119             // Turn this: Branch(Equal(x, 0), then, else)
+2120             // Into this: Branch(x, else, then)
+2121             if (m_value-&gt;child(0)-&gt;opcode() == Equal &amp;&amp; m_value-&gt;child(0)-&gt;child(1)-&gt;isInt(0)) {
+2122                 m_value-&gt;child(0) = m_value-&gt;child(0)-&gt;child(0);
+2123                 std::swap(m_block-&gt;taken(), m_block-&gt;notTaken());
+2124                 m_changed = true;
+2125             }
+2126 
+2127             // Turn this: Branch(BitXor(bool, 1), then, else)
+2128             // Into this: Branch(bool, else, then)
+2129             if (m_value-&gt;child(0)-&gt;opcode() == BitXor
+2130                 &amp;&amp; m_value-&gt;child(0)-&gt;child(1)-&gt;isInt32(1)
+2131                 &amp;&amp; m_value-&gt;child(0)-&gt;child(0)-&gt;returnsBool()) {
+2132                 m_value-&gt;child(0) = m_value-&gt;child(0)-&gt;child(0);
+2133                 std::swap(m_block-&gt;taken(), m_block-&gt;notTaken());
+2134                 m_changed = true;
+2135             }
+2136 
+2137             // Turn this: Branch(BitAnd(bool, xyb1), then, else)
+2138             // Into this: Branch(bool, then, else)
+2139             if (m_value-&gt;child(0)-&gt;opcode() == BitAnd
+2140                 &amp;&amp; m_value-&gt;child(0)-&gt;child(1)-&gt;hasInt()
+2141                 &amp;&amp; m_value-&gt;child(0)-&gt;child(1)-&gt;asInt() &amp; 1
+2142                 &amp;&amp; m_value-&gt;child(0)-&gt;child(0)-&gt;returnsBool()) {
+2143                 m_value-&gt;child(0) = m_value-&gt;child(0)-&gt;child(0);
+2144                 m_changed = true;
+2145             }
+2146 
+2147             TriState triState = m_value-&gt;child(0)-&gt;asTriState();
+2148 
+2149             // Turn this: Branch(0, then, else)
+2150             // Into this: Jump(else)
+2151             if (triState == FalseTriState) {
+2152                 m_block-&gt;taken().block()-&gt;removePredecessor(m_block);
+2153                 m_value-&gt;replaceWithJump(m_block, m_block-&gt;notTaken());
+2154                 m_changedCFG = true;
+2155                 break;
+2156             }
+2157 
+2158             // Turn this: Branch(not 0, then, else)
+2159             // Into this: Jump(then)
+2160             if (triState == TrueTriState) {
+2161                 m_block-&gt;notTaken().block()-&gt;removePredecessor(m_block);
+2162                 m_value-&gt;replaceWithJump(m_block, m_block-&gt;taken());
+2163                 m_changedCFG = true;
+2164                 break;
+2165             }
+2166 
+2167             if (m_proc.optLevel() &gt;= 2) {
+2168                 // If a check for the same property dominates us, we can kill the branch. This sort
+2169                 // of makes sense here because it&#39;s cheap, but hacks like this show that we&#39;re going
+2170                 // to need SCCP.
+2171                 Value* check = m_pureCSE.findMatch(
+2172                     ValueKey(Check, Void, m_value-&gt;child(0)), m_block, *m_dominators);
+2173                 if (check) {
+2174                     // The Check would have side-exited if child(0) was non-zero. So, it must be
+2175                     // zero here.
+2176                     m_block-&gt;taken().block()-&gt;removePredecessor(m_block);
+2177                     m_value-&gt;replaceWithJump(m_block, m_block-&gt;notTaken());
+2178                     m_changedCFG = true;
+2179                 }
+2180             }
+2181             break;
+2182         }
+2183 
+2184         case Const32:
+2185         case Const64:
+2186         case ConstFloat:
+2187         case ConstDouble: {
+2188             ValueKey key = m_value-&gt;key();
+2189             if (Value* constInRoot = m_valueForConstant.get(key)) {
+2190                 if (constInRoot != m_value) {
+2191                     m_value-&gt;replaceWithIdentity(constInRoot);
+2192                     m_changed = true;
+2193                 }
+2194             } else if (m_block == m_root)
+2195                 m_valueForConstant.add(key, m_value);
+2196             else {
+2197                 Value* constInRoot = m_proc.clone(m_value);
+2198                 ASSERT(m_root &amp;&amp; m_root-&gt;size() &gt;= 1);
+2199                 m_root-&gt;appendNonTerminal(constInRoot);
+2200                 m_valueForConstant.add(key, constInRoot);
+2201                 m_value-&gt;replaceWithIdentity(constInRoot);
+2202                 m_changed = true;
+2203             }
+2204             break;
+2205         }
+2206 
+2207         default:
+2208             break;
+2209         }
+2210     }
+2211 
+2212     // Find a node that:
+2213     //     - functor(node) returns true.
+2214     //     - it&#39;s reachable from the given node via children.
+2215     //     - it&#39;s in the last &quot;bound&quot; slots in the current basic block.
+2216     // This algorithm is optimized under the assumption that the bound is small.
+2217     template&lt;typename Functor&gt;
+2218     Value* findRecentNodeMatching(Value* start, unsigned bound, const Functor&amp; functor)
+2219     {
+2220         unsigned startIndex = bound &lt; m_index ? m_index - bound : 0;
+2221         Value* result = nullptr;
+2222         start-&gt;walk(
+2223             [&amp;] (Value* value) -&gt; Value::WalkStatus {
+2224                 bool found = false;
+2225                 for (unsigned i = startIndex; i &lt;= m_index; ++i) {
+2226                     if (m_block-&gt;at(i) == value)
+2227                         found = true;
+2228                 }
+2229                 if (!found)
+2230                     return Value::IgnoreChildren;
+2231 
+2232                 if (functor(value)) {
+2233                     result = value;
+2234                     return Value::Stop;
+2235                 }
+2236 
+2237                 return Value::Continue;
+2238             });
+2239         return result;
+2240     }
+2241 
+2242     // This specializes a sequence of code up to a Select. This doesn&#39;t work when we&#39;re at a
+2243     // terminal. It would be cool to fix that eventually. The main problem is that instead of
+2244     // splitting the block, we should just insert the then/else blocks. We&#39;ll have to create
+2245     // double the Phis and double the Upsilons. It&#39;ll probably be the sort of optimization that
+2246     // we want to do only after we&#39;ve done loop optimizations, since this will *definitely*
+2247     // obscure things. In fact, even this simpler form of select specialization will possibly
+2248     // obscure other optimizations. It would be great to have two modes of strength reduction,
+2249     // one that does obscuring optimizations and runs late, and another that does not do
+2250     // obscuring optimizations and runs early.
+2251     // FIXME: Make select specialization handle branches.
+2252     // FIXME: Have a form of strength reduction that does no obscuring optimizations and runs
+2253     // early.
+2254     void specializeSelect(Value* source)
+2255     {
+2256         if (B3ReduceStrengthInternal::verbose)
+2257             dataLog(&quot;Specializing select: &quot;, deepDump(m_proc, source), &quot;\n&quot;);
+2258 
+2259         // This mutates startIndex to account for the fact that m_block got the front of it
+2260         // chopped off.
+2261         BasicBlock* predecessor = m_blockInsertionSet.splitForward(m_block, m_index, &amp;m_insertionSet);
+2262         if (m_block == m_root) {
+2263             m_root = predecessor;
+2264             m_valueForConstant.clear();
+2265         }
+2266 
+2267         // Splitting will commit the insertion set, which changes the exact position of the
+2268         // source. That&#39;s why we do the search after splitting.
+2269         unsigned startIndex = UINT_MAX;
+2270         for (unsigned i = predecessor-&gt;size(); i--;) {
+2271             if (predecessor-&gt;at(i) == source) {
+2272                 startIndex = i;
+2273                 break;
+2274             }
+2275         }
+2276 
+2277         RELEASE_ASSERT(startIndex != UINT_MAX);
+2278 
+2279         // By BasicBlock convention, caseIndex == 0 =&gt; then, caseIndex == 1 =&gt; else.
+2280         static const unsigned numCases = 2;
+2281         BasicBlock* cases[numCases];
+2282         for (unsigned i = 0; i &lt; numCases; ++i)
+2283             cases[i] = m_blockInsertionSet.insertBefore(m_block);
+2284 
+2285         HashMap&lt;Value*, Value*&gt; mappings[2];
+2286 
+2287         // Save things we want to know about the source.
+2288         Value* predicate = source-&gt;child(0);
+2289 
+2290         for (unsigned i = 0; i &lt; numCases; ++i)
+2291             mappings[i].add(source, source-&gt;child(1 + i));
+2292 
+2293         auto cloneValue = [&amp;] (Value* value) {
+2294             ASSERT(value != source);
+2295 
+2296             for (unsigned i = 0; i &lt; numCases; ++i) {
+2297                 Value* clone = m_proc.clone(value);
+2298                 for (Value*&amp; child : clone-&gt;children()) {
+2299                     if (Value* newChild = mappings[i].get(child))
+2300                         child = newChild;
+2301                 }
+2302                 if (value-&gt;type() != Void)
+2303                     mappings[i].add(value, clone);
+2304 
+2305                 cases[i]-&gt;append(clone);
+2306                 if (value-&gt;type() != Void)
+2307                     cases[i]-&gt;appendNew&lt;UpsilonValue&gt;(m_proc, value-&gt;origin(), clone, value);
+2308             }
+2309 
+2310             value-&gt;replaceWithPhi();
+2311         };
+2312 
+2313         // The jump that the splitter inserted is of no use to us.
+2314         predecessor-&gt;removeLast(m_proc);
+2315 
+2316         // Hance the source, it&#39;s special.
+2317         for (unsigned i = 0; i &lt; numCases; ++i) {
+2318             cases[i]-&gt;appendNew&lt;UpsilonValue&gt;(
+2319                 m_proc, source-&gt;origin(), source-&gt;child(1 + i), source);
+2320         }
+2321         source-&gt;replaceWithPhi();
+2322         m_insertionSet.insertValue(m_index, source);
+2323 
+2324         // Now handle all values between the source and the check.
+2325         for (unsigned i = startIndex + 1; i &lt; predecessor-&gt;size(); ++i) {
+2326             Value* value = predecessor-&gt;at(i);
+2327             value-&gt;owner = nullptr;
+2328 
+2329             cloneValue(value);
+2330 
+2331             if (value-&gt;type() != Void)
+2332                 m_insertionSet.insertValue(m_index, value);
+2333             else
+2334                 m_proc.deleteValue(value);
+2335         }
+2336 
+2337         // Finally, deal with the check.
+2338         cloneValue(m_value);
+2339 
+2340         // Remove the values from the predecessor.
+2341         predecessor-&gt;values().resize(startIndex);
+2342 
+2343         predecessor-&gt;appendNew&lt;Value&gt;(m_proc, Branch, source-&gt;origin(), predicate);
+2344         predecessor-&gt;setSuccessors(FrequentedBlock(cases[0]), FrequentedBlock(cases[1]));
+2345 
+2346         for (unsigned i = 0; i &lt; numCases; ++i) {
+2347             cases[i]-&gt;appendNew&lt;Value&gt;(m_proc, Jump, m_value-&gt;origin());
+2348             cases[i]-&gt;setSuccessors(FrequentedBlock(m_block));
+2349         }
+2350 
+2351         m_changed = true;
+2352 
+2353         predecessor-&gt;updatePredecessorsAfter();
+2354     }
+2355 
+2356     static bool shouldSwapBinaryOperands(Value* value)
+2357     {
+2358         // Note that we have commutative operations that take more than two children. Those operations may
+2359         // commute their first two children while leaving the rest unaffected.
+2360         ASSERT(value-&gt;numChildren() &gt;= 2);
+2361 
+2362         // Leave it alone if the right child is a constant.
+2363         if (value-&gt;child(1)-&gt;isConstant()
+2364             || value-&gt;child(0)-&gt;opcode() == AtomicStrongCAS)
+2365             return false;
+2366 
+2367         if (value-&gt;child(0)-&gt;isConstant())
+2368             return true;
+2369 
+2370         if (value-&gt;child(1)-&gt;opcode() == AtomicStrongCAS)
+2371             return true;
+2372 
+2373         // Sort the operands. This is an important canonicalization. We use the index instead of
+2374         // the address to make this at least slightly deterministic.
+2375         if (value-&gt;child(0)-&gt;index() &gt; value-&gt;child(1)-&gt;index())
+2376             return true;
+2377 
+2378         return false;
+2379     }
+2380 
+2381     // Turn this: Add(constant, value)
+2382     // Into this: Add(value, constant)
+2383     //
+2384     // Also:
+2385     // Turn this: Add(value1, value2)
+2386     // Into this: Add(value2, value1)
+2387     // If we decide that value2 coming first is the canonical ordering.
+2388     void handleCommutativity()
+2389     {
+2390         if (shouldSwapBinaryOperands(m_value)) {
+2391             std::swap(m_value-&gt;child(0), m_value-&gt;child(1));
+2392             m_changed = true;
+2393         }
+2394     }
+2395 
+2396     // For Op==Add or Sub, turn any of these:
+2397     //      Op(Mul(x1, x2), Mul(x1, x3))
+2398     //      Op(Mul(x2, x1), Mul(x1, x3))
+2399     //      Op(Mul(x1, x2), Mul(x3, x1))
+2400     //      Op(Mul(x2, x1), Mul(x3, x1))
+2401     // Into this: Mul(x1, Op(x2, x3))
+2402     bool handleMulDistributivity()
+2403     {
+2404         ASSERT(m_value-&gt;opcode() == Add || m_value-&gt;opcode() == Sub);
+2405         Value* x1 = nullptr;
+2406         Value* x2 = nullptr;
+2407         Value* x3 = nullptr;
+2408         if (m_value-&gt;child(0)-&gt;opcode() == Mul &amp;&amp; m_value-&gt;child(1)-&gt;opcode() == Mul) {
+2409             if (m_value-&gt;child(0)-&gt;child(0) == m_value-&gt;child(1)-&gt;child(0)) {
+2410                 // Op(Mul(x1, x2), Mul(x1, x3))
+2411                 x1 = m_value-&gt;child(0)-&gt;child(0);
+2412                 x2 = m_value-&gt;child(0)-&gt;child(1);
+2413                 x3 = m_value-&gt;child(1)-&gt;child(1);
+2414             } else if (m_value-&gt;child(0)-&gt;child(1) == m_value-&gt;child(1)-&gt;child(0)) {
+2415                 // Op(Mul(x2, x1), Mul(x1, x3))
+2416                 x1 = m_value-&gt;child(0)-&gt;child(1);
+2417                 x2 = m_value-&gt;child(0)-&gt;child(0);
+2418                 x3 = m_value-&gt;child(1)-&gt;child(1);
+2419             } else if (m_value-&gt;child(0)-&gt;child(0) == m_value-&gt;child(1)-&gt;child(1)) {
+2420                 // Op(Mul(x1, x2), Mul(x3, x1))
+2421                 x1 = m_value-&gt;child(0)-&gt;child(0);
+2422                 x2 = m_value-&gt;child(0)-&gt;child(1);
+2423                 x3 = m_value-&gt;child(1)-&gt;child(0);
+2424             } else if (m_value-&gt;child(0)-&gt;child(1) == m_value-&gt;child(1)-&gt;child(1)) {
+2425                 // Op(Mul(x2, x1), Mul(x3, x1))
+2426                 x1 = m_value-&gt;child(0)-&gt;child(1);
+2427                 x2 = m_value-&gt;child(0)-&gt;child(0);
+2428                 x3 = m_value-&gt;child(1)-&gt;child(0);
+2429             }
+2430         }
+2431         if (x1 != nullptr) {
+2432             ASSERT(x2 != nullptr &amp;&amp; x3 != nullptr);
+2433             Value* newOp = m_insertionSet.insert&lt;Value&gt;(m_index, m_value-&gt;opcode(), m_value-&gt;origin(), x2, x3);
+2434             replaceWithNew&lt;Value&gt;(Mul, m_value-&gt;origin(), x1, newOp);
+2435             return true;
+2436         }
+2437         return false;
+2438     }
+2439 
+2440     // For Op==BitOr or BitXor, turn any of these:
+2441     //      Op(BitAnd(x1, x2), BitAnd(x1, x3))
+2442     //      Op(BitAnd(x2, x1), BitAnd(x1, x3))
+2443     //      Op(BitAnd(x1, x2), BitAnd(x3, x1))
+2444     //      Op(BitAnd(x2, x1), BitAnd(x3, x1))
+2445     // Into this: BitAnd(Op(x2, x3), x1)
+2446     // And any of these:
+2447     //      Op(BitAnd(x1, x2), x1)
+2448     //      Op(BitAnd(x2, x1), x1)
+2449     //      Op(x1, BitAnd(x1, x2))
+2450     //      Op(x1, BitAnd(x2, x1))
+2451     // Into this: BitAnd(Op(x2, x1), x1)
+2452     // This second set is equivalent to doing x1 =&gt; BitAnd(x1, x1), and then applying the first set.
+2453     // It does not reduce the number of operations executed, but provides some useful normalization: we prefer to have BitAnd at the outermost, then BitXor, and finally BitOr at the innermost
+2454     bool handleBitAndDistributivity()
+2455     {
+2456         ASSERT(m_value-&gt;opcode() == BitOr || m_value-&gt;opcode() == BitXor);
+2457         Value* x1 = nullptr;
+2458         Value* x2 = nullptr;
+2459         Value* x3 = nullptr;
+2460         if (m_value-&gt;child(0)-&gt;opcode() == BitAnd &amp;&amp; m_value-&gt;child(1)-&gt;opcode() == BitAnd) {
+2461             if (m_value-&gt;child(0)-&gt;child(0) == m_value-&gt;child(1)-&gt;child(0)) {
+2462                 x1 = m_value-&gt;child(0)-&gt;child(0);
+2463                 x2 = m_value-&gt;child(0)-&gt;child(1);
+2464                 x3 = m_value-&gt;child(1)-&gt;child(1);
+2465             } else if (m_value-&gt;child(0)-&gt;child(1) == m_value-&gt;child(1)-&gt;child(0)) {
+2466                 x1 = m_value-&gt;child(0)-&gt;child(1);
+2467                 x2 = m_value-&gt;child(0)-&gt;child(0);
+2468                 x3 = m_value-&gt;child(1)-&gt;child(1);
+2469             } else if (m_value-&gt;child(0)-&gt;child(0) == m_value-&gt;child(1)-&gt;child(1)) {
+2470                 x1 = m_value-&gt;child(0)-&gt;child(0);
+2471                 x2 = m_value-&gt;child(0)-&gt;child(1);
+2472                 x3 = m_value-&gt;child(1)-&gt;child(0);
+2473             } else if (m_value-&gt;child(0)-&gt;child(1) == m_value-&gt;child(1)-&gt;child(1)) {
+2474                 x1 = m_value-&gt;child(0)-&gt;child(1);
+2475                 x2 = m_value-&gt;child(0)-&gt;child(0);
+2476                 x3 = m_value-&gt;child(1)-&gt;child(0);
+2477             }
+2478         } else if (m_value-&gt;child(0)-&gt;opcode() == BitAnd) {
+2479             if (m_value-&gt;child(0)-&gt;child(0) == m_value-&gt;child(1)) {
+2480                 x1 = x3 = m_value-&gt;child(1);
+2481                 x2 = m_value-&gt;child(0)-&gt;child(1);
+2482             } else if (m_value-&gt;child(0)-&gt;child(1) == m_value-&gt;child(1)) {
+2483                 x1 = x3 = m_value-&gt;child(1);
+2484                 x2 = m_value-&gt;child(0)-&gt;child(0);
+2485             }
+2486         } else if (m_value-&gt;child(1)-&gt;opcode() == BitAnd) {
+2487             if (m_value-&gt;child(1)-&gt;child(0) == m_value-&gt;child(0)) {
+2488                 x1 = x3 = m_value-&gt;child(0);
+2489                 x2 = m_value-&gt;child(1)-&gt;child(1);
+2490             } else if (m_value-&gt;child(1)-&gt;child(1) == m_value-&gt;child(0)) {
+2491                 x1 = x3 = m_value-&gt;child(0);
+2492                 x2 = m_value-&gt;child(1)-&gt;child(0);
+2493             }
+2494         }
+2495         if (x1 != nullptr) {
+2496             ASSERT(x2 != nullptr &amp;&amp; x3 != nullptr);
+2497             Value* bitOp = m_insertionSet.insert&lt;Value&gt;(m_index, m_value-&gt;opcode(), m_value-&gt;origin(), x2, x3);
+2498             replaceWithNew&lt;Value&gt;(BitAnd, m_value-&gt;origin(), x1, bitOp);
+2499             return true;
+2500         }
+2501         return false;
+2502     }
+2503 
+2504     struct CanonicalizedComparison {
+2505         Opcode opcode;
+2506         Value* operands[2];
+2507     };
+2508     static CanonicalizedComparison canonicalizeComparison(Value* value)
+2509     {
+2510         auto flip = [] (Opcode opcode) {
+2511             switch (opcode) {
+2512             case LessThan:
+2513                 return GreaterThan;
+2514             case GreaterThan:
+2515                 return LessThan;
+2516             case LessEqual:
+2517                 return GreaterEqual;
+2518             case GreaterEqual:
+2519                 return LessEqual;
+2520             case Above:
+2521                 return Below;
+2522             case Below:
+2523                 return Above;
+2524             case AboveEqual:
+2525                 return BelowEqual;
+2526             case BelowEqual:
+2527                 return AboveEqual;
+2528             default:
+2529                 return opcode;
+2530             }
+2531         };
+2532         if (shouldSwapBinaryOperands(value))
+2533             return { flip(value-&gt;opcode()), { value-&gt;child(1), value-&gt;child(0) } };
+2534         return { value-&gt;opcode(), { value-&gt;child(0), value-&gt;child(1) } };
+2535     }
+2536 
+2537     // FIXME: This should really be a forward analysis. Instead, we uses a bounded-search backwards
+2538     // analysis.
+2539     IntRange rangeFor(Value* value, unsigned timeToLive = 5)
+2540     {
+2541         if (!timeToLive)
+2542             return IntRange::top(value-&gt;type());
+2543 
+2544         switch (value-&gt;opcode()) {
+2545         case Const32:
+2546         case Const64: {
+2547             int64_t intValue = value-&gt;asInt();
+2548             return IntRange(intValue, intValue);
+2549         }
+2550 
+2551         case BitAnd:
+2552             if (value-&gt;child(1)-&gt;hasInt())
+2553                 return IntRange::rangeForMask(value-&gt;child(1)-&gt;asInt(), value-&gt;type());
+2554             break;
+2555 
+2556         case SShr:
+2557             if (value-&gt;child(1)-&gt;hasInt32()) {
+2558                 return rangeFor(value-&gt;child(0), timeToLive - 1).sShr(
+2559                     value-&gt;child(1)-&gt;asInt32(), value-&gt;type());
+2560             }
+2561             break;
+2562 
+2563         case ZShr:
+2564             if (value-&gt;child(1)-&gt;hasInt32()) {
+2565                 return rangeFor(value-&gt;child(0), timeToLive - 1).zShr(
+2566                     value-&gt;child(1)-&gt;asInt32(), value-&gt;type());
+2567             }
+2568             break;
+2569 
+2570         case Shl:
+2571             if (value-&gt;child(1)-&gt;hasInt32()) {
+2572                 return rangeFor(value-&gt;child(0), timeToLive - 1).shl(
+2573                     value-&gt;child(1)-&gt;asInt32(), value-&gt;type());
+2574             }
+2575             break;
+2576 
+2577         case Add:
+2578             return rangeFor(value-&gt;child(0), timeToLive - 1).add(
+2579                 rangeFor(value-&gt;child(1), timeToLive - 1), value-&gt;type());
+2580 
+2581         case Sub:
+2582             return rangeFor(value-&gt;child(0), timeToLive - 1).sub(
+2583                 rangeFor(value-&gt;child(1), timeToLive - 1), value-&gt;type());
+2584 
+2585         case Mul:
+2586             return rangeFor(value-&gt;child(0), timeToLive - 1).mul(
+2587                 rangeFor(value-&gt;child(1), timeToLive - 1), value-&gt;type());
+2588 
+2589         default:
+2590             break;
+2591         }
+2592 
+2593         return IntRange::top(value-&gt;type());
+2594     }
+2595 
+2596     template&lt;typename ValueType, typename... Arguments&gt;
+2597     void replaceWithNew(Arguments... arguments)
+2598     {
+2599         replaceWithNewValue(m_proc.add&lt;ValueType&gt;(arguments...));
+2600     }
+2601 
+2602     bool replaceWithNewValue(Value* newValue)
+2603     {
+2604         if (!newValue)
+2605             return false;
+2606         m_insertionSet.insertValue(m_index, newValue);
+2607         m_value-&gt;replaceWithIdentity(newValue);
+2608         m_changed = true;
+2609         return true;
+2610     }
+2611 
+2612     void replaceWithIdentity(Value* newValue)
+2613     {
+2614         m_value-&gt;replaceWithIdentity(newValue);
+2615         m_changed = true;
+2616     }
+2617 
+2618     void handleShiftAmount()
+2619     {
+2620         // Shift anything by zero is identity.
+2621         if (m_value-&gt;child(1)-&gt;isInt32(0)) {
+2622             replaceWithIdentity(m_value-&gt;child(0));
+2623             return;
+2624         }
+2625 
+2626         // The shift already masks its shift amount. If the shift amount is being masked by a
+2627         // redundant amount, then remove the mask. For example,
+2628         // Turn this: Shl(@x, BitAnd(@y, 63))
+2629         // Into this: Shl(@x, @y)
+2630         unsigned mask = sizeofType(m_value-&gt;type()) * 8 - 1;
+2631         if (m_value-&gt;child(1)-&gt;opcode() == BitAnd
+2632             &amp;&amp; m_value-&gt;child(1)-&gt;child(1)-&gt;hasInt32()
+2633             &amp;&amp; (m_value-&gt;child(1)-&gt;child(1)-&gt;asInt32() &amp; mask) == mask) {
+2634             m_value-&gt;child(1) = m_value-&gt;child(1)-&gt;child(0);
+2635             m_changed = true;
+2636         }
+2637     }
+2638 
+2639     void replaceIfRedundant()
+2640     {
+2641         m_changed |= m_pureCSE.process(m_value, *m_dominators);
+2642     }
+2643 
+2644     void simplifyCFG()
+2645     {
+2646         if (B3ReduceStrengthInternal::verbose) {
+2647             dataLog(&quot;Before simplifyCFG:\n&quot;);
+2648             dataLog(m_proc);
+2649         }
+2650 
+2651         // We have three easy simplification rules:
+2652         //
+2653         // 1) If a successor is a block that just jumps to another block, then jump directly to
+2654         //    that block.
+2655         //
+2656         // 2) If all successors are the same and the operation has no effects, then use a jump
+2657         //    instead.
+2658         //
+2659         // 3) If you jump to a block that is not you and has one predecessor, then merge.
+2660         //
+2661         // Note that because of the first rule, this phase may introduce critical edges. That&#39;s fine.
+2662         // If you need broken critical edges, then you have to break them yourself.
+2663 
+2664         // Note that this relies on predecessors being at least conservatively correct. It&#39;s fine for
+2665         // predecessors to mention a block that isn&#39;t actually a predecessor. It&#39;s *not* fine for a
+2666         // predecessor to be omitted. We assert as much in the loop. In practice, we precisely preserve
+2667         // predecessors during strength reduction since that minimizes the total number of fixpoint
+2668         // iterations needed to kill a lot of code.
+2669 
+2670         for (BasicBlock* block : m_proc.blocksInPostOrder()) {
+2671             if (B3ReduceStrengthInternal::verbose)
+2672                 dataLog(&quot;Considering block &quot;, *block, &quot;:\n&quot;);
+2673 
+2674             checkPredecessorValidity();
+2675 
+2676             // We don&#39;t care about blocks that don&#39;t have successors.
+2677             if (!block-&gt;numSuccessors())
+2678                 continue;
+2679 
+2680             // First check if any of the successors of this block can be forwarded over.
+2681             for (BasicBlock*&amp; successor : block-&gt;successorBlocks()) {
+2682                 if (successor != block
+2683                     &amp;&amp; successor-&gt;size() == 1
+2684                     &amp;&amp; successor-&gt;last()-&gt;opcode() == Jump) {
+2685                     BasicBlock* newSuccessor = successor-&gt;successorBlock(0);
+2686                     if (newSuccessor != successor) {
+2687                         if (B3ReduceStrengthInternal::verbose) {
+2688                             dataLog(
+2689                                 &quot;Replacing &quot;, pointerDump(block), &quot;-&gt;&quot;, pointerDump(successor),
+2690                                 &quot; with &quot;, pointerDump(block), &quot;-&gt;&quot;, pointerDump(newSuccessor),
+2691                                 &quot;\n&quot;);
+2692                         }
+2693                         // Note that we do not do replacePredecessor() because the block we&#39;re
+2694                         // skipping will still have newSuccessor as its successor.
+2695                         newSuccessor-&gt;addPredecessor(block);
+2696                         successor = newSuccessor;
+2697                         m_changedCFG = true;
+2698                     }
+2699                 }
+2700             }
+2701 
+2702             // Now check if the block&#39;s terminal can be replaced with a jump.
+2703             if (block-&gt;numSuccessors() &gt; 1) {
+2704                 // The terminal must not have weird effects.
+2705                 Effects effects = block-&gt;last()-&gt;effects();
+2706                 effects.terminal = false;
+2707                 if (!effects.mustExecute()) {
+2708                     // All of the successors must be the same.
+2709                     bool allSame = true;
+2710                     BasicBlock* firstSuccessor = block-&gt;successorBlock(0);
+2711                     for (unsigned i = 1; i &lt; block-&gt;numSuccessors(); ++i) {
+2712                         if (block-&gt;successorBlock(i) != firstSuccessor) {
+2713                             allSame = false;
+2714                             break;
+2715                         }
+2716                     }
+2717                     if (allSame) {
+2718                         if (B3ReduceStrengthInternal::verbose) {
+2719                             dataLog(
+2720                                 &quot;Changing &quot;, pointerDump(block), &quot;&#39;s terminal to a Jump.\n&quot;);
+2721                         }
+2722                         block-&gt;last()-&gt;replaceWithJump(block, FrequentedBlock(firstSuccessor));
+2723                         m_changedCFG = true;
+2724                     }
+2725                 }
+2726             }
+2727 
+2728             // Finally handle jumps to a block with one predecessor.
+2729             if (block-&gt;numSuccessors() == 1) {
+2730                 BasicBlock* successor = block-&gt;successorBlock(0);
+2731                 if (successor != block &amp;&amp; successor-&gt;numPredecessors() == 1) {
+2732                     RELEASE_ASSERT(successor-&gt;predecessor(0) == block);
+2733 
+2734                     // We can merge the two blocks, because the predecessor only jumps to the successor
+2735                     // and the successor is only reachable from the predecessor.
+2736 
+2737                     // Remove the terminal.
+2738                     Value* value = block-&gt;values().takeLast();
+2739                     Origin jumpOrigin = value-&gt;origin();
+2740                     RELEASE_ASSERT(value-&gt;effects().terminal);
+2741                     m_proc.deleteValue(value);
+2742 
+2743                     // Append the full contents of the successor to the predecessor.
+2744                     block-&gt;values().appendVector(successor-&gt;values());
+2745                     block-&gt;successors() = successor-&gt;successors();
+2746 
+2747                     // Make sure that the successor has nothing left in it. Make sure that the block
+2748                     // has a terminal so that nobody chokes when they look at it.
+2749                     successor-&gt;values().shrink(0);
+2750                     successor-&gt;appendNew&lt;Value&gt;(m_proc, Oops, jumpOrigin);
+2751                     successor-&gt;clearSuccessors();
+2752 
+2753                     // Ensure that predecessors of block&#39;s new successors know what&#39;s up.
+2754                     for (BasicBlock* newSuccessor : block-&gt;successorBlocks())
+2755                         newSuccessor-&gt;replacePredecessor(successor, block);
+2756 
+2757                     if (B3ReduceStrengthInternal::verbose) {
+2758                         dataLog(
+2759                             &quot;Merged &quot;, pointerDump(block), &quot;-&gt;&quot;, pointerDump(successor), &quot;\n&quot;);
+2760                     }
+2761 
+2762                     m_changedCFG = true;
+2763                 }
+2764             }
+2765         }
+2766 
+2767         if (m_changedCFG &amp;&amp; B3ReduceStrengthInternal::verbose) {
+2768             dataLog(&quot;B3 after simplifyCFG:\n&quot;);
+2769             dataLog(m_proc);
+2770         }
+2771     }
+2772 
+2773     void handleChangedCFGIfNecessary()
+2774     {
+2775         if (m_changedCFG) {
+2776             m_proc.resetReachability();
+2777             m_proc.invalidateCFG();
+2778             m_dominators = nullptr; // Dominators are not valid anymore, and we don&#39;t need them yet.
+2779             m_changed = true;
+2780         }
+2781     }
+2782 
+2783     void checkPredecessorValidity()
+2784     {
+2785         if (!shouldValidateIRAtEachPhase())
+2786             return;
+2787 
+2788         for (BasicBlock* block : m_proc) {
+2789             for (BasicBlock* successor : block-&gt;successorBlocks())
+2790                 RELEASE_ASSERT(successor-&gt;containsPredecessor(block));
+2791         }
+2792     }
+2793 
+2794     void simplifySSA()
+2795     {
+2796         // This runs Aycock and Horspool&#39;s algorithm on our Phi functions [1]. For most CFG patterns,
+2797         // this can take a suboptimal arrangement of Phi functions and make it optimal, as if you had
+2798         // run Cytron, Ferrante, Rosen, Wegman, and Zadeck. It&#39;s only suboptimal for irreducible
+2799         // CFGs. In practice, that doesn&#39;t matter, since we expect clients of B3 to run their own SSA
+2800         // conversion before lowering to B3, and in the case of the DFG, that conversion uses Cytron
+2801         // et al. In that context, this algorithm is intended to simplify Phi functions that were
+2802         // made redundant by prior CFG simplification. But according to Aycock and Horspool&#39;s paper,
+2803         // this algorithm is good enough that a B3 client could just give us maximal Phi&#39;s (i.e. Phi
+2804         // for each variable at each basic block) and we will make them optimal.
+2805         // [1] http://pages.cpsc.ucalgary.ca/~aycock/papers/ssa.ps
+2806 
+2807         // Aycock and Horspool prescribe two rules that are to be run to fixpoint:
+2808         //
+2809         // 1) If all of the Phi&#39;s children are the same (i.e. it&#39;s one child referenced from one or
+2810         //    more Upsilons), then replace all uses of the Phi with the one child.
+2811         //
+2812         // 2) If all of the Phi&#39;s children are either the Phi itself or exactly one other child, then
+2813         //    replace all uses of the Phi with the one other child.
+2814         //
+2815         // Rule (2) subsumes rule (1), so we can just run (2). We only run one fixpoint iteration
+2816         // here. This premise is that in common cases, this will only find optimization opportunities
+2817         // as a result of CFG simplification and usually CFG simplification will only do one round
+2818         // of block merging per ReduceStrength fixpoint iteration, so it&#39;s OK for this to only do one
+2819         // round of Phi merging - since Phis are the value analogue of blocks.
+2820 
+2821         PhiChildren phiChildren(m_proc);
+2822 
+2823         for (Value* phi : phiChildren.phis()) {
+2824             Value* otherChild = nullptr;
+2825             bool ok = true;
+2826             for (Value* child : phiChildren[phi].values()) {
+2827                 if (child == phi)
+2828                     continue;
+2829                 if (child == otherChild)
+2830                     continue;
+2831                 if (!otherChild) {
+2832                     otherChild = child;
+2833                     continue;
+2834                 }
+2835                 ok = false;
+2836                 break;
+2837             }
+2838             if (!ok)
+2839                 continue;
+2840             if (!otherChild) {
+2841                 // Wow, this would be super weird. It probably won&#39;t happen, except that things could
+2842                 // get weird as a consequence of stepwise simplifications in the strength reduction
+2843                 // fixpoint.
+2844                 continue;
+2845             }
+2846 
+2847             // Turn the Phi into an Identity and turn the Upsilons into Nops.
+2848             m_changed = true;
+2849             for (Value* upsilon : phiChildren[phi])
+2850                 upsilon-&gt;replaceWithNop();
+2851             phi-&gt;replaceWithIdentity(otherChild);
+2852         }
+2853     }
+2854 
+2855     Procedure&amp; m_proc;
+2856     InsertionSet m_insertionSet;
+2857     BlockInsertionSet m_blockInsertionSet;
+2858     HashMap&lt;ValueKey, Value*&gt; m_valueForConstant;
+2859     BasicBlock* m_root { nullptr };
+2860     BasicBlock* m_block { nullptr };
+2861     unsigned m_index { 0 };
+2862     Value* m_value { nullptr };
+2863     Dominators* m_dominators { nullptr };
+2864     PureCSE m_pureCSE;
+2865     bool m_changed { false };
+2866     bool m_changedCFG { false };
+2867 };
+2868 
+2869 } // anonymous namespace
+2870 
+2871 bool reduceStrength(Procedure&amp; proc)
+2872 {
+2873     PhaseScope phaseScope(proc, &quot;reduceStrength&quot;);
+2874     ReduceStrength reduceStrength(proc);
+2875     return reduceStrength.run();
+2876 }
+2877 
+2878 } } // namespace JSC::B3
+2879 
+2880 #endif // ENABLE(B3_JIT)
+2881 
+    </pre>
+  </body>
+</html>
