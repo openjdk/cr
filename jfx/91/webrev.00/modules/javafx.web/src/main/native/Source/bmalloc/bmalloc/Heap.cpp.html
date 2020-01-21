@@ -1,0 +1,668 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>New modules/javafx.web/src/main/native/Source/bmalloc/bmalloc/Heap.cpp</title>
+    <link rel="stylesheet" href="../../../../../../../../style.css" />
+  </head>
+  <body>
+    <pre>
+  1 /*
+  2  * Copyright (C) 2014-2018 Apple Inc. All rights reserved.
+  3  *
+  4  * Redistribution and use in source and binary forms, with or without
+  5  * modification, are permitted provided that the following conditions
+  6  * are met:
+  7  * 1. Redistributions of source code must retain the above copyright
+  8  *    notice, this list of conditions and the following disclaimer.
+  9  * 2. Redistributions in binary form must reproduce the above copyright
+ 10  *    notice, this list of conditions and the following disclaimer in the
+ 11  *    documentation and/or other materials provided with the distribution.
+ 12  *
+ 13  * THIS SOFTWARE IS PROVIDED BY APPLE INC. ``AS IS&#39;&#39; AND ANY
+ 14  * EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ 15  * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+ 16  * PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL APPLE INC. OR
+ 17  * CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+ 18  * EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+ 19  * PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
+ 20  * PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY
+ 21  * OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ 22  * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ 23  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ 24  */
+ 25 
+ 26 #include &quot;Heap.h&quot;
+ 27 
+ 28 #include &quot;AvailableMemory.h&quot;
+ 29 #include &quot;BulkDecommit.h&quot;
+ 30 #include &quot;BumpAllocator.h&quot;
+ 31 #include &quot;Chunk.h&quot;
+ 32 #include &quot;CryptoRandom.h&quot;
+ 33 #include &quot;Environment.h&quot;
+ 34 #include &quot;Gigacage.h&quot;
+ 35 #include &quot;DebugHeap.h&quot;
+ 36 #include &quot;PerProcess.h&quot;
+ 37 #include &quot;Scavenger.h&quot;
+ 38 #include &quot;SmallLine.h&quot;
+ 39 #include &quot;SmallPage.h&quot;
+ 40 #include &quot;VMHeap.h&quot;
+ 41 #include &quot;bmalloc.h&quot;
+ 42 #include &lt;thread&gt;
+ 43 #include &lt;vector&gt;
+ 44 
+ 45 namespace bmalloc {
+ 46 
+ 47 Heap::Heap(HeapKind kind, std::lock_guard&lt;Mutex&gt;&amp;)
+ 48     : m_kind(kind)
+ 49     , m_vmPageSizePhysical(vmPageSizePhysical())
+ 50 {
+ 51     RELEASE_BASSERT(vmPageSizePhysical() &gt;= smallPageSize);
+ 52     RELEASE_BASSERT(vmPageSize() &gt;= vmPageSizePhysical());
+ 53 
+ 54     initializeLineMetadata();
+ 55     initializePageMetadata();
+ 56 
+ 57     BASSERT(!Environment::get()-&gt;isDebugHeapEnabled());
+ 58 
+ 59     Gigacage::ensureGigacage();
+ 60 #if GIGACAGE_ENABLED
+ 61     if (usingGigacage()) {
+ 62         RELEASE_BASSERT(gigacageBasePtr());
+ 63         uint64_t random[2];
+ 64         cryptoRandom(reinterpret_cast&lt;unsigned char*&gt;(random), sizeof(random));
+ 65         size_t size = roundDownToMultipleOf(vmPageSize(), gigacageSize() - (random[0] % Gigacage::maximumCageSizeReductionForSlide));
+ 66         ptrdiff_t offset = roundDownToMultipleOf(vmPageSize(), random[1] % (gigacageSize() - size));
+ 67         void* base = reinterpret_cast&lt;unsigned char*&gt;(gigacageBasePtr()) + offset;
+ 68         m_largeFree.add(LargeRange(base, size, 0, 0));
+ 69     }
+ 70 #endif
+ 71 
+ 72     m_scavenger = Scavenger::get();
+ 73 }
+ 74 
+ 75 bool Heap::usingGigacage()
+ 76 {
+ 77     return isGigacage(m_kind) &amp;&amp; gigacageBasePtr();
+ 78 }
+ 79 
+ 80 void* Heap::gigacageBasePtr()
+ 81 {
+ 82     return Gigacage::basePtr(gigacageKind(m_kind));
+ 83 }
+ 84 
+ 85 size_t Heap::gigacageSize()
+ 86 {
+ 87     return Gigacage::size(gigacageKind(m_kind));
+ 88 }
+ 89 
+ 90 void Heap::initializeLineMetadata()
+ 91 {
+ 92     size_t sizeClassCount = bmalloc::sizeClass(smallLineSize);
+ 93     size_t smallLineCount = m_vmPageSizePhysical / smallLineSize;
+ 94     m_smallLineMetadata.grow(sizeClassCount * smallLineCount);
+ 95 
+ 96     for (size_t sizeClass = 0; sizeClass &lt; sizeClassCount; ++sizeClass) {
+ 97         size_t size = objectSize(sizeClass);
+ 98         LineMetadata* pageMetadata = &amp;m_smallLineMetadata[sizeClass * smallLineCount];
+ 99 
+100         size_t object = 0;
+101         size_t line = 0;
+102         while (object &lt; m_vmPageSizePhysical) {
+103             line = object / smallLineSize;
+104             size_t leftover = object % smallLineSize;
+105 
+106             size_t objectCount;
+107             size_t remainder;
+108             divideRoundingUp(smallLineSize - leftover, size, objectCount, remainder);
+109 
+110             pageMetadata[line] = { static_cast&lt;unsigned char&gt;(leftover), static_cast&lt;unsigned char&gt;(objectCount) };
+111 
+112             object += objectCount * size;
+113         }
+114 
+115         // Don&#39;t allow the last object in a page to escape the page.
+116         if (object &gt; m_vmPageSizePhysical) {
+117             BASSERT(pageMetadata[line].objectCount);
+118             --pageMetadata[line].objectCount;
+119         }
+120     }
+121 }
+122 
+123 void Heap::initializePageMetadata()
+124 {
+125     auto computePageSize = [&amp;](size_t sizeClass) {
+126         size_t size = objectSize(sizeClass);
+127         if (sizeClass &lt; bmalloc::sizeClass(smallLineSize))
+128             return m_vmPageSizePhysical;
+129 
+130         for (size_t pageSize = m_vmPageSizePhysical;
+131             pageSize &lt; pageSizeMax;
+132             pageSize += m_vmPageSizePhysical) {
+133             RELEASE_BASSERT(pageSize &lt;= chunkSize / 2);
+134             size_t waste = pageSize % size;
+135             if (waste &lt;= pageSize / pageSizeWasteFactor)
+136                 return pageSize;
+137         }
+138 
+139         return pageSizeMax;
+140     };
+141 
+142     for (size_t i = 0; i &lt; sizeClassCount; ++i)
+143         m_pageClasses[i] = (computePageSize(i) - 1) / smallPageSize;
+144 }
+145 
+146 size_t Heap::freeableMemory(std::lock_guard&lt;Mutex&gt;&amp;)
+147 {
+148     return m_freeableMemory;
+149 }
+150 
+151 size_t Heap::footprint()
+152 {
+153     return m_footprint;
+154 }
+155 
+156 void Heap::markAllLargeAsEligibile(std::lock_guard&lt;Mutex&gt;&amp;)
+157 {
+158     m_largeFree.markAllAsEligibile();
+159     m_hasPendingDecommits = false;
+160     m_condition.notify_all();
+161 }
+162 
+163 void Heap::decommitLargeRange(std::lock_guard&lt;Mutex&gt;&amp;, LargeRange&amp; range, BulkDecommit&amp; decommitter)
+164 {
+165     m_footprint -= range.totalPhysicalSize();
+166     m_freeableMemory -= range.totalPhysicalSize();
+167     decommitter.addLazy(range.begin(), range.size());
+168     m_hasPendingDecommits = true;
+169     range.setStartPhysicalSize(0);
+170     range.setTotalPhysicalSize(0);
+171     BASSERT(range.isEligibile());
+172     range.setEligible(false);
+173 #if ENABLE_PHYSICAL_PAGE_MAP
+174     m_physicalPageMap.decommit(range.begin(), range.size());
+175 #endif
+176 }
+177 
+178 void Heap::scavenge(std::lock_guard&lt;Mutex&gt;&amp; lock, BulkDecommit&amp; decommitter, size_t&amp; deferredDecommits)
+179 {
+180     for (auto&amp; list : m_freePages) {
+181         for (auto* chunk : list) {
+182             for (auto* page : chunk-&gt;freePages()) {
+183                 if (!page-&gt;hasPhysicalPages())
+184                     continue;
+185                 if (page-&gt;usedSinceLastScavenge()) {
+186                     page-&gt;clearUsedSinceLastScavenge();
+187                     deferredDecommits++;
+188                     continue;
+189                 }
+190 
+191                 size_t pageSize = bmalloc::pageSize(&amp;list - &amp;m_freePages[0]);
+192                 size_t decommitSize = physicalPageSizeSloppy(page-&gt;begin()-&gt;begin(), pageSize);
+193                 m_freeableMemory -= decommitSize;
+194                 m_footprint -= decommitSize;
+195                 decommitter.addEager(page-&gt;begin()-&gt;begin(), pageSize);
+196                 page-&gt;setHasPhysicalPages(false);
+197 #if ENABLE_PHYSICAL_PAGE_MAP
+198                 m_physicalPageMap.decommit(page-&gt;begin()-&gt;begin(), pageSize);
+199 #endif
+200             }
+201         }
+202     }
+203 
+204     for (auto&amp; list : m_chunkCache) {
+205         while (!list.isEmpty())
+206             deallocateSmallChunk(list.pop(), &amp;list - &amp;m_chunkCache[0]);
+207     }
+208 
+209     for (LargeRange&amp; range : m_largeFree) {
+210         if (range.usedSinceLastScavenge()) {
+211             range.clearUsedSinceLastScavenge();
+212             deferredDecommits++;
+213             continue;
+214         }
+215         decommitLargeRange(lock, range, decommitter);
+216     }
+217 }
+218 
+219 void Heap::deallocateLineCache(std::unique_lock&lt;Mutex&gt;&amp;, LineCache&amp; lineCache)
+220 {
+221     for (auto&amp; list : lineCache) {
+222         while (!list.isEmpty()) {
+223             size_t sizeClass = &amp;list - &amp;lineCache[0];
+224             m_lineCache[sizeClass].push(list.popFront());
+225         }
+226     }
+227 }
+228 
+229 void Heap::allocateSmallChunk(std::unique_lock&lt;Mutex&gt;&amp; lock, size_t pageClass)
+230 {
+231     RELEASE_BASSERT(isActiveHeapKind(m_kind));
+232 
+233     size_t pageSize = bmalloc::pageSize(pageClass);
+234 
+235     Chunk* chunk = [&amp;]() {
+236         if (!m_chunkCache[pageClass].isEmpty())
+237             return m_chunkCache[pageClass].pop();
+238 
+239         void* memory = allocateLarge(lock, chunkSize, chunkSize);
+240 
+241         Chunk* chunk = new (memory) Chunk(pageSize);
+242 
+243         m_objectTypes.set(chunk, ObjectType::Small);
+244 
+245         forEachPage(chunk, pageSize, [&amp;](SmallPage* page) {
+246             page-&gt;setHasPhysicalPages(true);
+247             page-&gt;setUsedSinceLastScavenge();
+248             page-&gt;setHasFreeLines(lock, true);
+249             chunk-&gt;freePages().push(page);
+250         });
+251 
+252         m_freeableMemory += chunkSize;
+253 
+254         m_scavenger-&gt;schedule(0);
+255 
+256         return chunk;
+257     }();
+258 
+259     m_freePages[pageClass].push(chunk);
+260 }
+261 
+262 void Heap::deallocateSmallChunk(Chunk* chunk, size_t pageClass)
+263 {
+264     m_objectTypes.set(chunk, ObjectType::Large);
+265 
+266     size_t size = m_largeAllocated.remove(chunk);
+267     size_t totalPhysicalSize = size;
+268 
+269     size_t accountedInFreeable = 0;
+270 
+271     bool hasPhysicalPages = true;
+272     forEachPage(chunk, pageSize(pageClass), [&amp;](SmallPage* page) {
+273         size_t physicalSize = physicalPageSizeSloppy(page-&gt;begin()-&gt;begin(), pageSize(pageClass));
+274         if (!page-&gt;hasPhysicalPages()) {
+275             totalPhysicalSize -= physicalSize;
+276             hasPhysicalPages = false;
+277         } else
+278             accountedInFreeable += physicalSize;
+279     });
+280 
+281     m_freeableMemory -= accountedInFreeable;
+282     m_freeableMemory += totalPhysicalSize;
+283 
+284     size_t startPhysicalSize = hasPhysicalPages ? size : 0;
+285     m_largeFree.add(LargeRange(chunk, size, startPhysicalSize, totalPhysicalSize));
+286 }
+287 
+288 SmallPage* Heap::allocateSmallPage(std::unique_lock&lt;Mutex&gt;&amp; lock, size_t sizeClass, LineCache&amp; lineCache)
+289 {
+290     RELEASE_BASSERT(isActiveHeapKind(m_kind));
+291 
+292     if (!lineCache[sizeClass].isEmpty())
+293         return lineCache[sizeClass].popFront();
+294 
+295     if (!m_lineCache[sizeClass].isEmpty())
+296         return m_lineCache[sizeClass].popFront();
+297 
+298     m_scavenger-&gt;didStartGrowing();
+299 
+300     SmallPage* page = [&amp;]() {
+301         size_t pageClass = m_pageClasses[sizeClass];
+302 
+303         if (m_freePages[pageClass].isEmpty())
+304             allocateSmallChunk(lock, pageClass);
+305 
+306         Chunk* chunk = m_freePages[pageClass].tail();
+307 
+308         chunk-&gt;ref();
+309 
+310         SmallPage* page = chunk-&gt;freePages().pop();
+311         if (chunk-&gt;freePages().isEmpty())
+312             m_freePages[pageClass].remove(chunk);
+313 
+314         size_t pageSize = bmalloc::pageSize(pageClass);
+315         size_t physicalSize = physicalPageSizeSloppy(page-&gt;begin()-&gt;begin(), pageSize);
+316         if (page-&gt;hasPhysicalPages())
+317             m_freeableMemory -= physicalSize;
+318         else {
+319             m_scavenger-&gt;scheduleIfUnderMemoryPressure(pageSize);
+320             m_footprint += physicalSize;
+321             vmAllocatePhysicalPagesSloppy(page-&gt;begin()-&gt;begin(), pageSize);
+322             page-&gt;setHasPhysicalPages(true);
+323 #if ENABLE_PHYSICAL_PAGE_MAP
+324             m_physicalPageMap.commit(page-&gt;begin()-&gt;begin(), pageSize);
+325 #endif
+326         }
+327         page-&gt;setUsedSinceLastScavenge();
+328 
+329         return page;
+330     }();
+331 
+332     page-&gt;setSizeClass(sizeClass);
+333     return page;
+334 }
+335 
+336 void Heap::deallocateSmallLine(std::unique_lock&lt;Mutex&gt;&amp; lock, Object object, LineCache&amp; lineCache)
+337 {
+338     BASSERT(!object.line()-&gt;refCount(lock));
+339     SmallPage* page = object.page();
+340     page-&gt;deref(lock);
+341 
+342     if (!page-&gt;hasFreeLines(lock)) {
+343         page-&gt;setHasFreeLines(lock, true);
+344         lineCache[page-&gt;sizeClass()].push(page);
+345     }
+346 
+347     if (page-&gt;refCount(lock))
+348         return;
+349 
+350     size_t sizeClass = page-&gt;sizeClass();
+351     size_t pageClass = m_pageClasses[sizeClass];
+352 
+353     m_freeableMemory += physicalPageSizeSloppy(page-&gt;begin()-&gt;begin(), pageSize(pageClass));
+354 
+355     List&lt;SmallPage&gt;::remove(page); // &#39;page&#39; may be in any thread&#39;s line cache.
+356 
+357     Chunk* chunk = Chunk::get(page);
+358     if (chunk-&gt;freePages().isEmpty())
+359         m_freePages[pageClass].push(chunk);
+360     chunk-&gt;freePages().push(page);
+361 
+362     chunk-&gt;deref();
+363 
+364     if (!chunk-&gt;refCount()) {
+365         m_freePages[pageClass].remove(chunk);
+366 
+367         if (!m_chunkCache[pageClass].isEmpty())
+368             deallocateSmallChunk(m_chunkCache[pageClass].pop(), pageClass);
+369 
+370         m_chunkCache[pageClass].push(chunk);
+371     }
+372 
+373     m_scavenger-&gt;schedule(pageSize(pageClass));
+374 }
+375 
+376 void Heap::allocateSmallBumpRangesByMetadata(
+377     std::unique_lock&lt;Mutex&gt;&amp; lock, size_t sizeClass,
+378     BumpAllocator&amp; allocator, BumpRangeCache&amp; rangeCache,
+379     LineCache&amp; lineCache)
+380 {
+381     RELEASE_BASSERT(isActiveHeapKind(m_kind));
+382 
+383     SmallPage* page = allocateSmallPage(lock, sizeClass, lineCache);
+384     SmallLine* lines = page-&gt;begin();
+385     BASSERT(page-&gt;hasFreeLines(lock));
+386     size_t smallLineCount = m_vmPageSizePhysical / smallLineSize;
+387     LineMetadata* pageMetadata = &amp;m_smallLineMetadata[sizeClass * smallLineCount];
+388 
+389     auto findSmallBumpRange = [&amp;](size_t&amp; lineNumber) {
+390         for ( ; lineNumber &lt; smallLineCount; ++lineNumber) {
+391             if (!lines[lineNumber].refCount(lock)) {
+392                 if (pageMetadata[lineNumber].objectCount)
+393                     return true;
+394             }
+395         }
+396         return false;
+397     };
+398 
+399     auto allocateSmallBumpRange = [&amp;](size_t&amp; lineNumber) -&gt; BumpRange {
+400         char* begin = lines[lineNumber].begin() + pageMetadata[lineNumber].startOffset;
+401         unsigned short objectCount = 0;
+402 
+403         for ( ; lineNumber &lt; smallLineCount; ++lineNumber) {
+404             if (lines[lineNumber].refCount(lock))
+405                 break;
+406 
+407             if (!pageMetadata[lineNumber].objectCount)
+408                 continue;
+409 
+410             objectCount += pageMetadata[lineNumber].objectCount;
+411             lines[lineNumber].ref(lock, pageMetadata[lineNumber].objectCount);
+412             page-&gt;ref(lock);
+413         }
+414         return { begin, objectCount };
+415     };
+416 
+417     size_t lineNumber = 0;
+418     for (;;) {
+419         if (!findSmallBumpRange(lineNumber)) {
+420             page-&gt;setHasFreeLines(lock, false);
+421             BASSERT(allocator.canAllocate());
+422             return;
+423         }
+424 
+425         // In a fragmented page, some free ranges might not fit in the cache.
+426         if (rangeCache.size() == rangeCache.capacity()) {
+427             lineCache[sizeClass].push(page);
+428             BASSERT(allocator.canAllocate());
+429             return;
+430         }
+431 
+432         BumpRange bumpRange = allocateSmallBumpRange(lineNumber);
+433         if (allocator.canAllocate())
+434             rangeCache.push(bumpRange);
+435         else
+436             allocator.refill(bumpRange);
+437     }
+438 }
+439 
+440 void Heap::allocateSmallBumpRangesByObject(
+441     std::unique_lock&lt;Mutex&gt;&amp; lock, size_t sizeClass,
+442     BumpAllocator&amp; allocator, BumpRangeCache&amp; rangeCache,
+443     LineCache&amp; lineCache)
+444 {
+445     RELEASE_BASSERT(isActiveHeapKind(m_kind));
+446 
+447     size_t size = allocator.size();
+448     SmallPage* page = allocateSmallPage(lock, sizeClass, lineCache);
+449     BASSERT(page-&gt;hasFreeLines(lock));
+450 
+451     auto findSmallBumpRange = [&amp;](Object&amp; it, Object&amp; end) {
+452         for ( ; it + size &lt;= end; it = it + size) {
+453             if (!it.line()-&gt;refCount(lock))
+454                 return true;
+455         }
+456         return false;
+457     };
+458 
+459     auto allocateSmallBumpRange = [&amp;](Object&amp; it, Object&amp; end) -&gt; BumpRange {
+460         char* begin = it.address();
+461         unsigned short objectCount = 0;
+462         for ( ; it + size &lt;= end; it = it + size) {
+463             if (it.line()-&gt;refCount(lock))
+464                 break;
+465 
+466             ++objectCount;
+467             it.line()-&gt;ref(lock);
+468             it.page()-&gt;ref(lock);
+469         }
+470         return { begin, objectCount };
+471     };
+472 
+473     Object it(page-&gt;begin()-&gt;begin());
+474     Object end(it + pageSize(m_pageClasses[sizeClass]));
+475     for (;;) {
+476         if (!findSmallBumpRange(it, end)) {
+477             page-&gt;setHasFreeLines(lock, false);
+478             BASSERT(allocator.canAllocate());
+479             return;
+480         }
+481 
+482         // In a fragmented page, some free ranges might not fit in the cache.
+483         if (rangeCache.size() == rangeCache.capacity()) {
+484             lineCache[sizeClass].push(page);
+485             BASSERT(allocator.canAllocate());
+486             return;
+487         }
+488 
+489         BumpRange bumpRange = allocateSmallBumpRange(it, end);
+490         if (allocator.canAllocate())
+491             rangeCache.push(bumpRange);
+492         else
+493             allocator.refill(bumpRange);
+494     }
+495 }
+496 
+497 LargeRange Heap::splitAndAllocate(std::unique_lock&lt;Mutex&gt;&amp;, LargeRange&amp; range, size_t alignment, size_t size)
+498 {
+499     RELEASE_BASSERT(isActiveHeapKind(m_kind));
+500 
+501     LargeRange prev;
+502     LargeRange next;
+503 
+504     size_t alignmentMask = alignment - 1;
+505     if (test(range.begin(), alignmentMask)) {
+506         size_t prefixSize = roundUpToMultipleOf(alignment, range.begin()) - range.begin();
+507         std::pair&lt;LargeRange, LargeRange&gt; pair = range.split(prefixSize);
+508         prev = pair.first;
+509         range = pair.second;
+510     }
+511 
+512     if (range.size() - size &gt; size / pageSizeWasteFactor) {
+513         std::pair&lt;LargeRange, LargeRange&gt; pair = range.split(size);
+514         range = pair.first;
+515         next = pair.second;
+516     }
+517 
+518     if (range.startPhysicalSize() &lt; range.size()) {
+519         m_scavenger-&gt;scheduleIfUnderMemoryPressure(range.size());
+520         m_footprint += range.size() - range.totalPhysicalSize();
+521         vmAllocatePhysicalPagesSloppy(range.begin() + range.startPhysicalSize(), range.size() - range.startPhysicalSize());
+522         range.setStartPhysicalSize(range.size());
+523         range.setTotalPhysicalSize(range.size());
+524 #if ENABLE_PHYSICAL_PAGE_MAP
+525         m_physicalPageMap.commit(range.begin(), range.size());
+526 #endif
+527     }
+528 
+529     if (prev) {
+530         m_freeableMemory += prev.totalPhysicalSize();
+531         m_largeFree.add(prev);
+532     }
+533 
+534     if (next) {
+535         m_freeableMemory += next.totalPhysicalSize();
+536         m_largeFree.add(next);
+537     }
+538 
+539     m_objectTypes.set(Chunk::get(range.begin()), ObjectType::Large);
+540 
+541     m_largeAllocated.set(range.begin(), range.size());
+542     return range;
+543 }
+544 
+545 void* Heap::tryAllocateLarge(std::unique_lock&lt;Mutex&gt;&amp; lock, size_t alignment, size_t size)
+546 {
+547     RELEASE_BASSERT(isActiveHeapKind(m_kind));
+548 
+549     BASSERT(isPowerOfTwo(alignment));
+550 
+551     m_scavenger-&gt;didStartGrowing();
+552 
+553     size_t roundedSize = size ? roundUpToMultipleOf(largeAlignment, size) : largeAlignment;
+554     if (roundedSize &lt; size) // Check for overflow
+555         return nullptr;
+556     size = roundedSize;
+557 
+558     size_t roundedAlignment = roundUpToMultipleOf&lt;largeAlignment&gt;(alignment);
+559     if (roundedAlignment &lt; alignment) // Check for overflow
+560         return nullptr;
+561     alignment = roundedAlignment;
+562 
+563     LargeRange range = m_largeFree.remove(alignment, size);
+564     if (!range) {
+565         if (m_hasPendingDecommits) {
+566             m_condition.wait(lock, [&amp;]() { return !m_hasPendingDecommits; });
+567             // Now we&#39;re guaranteed we&#39;re looking at all available memory.
+568             return tryAllocateLarge(lock, alignment, size);
+569         }
+570 
+571         if (usingGigacage())
+572             return nullptr;
+573 
+574         range = VMHeap::get()-&gt;tryAllocateLargeChunk(alignment, size);
+575         if (!range)
+576             return nullptr;
+577 
+578         m_largeFree.add(range);
+579         range = m_largeFree.remove(alignment, size);
+580     }
+581 
+582     m_freeableMemory -= range.totalPhysicalSize();
+583 
+584     void* result = splitAndAllocate(lock, range, alignment, size).begin();
+585     return result;
+586 }
+587 
+588 void* Heap::allocateLarge(std::unique_lock&lt;Mutex&gt;&amp; lock, size_t alignment, size_t size)
+589 {
+590     void* result = tryAllocateLarge(lock, alignment, size);
+591     RELEASE_BASSERT(result);
+592     return result;
+593 }
+594 
+595 bool Heap::isLarge(std::unique_lock&lt;Mutex&gt;&amp;, void* object)
+596 {
+597     return m_objectTypes.get(Object(object).chunk()) == ObjectType::Large;
+598 }
+599 
+600 size_t Heap::largeSize(std::unique_lock&lt;Mutex&gt;&amp;, void* object)
+601 {
+602     return m_largeAllocated.get(object);
+603 }
+604 
+605 void Heap::shrinkLarge(std::unique_lock&lt;Mutex&gt;&amp; lock, const Range&amp; object, size_t newSize)
+606 {
+607     BASSERT(object.size() &gt; newSize);
+608 
+609     size_t size = m_largeAllocated.remove(object.begin());
+610     LargeRange range = LargeRange(object, size, size);
+611     splitAndAllocate(lock, range, alignment, newSize);
+612 
+613     m_scavenger-&gt;schedule(size);
+614 }
+615 
+616 void Heap::deallocateLarge(std::unique_lock&lt;Mutex&gt;&amp;, void* object)
+617 {
+618     size_t size = m_largeAllocated.remove(object);
+619     m_largeFree.add(LargeRange(object, size, size, size));
+620     m_freeableMemory += size;
+621     m_scavenger-&gt;schedule(size);
+622 }
+623 
+624 void Heap::externalCommit(void* ptr, size_t size)
+625 {
+626     std::unique_lock&lt;Mutex&gt; lock(Heap::mutex());
+627     externalCommit(lock, ptr, size);
+628 }
+629 
+630 void Heap::externalCommit(std::unique_lock&lt;Mutex&gt;&amp;, void* ptr, size_t size)
+631 {
+632     BUNUSED_PARAM(ptr);
+633 
+634     m_footprint += size;
+635 #if ENABLE_PHYSICAL_PAGE_MAP
+636     m_physicalPageMap.commit(ptr, size);
+637 #endif
+638 }
+639 
+640 void Heap::externalDecommit(void* ptr, size_t size)
+641 {
+642     std::unique_lock&lt;Mutex&gt; lock(Heap::mutex());
+643     externalDecommit(lock, ptr, size);
+644 }
+645 
+646 void Heap::externalDecommit(std::unique_lock&lt;Mutex&gt;&amp;, void* ptr, size_t size)
+647 {
+648     BUNUSED_PARAM(ptr);
+649 
+650     m_footprint -= size;
+651 #if ENABLE_PHYSICAL_PAGE_MAP
+652     m_physicalPageMap.decommit(ptr, size);
+653 #endif
+654 }
+655 
+656 } // namespace bmalloc
+    </pre>
+  </body>
+</html>

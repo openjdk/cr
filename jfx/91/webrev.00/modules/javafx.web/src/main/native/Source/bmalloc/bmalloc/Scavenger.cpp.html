@@ -1,0 +1,397 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>New modules/javafx.web/src/main/native/Source/bmalloc/bmalloc/Scavenger.cpp</title>
+    <link rel="stylesheet" href="../../../../../../../../style.css" />
+  </head>
+  <body>
+    <pre>
+  1 /*
+  2  * Copyright (C) 2017-2018 Apple Inc. All rights reserved.
+  3  *
+  4  * Redistribution and use in source and binary forms, with or without
+  5  * modification, are permitted provided that the following conditions
+  6  * are met:
+  7  * 1. Redistributions of source code must retain the above copyright
+  8  *    notice, this list of conditions and the following disclaimer.
+  9  * 2. Redistributions in binary form must reproduce the above copyright
+ 10  *    notice, this list of conditions and the following disclaimer in the
+ 11  *    documentation and/or other materials provided with the distribution.
+ 12  *
+ 13  * THIS SOFTWARE IS PROVIDED BY APPLE INC. ``AS IS&#39;&#39; AND ANY
+ 14  * EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ 15  * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+ 16  * PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL APPLE INC. OR
+ 17  * CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+ 18  * EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+ 19  * PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
+ 20  * PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY
+ 21  * OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ 22  * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ 23  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ 24  */
+ 25 
+ 26 #include &quot;Scavenger.h&quot;
+ 27 
+ 28 #include &quot;AllIsoHeapsInlines.h&quot;
+ 29 #include &quot;AvailableMemory.h&quot;
+ 30 #include &quot;BulkDecommit.h&quot;
+ 31 #include &quot;Environment.h&quot;
+ 32 #include &quot;Heap.h&quot;
+ 33 #if BOS(DARWIN)
+ 34 #import &lt;dispatch/dispatch.h&gt;
+ 35 #import &lt;mach/host_info.h&gt;
+ 36 #import &lt;mach/mach.h&gt;
+ 37 #import &lt;mach/mach_error.h&gt;
+ 38 #endif
+ 39 #include &lt;stdio.h&gt;
+ 40 #include &lt;thread&gt;
+ 41 
+ 42 namespace bmalloc {
+ 43 
+ 44 static constexpr bool verbose = false;
+ 45 
+ 46 struct PrintTime {
+ 47     PrintTime(const char* str)
+ 48         : string(str)
+ 49     { }
+ 50 
+ 51     ~PrintTime()
+ 52     {
+ 53         if (!printed)
+ 54             print();
+ 55     }
+ 56     void print()
+ 57     {
+ 58         if (verbose) {
+ 59             fprintf(stderr, &quot;%s %lfms\n&quot;, string, static_cast&lt;double&gt;(std::chrono::duration_cast&lt;std::chrono::microseconds&gt;(std::chrono::steady_clock::now() - start).count()) / 1000);
+ 60             printed = true;
+ 61         }
+ 62     }
+ 63     const char* string;
+ 64     std::chrono::steady_clock::time_point start { std::chrono::steady_clock::now() };
+ 65     bool printed { false };
+ 66 };
+ 67 
+ 68 DEFINE_STATIC_PER_PROCESS_STORAGE(Scavenger);
+ 69 
+ 70 Scavenger::Scavenger(std::lock_guard&lt;Mutex&gt;&amp;)
+ 71 {
+ 72     BASSERT(!Environment::get()-&gt;isDebugHeapEnabled());
+ 73 
+ 74 #if BOS(DARWIN)
+ 75     auto queue = dispatch_queue_create(&quot;WebKit Malloc Memory Pressure Handler&quot;, DISPATCH_QUEUE_SERIAL);
+ 76     m_pressureHandlerDispatchSource = dispatch_source_create(DISPATCH_SOURCE_TYPE_MEMORYPRESSURE, 0, DISPATCH_MEMORYPRESSURE_CRITICAL, queue);
+ 77     dispatch_source_set_event_handler(m_pressureHandlerDispatchSource, ^{
+ 78         scavenge();
+ 79     });
+ 80     dispatch_resume(m_pressureHandlerDispatchSource);
+ 81     dispatch_release(queue);
+ 82 #endif
+ 83     m_waitTime = std::chrono::milliseconds(10);
+ 84 
+ 85     m_thread = std::thread(&amp;threadEntryPoint, this);
+ 86 }
+ 87 
+ 88 void Scavenger::run()
+ 89 {
+ 90     std::lock_guard&lt;Mutex&gt; lock(mutex());
+ 91     runHoldingLock();
+ 92 }
+ 93 
+ 94 void Scavenger::runHoldingLock()
+ 95 {
+ 96     m_state = State::Run;
+ 97     m_condition.notify_all();
+ 98 }
+ 99 
+100 void Scavenger::runSoon()
+101 {
+102     std::lock_guard&lt;Mutex&gt; lock(mutex());
+103     runSoonHoldingLock();
+104 }
+105 
+106 void Scavenger::runSoonHoldingLock()
+107 {
+108     if (willRunSoon())
+109         return;
+110     m_state = State::RunSoon;
+111     m_condition.notify_all();
+112 }
+113 
+114 void Scavenger::didStartGrowing()
+115 {
+116     // We don&#39;t really need to lock here, since this is just a heuristic.
+117     m_isProbablyGrowing = true;
+118 }
+119 
+120 void Scavenger::scheduleIfUnderMemoryPressure(size_t bytes)
+121 {
+122     std::lock_guard&lt;Mutex&gt; lock(mutex());
+123     scheduleIfUnderMemoryPressureHoldingLock(bytes);
+124 }
+125 
+126 void Scavenger::scheduleIfUnderMemoryPressureHoldingLock(size_t bytes)
+127 {
+128     m_scavengerBytes += bytes;
+129     if (m_scavengerBytes &lt; scavengerBytesPerMemoryPressureCheck)
+130         return;
+131 
+132     m_scavengerBytes = 0;
+133 
+134     if (willRun())
+135         return;
+136 
+137     if (!isUnderMemoryPressure())
+138         return;
+139 
+140     m_isProbablyGrowing = false;
+141     runHoldingLock();
+142 }
+143 
+144 void Scavenger::schedule(size_t bytes)
+145 {
+146     std::lock_guard&lt;Mutex&gt; lock(mutex());
+147     scheduleIfUnderMemoryPressureHoldingLock(bytes);
+148 
+149     if (willRunSoon())
+150         return;
+151 
+152     m_isProbablyGrowing = false;
+153     runSoonHoldingLock();
+154 }
+155 
+156 inline void dumpStats()
+157 {
+158     auto dump = [] (auto* string, auto size) {
+159         fprintf(stderr, &quot;%s %zuMB\n&quot;, string, static_cast&lt;size_t&gt;(size) / 1024 / 1024);
+160     };
+161 
+162 #if BOS(DARWIN)
+163     task_vm_info_data_t vmInfo;
+164     mach_msg_type_number_t vmSize = TASK_VM_INFO_COUNT;
+165     if (KERN_SUCCESS == task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)(&amp;vmInfo), &amp;vmSize)) {
+166         dump(&quot;phys_footprint&quot;, vmInfo.phys_footprint);
+167         dump(&quot;internal+compressed&quot;, vmInfo.internal + vmInfo.compressed);
+168     }
+169 #endif
+170 
+171     dump(&quot;bmalloc-freeable&quot;, Scavenger::get()-&gt;freeableMemory());
+172     dump(&quot;bmalloc-footprint&quot;, Scavenger::get()-&gt;footprint());
+173 }
+174 
+175 std::chrono::milliseconds Scavenger::timeSinceLastFullScavenge()
+176 {
+177     std::unique_lock&lt;Mutex&gt; lock(mutex());
+178     return std::chrono::duration_cast&lt;std::chrono::milliseconds&gt;(std::chrono::steady_clock::now() - m_lastFullScavengeTime);
+179 }
+180 
+181 void Scavenger::enableMiniMode()
+182 {
+183     m_isInMiniMode = true; // We just store to this racily. The scavenger thread will eventually pick up the right value.
+184     if (m_state == State::RunSoon)
+185         run();
+186 }
+187 
+188 void Scavenger::scavenge()
+189 {
+190     std::unique_lock&lt;Mutex&gt; lock(m_scavengingMutex);
+191 
+192     if (verbose) {
+193         fprintf(stderr, &quot;--------------------------------\n&quot;);
+194         fprintf(stderr, &quot;--before scavenging--\n&quot;);
+195         dumpStats();
+196     }
+197 
+198     {
+199         BulkDecommit decommitter;
+200 
+201         {
+202             PrintTime printTime(&quot;\nfull scavenge under lock time&quot;);
+203             size_t deferredDecommits = 0;
+204             std::lock_guard&lt;Mutex&gt; lock(Heap::mutex());
+205             for (unsigned i = numHeaps; i--;) {
+206                 if (!isActiveHeapKind(static_cast&lt;HeapKind&gt;(i)))
+207                     continue;
+208                 PerProcess&lt;PerHeapKind&lt;Heap&gt;&gt;::get()-&gt;at(i).scavenge(lock, decommitter, deferredDecommits);
+209             }
+210             decommitter.processEager();
+211 
+212             if (deferredDecommits)
+213                 m_state = State::RunSoon;
+214         }
+215 
+216         {
+217             PrintTime printTime(&quot;full scavenge lazy decommit time&quot;);
+218             decommitter.processLazy();
+219         }
+220 
+221         {
+222             PrintTime printTime(&quot;full scavenge mark all as eligible time&quot;);
+223             std::lock_guard&lt;Mutex&gt; lock(Heap::mutex());
+224             for (unsigned i = numHeaps; i--;) {
+225                 if (!isActiveHeapKind(static_cast&lt;HeapKind&gt;(i)))
+226                     continue;
+227                 PerProcess&lt;PerHeapKind&lt;Heap&gt;&gt;::get()-&gt;at(i).markAllLargeAsEligibile(lock);
+228             }
+229         }
+230     }
+231 
+232     {
+233         RELEASE_BASSERT(!m_deferredDecommits.size());
+234         AllIsoHeaps::get()-&gt;forEach(
+235             [&amp;] (IsoHeapImplBase&amp; heap) {
+236                 heap.scavenge(m_deferredDecommits);
+237             });
+238         IsoHeapImplBase::finishScavenging(m_deferredDecommits);
+239         m_deferredDecommits.shrink(0);
+240     }
+241 
+242     if (verbose) {
+243         fprintf(stderr, &quot;--after scavenging--\n&quot;);
+244         dumpStats();
+245         fprintf(stderr, &quot;--------------------------------\n&quot;);
+246     }
+247 
+248     {
+249         std::unique_lock&lt;Mutex&gt; lock(mutex());
+250         m_lastFullScavengeTime = std::chrono::steady_clock::now();
+251     }
+252 }
+253 
+254 size_t Scavenger::freeableMemory()
+255 {
+256     size_t result = 0;
+257     {
+258         std::lock_guard&lt;Mutex&gt; lock(Heap::mutex());
+259         for (unsigned i = numHeaps; i--;) {
+260             if (!isActiveHeapKind(static_cast&lt;HeapKind&gt;(i)))
+261                 continue;
+262             result += PerProcess&lt;PerHeapKind&lt;Heap&gt;&gt;::get()-&gt;at(i).freeableMemory(lock);
+263         }
+264     }
+265 
+266     AllIsoHeaps::get()-&gt;forEach(
+267         [&amp;] (IsoHeapImplBase&amp; heap) {
+268             result += heap.freeableMemory();
+269         });
+270 
+271     return result;
+272 }
+273 
+274 size_t Scavenger::footprint()
+275 {
+276     RELEASE_BASSERT(!Environment::get()-&gt;isDebugHeapEnabled());
+277 
+278     size_t result = 0;
+279     for (unsigned i = numHeaps; i--;) {
+280         if (!isActiveHeapKind(static_cast&lt;HeapKind&gt;(i)))
+281             continue;
+282         result += PerProcess&lt;PerHeapKind&lt;Heap&gt;&gt;::get()-&gt;at(i).footprint();
+283     }
+284 
+285     AllIsoHeaps::get()-&gt;forEach(
+286         [&amp;] (IsoHeapImplBase&amp; heap) {
+287             result += heap.footprint();
+288         });
+289 
+290     return result;
+291 }
+292 
+293 void Scavenger::threadEntryPoint(Scavenger* scavenger)
+294 {
+295     scavenger-&gt;threadRunLoop();
+296 }
+297 
+298 void Scavenger::threadRunLoop()
+299 {
+300     setSelfQOSClass();
+301 #if BOS(DARWIN)
+302     setThreadName(&quot;JavaScriptCore bmalloc scavenger&quot;);
+303 #else
+304     setThreadName(&quot;BMScavenger&quot;);
+305 #endif
+306 
+307     // This loop ratchets downward from most active to least active state. While
+308     // we ratchet downward, any other thread may reset our state.
+309 
+310     // We require any state change while we are sleeping to signal to our
+311     // condition variable and wake us up.
+312 
+313     while (true) {
+314         if (m_state == State::Sleep) {
+315             std::unique_lock&lt;Mutex&gt; lock(mutex());
+316             m_condition.wait(lock, [&amp;]() { return m_state != State::Sleep; });
+317         }
+318 
+319         if (m_state == State::RunSoon) {
+320             std::unique_lock&lt;Mutex&gt; lock(mutex());
+321             m_condition.wait_for(lock, m_waitTime, [&amp;]() { return m_state != State::RunSoon; });
+322         }
+323 
+324         m_state = State::Sleep;
+325 
+326         setSelfQOSClass();
+327 
+328         if (verbose) {
+329             fprintf(stderr, &quot;--------------------------------\n&quot;);
+330             fprintf(stderr, &quot;considering running scavenger\n&quot;);
+331             dumpStats();
+332             fprintf(stderr, &quot;--------------------------------\n&quot;);
+333         }
+334 
+335         std::chrono::steady_clock::time_point start { std::chrono::steady_clock::now() };
+336 
+337         scavenge();
+338 
+339         auto timeSpentScavenging = std::chrono::steady_clock::now() - start;
+340 
+341         if (verbose) {
+342             fprintf(stderr, &quot;time spent scavenging %lfms\n&quot;,
+343                 static_cast&lt;double&gt;(std::chrono::duration_cast&lt;std::chrono::microseconds&gt;(timeSpentScavenging).count()) / 1000);
+344         }
+345 
+346         std::chrono::milliseconds newWaitTime;
+347 
+348         if (m_isInMiniMode) {
+349             timeSpentScavenging *= 50;
+350             newWaitTime = std::chrono::duration_cast&lt;std::chrono::milliseconds&gt;(timeSpentScavenging);
+351             newWaitTime = std::min(std::max(newWaitTime, std::chrono::milliseconds(25)), std::chrono::milliseconds(500));
+352         } else {
+353             timeSpentScavenging *= 150;
+354             newWaitTime = std::chrono::duration_cast&lt;std::chrono::milliseconds&gt;(timeSpentScavenging);
+355             m_waitTime = std::min(std::max(newWaitTime, std::chrono::milliseconds(100)), std::chrono::milliseconds(10000));
+356         }
+357 
+358         if (verbose)
+359             fprintf(stderr, &quot;new wait time %lldms\n&quot;, static_cast&lt;long long int&gt;(m_waitTime.count()));
+360     }
+361 }
+362 
+363 void Scavenger::setThreadName(const char* name)
+364 {
+365     BUNUSED(name);
+366 #if BOS(DARWIN)
+367     pthread_setname_np(name);
+368 #elif BOS(LINUX)
+369     // Truncate the given name since Linux limits the size of the thread name 16 including null terminator.
+370     std::array&lt;char, 16&gt; buf;
+371     strncpy(buf.data(), name, buf.size() - 1);
+372     buf[buf.size() - 1] = &#39;\0&#39;;
+373     pthread_setname_np(pthread_self(), buf.data());
+374 #endif
+375 }
+376 
+377 void Scavenger::setSelfQOSClass()
+378 {
+379 #if BOS(DARWIN)
+380     pthread_set_qos_class_self_np(requestedScavengerThreadQOSClass(), 0);
+381 #endif
+382 }
+383 
+384 } // namespace bmalloc
+385 
+    </pre>
+  </body>
+</html>
