@@ -1,0 +1,484 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Old modules/javafx.web/src/main/native/Source/WebCore/platform/audio/SincResampler.cpp</title>
+    <link rel="stylesheet" href="../../../../../../../../../style.css" />
+  </head>
+  <body>
+    <pre>
+  1 /*
+  2  * Copyright (C) 2011 Google Inc. All rights reserved.
+  3  *
+  4  * Redistribution and use in source and binary forms, with or without
+  5  * modification, are permitted provided that the following conditions
+  6  * are met:
+  7  *
+  8  * 1.  Redistributions of source code must retain the above copyright
+  9  *     notice, this list of conditions and the following disclaimer.
+ 10  * 2.  Redistributions in binary form must reproduce the above copyright
+ 11  *     notice, this list of conditions and the following disclaimer in the
+ 12  *     documentation and/or other materials provided with the distribution.
+ 13  * 3.  Neither the name of Apple Inc. (&quot;Apple&quot;) nor the names of
+ 14  *     its contributors may be used to endorse or promote products derived
+ 15  *     from this software without specific prior written permission.
+ 16  *
+ 17  * THIS SOFTWARE IS PROVIDED BY APPLE AND ITS CONTRIBUTORS &quot;AS IS&quot; AND ANY
+ 18  * EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+ 19  * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ 20  * DISCLAIMED. IN NO EVENT SHALL APPLE OR ITS CONTRIBUTORS BE LIABLE FOR ANY
+ 21  * DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+ 22  * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+ 23  * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ 24  * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ 25  * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
+ 26  * THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ 27  */
+ 28 
+ 29 #include &quot;config.h&quot;
+ 30 
+ 31 #if ENABLE(WEB_AUDIO)
+ 32 
+ 33 #include &quot;SincResampler.h&quot;
+ 34 
+ 35 #include &quot;AudioBus.h&quot;
+ 36 #include &lt;wtf/MathExtras.h&gt;
+ 37 
+ 38 #if CPU(X86_SSE2)
+ 39 #include &lt;emmintrin.h&gt;
+ 40 #endif
+ 41 
+ 42 // Input buffer layout, dividing the total buffer into regions (r0 - r5):
+ 43 //
+ 44 // |----------------|----------------------------------------------------------------|----------------|
+ 45 //
+ 46 //                                              blockSize + kernelSize / 2
+ 47 //                   &lt;--------------------------------------------------------------------------------&gt;
+ 48 //                                                  r0
+ 49 //
+ 50 //   kernelSize / 2   kernelSize / 2                                 kernelSize / 2     kernelSize / 2
+ 51 // &lt;---------------&gt; &lt;---------------&gt;                              &lt;---------------&gt; &lt;---------------&gt;
+ 52 //         r1                r2                                             r3                r4
+ 53 //
+ 54 //                                              blockSize
+ 55 //                                     &lt;--------------------------------------------------------------&gt;
+ 56 //                                                  r5
+ 57 
+ 58 // The Algorithm:
+ 59 //
+ 60 // 1) Consume input frames into r0 (r1 is zero-initialized).
+ 61 // 2) Position kernel centered at start of r0 (r2) and generate output frames until kernel is centered at start of r4.
+ 62 //    or we&#39;ve finished generating all the output frames.
+ 63 // 3) Copy r3 to r1 and r4 to r2.
+ 64 // 4) Consume input frames into r5 (zero-pad if we run out of input).
+ 65 // 5) Goto (2) until all of input is consumed.
+ 66 //
+ 67 // note: we&#39;re glossing over how the sub-sample handling works with m_virtualSourceIndex, etc.
+ 68 
+ 69 namespace WebCore {
+ 70 
+ 71 SincResampler::SincResampler(double scaleFactor, unsigned kernelSize, unsigned numberOfKernelOffsets)
+ 72     : m_scaleFactor(scaleFactor)
+ 73     , m_kernelSize(kernelSize)
+ 74     , m_numberOfKernelOffsets(numberOfKernelOffsets)
+ 75     , m_kernelStorage(m_kernelSize * (m_numberOfKernelOffsets + 1))
+ 76     , m_virtualSourceIndex(0)
+ 77     , m_blockSize(512)
+ 78     , m_inputBuffer(m_blockSize + m_kernelSize) // See input buffer layout above.
+ 79     , m_source(0)
+ 80     , m_sourceFramesAvailable(0)
+ 81     , m_sourceProvider(0)
+ 82     , m_isBufferPrimed(false)
+ 83 {
+ 84     initializeKernel();
+ 85 }
+ 86 
+ 87 void SincResampler::initializeKernel()
+ 88 {
+ 89     // Blackman window parameters.
+ 90     double alpha = 0.16;
+ 91     double a0 = 0.5 * (1.0 - alpha);
+ 92     double a1 = 0.5;
+ 93     double a2 = 0.5 * alpha;
+ 94 
+ 95     // sincScaleFactor is basically the normalized cutoff frequency of the low-pass filter.
+ 96     double sincScaleFactor = m_scaleFactor &gt; 1.0 ? 1.0 / m_scaleFactor : 1.0;
+ 97 
+ 98     // The sinc function is an idealized brick-wall filter, but since we&#39;re windowing it the
+ 99     // transition from pass to stop does not happen right away. So we should adjust the
+100     // lowpass filter cutoff slightly downward to avoid some aliasing at the very high-end.
+101     // FIXME: this value is empirical and to be more exact should vary depending on m_kernelSize.
+102     sincScaleFactor *= 0.9;
+103 
+104     int n = m_kernelSize;
+105     int halfSize = n / 2;
+106 
+107     // Generates a set of windowed sinc() kernels.
+108     // We generate a range of sub-sample offsets from 0.0 to 1.0.
+109     for (unsigned offsetIndex = 0; offsetIndex &lt;= m_numberOfKernelOffsets; ++offsetIndex) {
+110         double subsampleOffset = static_cast&lt;double&gt;(offsetIndex) / m_numberOfKernelOffsets;
+111 
+112         for (int i = 0; i &lt; n; ++i) {
+113             // Compute the sinc() with offset.
+114             double s = sincScaleFactor * piDouble * (i - halfSize - subsampleOffset);
+115             double sinc = !s ? 1.0 : sin(s) / s;
+116             sinc *= sincScaleFactor;
+117 
+118             // Compute Blackman window, matching the offset of the sinc().
+119             double x = (i - subsampleOffset) / n;
+120             double window = a0 - a1 * cos(2.0 * piDouble * x) + a2 * cos(4.0 * piDouble * x);
+121 
+122             // Window the sinc() function and store at the correct offset.
+123             m_kernelStorage[i + offsetIndex * m_kernelSize] = sinc * window;
+124         }
+125     }
+126 }
+127 
+128 void SincResampler::consumeSource(float* buffer, unsigned numberOfSourceFrames)
+129 {
+130     ASSERT(m_sourceProvider);
+131     if (!m_sourceProvider)
+132         return;
+133 
+134     // Wrap the provided buffer by an AudioBus for use by the source provider.
+135     auto bus = AudioBus::create(1, numberOfSourceFrames, false);
+136 
+137     // FIXME: Find a way to make the following const-correct:
+138     bus-&gt;setChannelMemory(0, buffer, numberOfSourceFrames);
+139 
+140     m_sourceProvider-&gt;provideInput(bus.get(), numberOfSourceFrames);
+141 }
+142 
+143 namespace {
+144 
+145 // BufferSourceProvider is an AudioSourceProvider wrapping an in-memory buffer.
+146 
+147 class BufferSourceProvider : public AudioSourceProvider {
+148 public:
+149     BufferSourceProvider(const float* source, size_t numberOfSourceFrames)
+150         : m_source(source)
+151         , m_sourceFramesAvailable(numberOfSourceFrames)
+152     {
+153     }
+154 
+155     // Consumes samples from the in-memory buffer.
+156     void provideInput(AudioBus* bus, size_t framesToProcess) override
+157     {
+158         ASSERT(m_source &amp;&amp; bus);
+159         if (!m_source || !bus)
+160             return;
+161 
+162         float* buffer = bus-&gt;channel(0)-&gt;mutableData();
+163 
+164         // Clamp to number of frames available and zero-pad.
+165         size_t framesToCopy = std::min(m_sourceFramesAvailable, framesToProcess);
+166         memcpy(buffer, m_source, sizeof(float) * framesToCopy);
+167 
+168         // Zero-pad if necessary.
+169         if (framesToCopy &lt; framesToProcess)
+170             memset(buffer + framesToCopy, 0, sizeof(float) * (framesToProcess - framesToCopy));
+171 
+172         m_sourceFramesAvailable -= framesToCopy;
+173         m_source += framesToCopy;
+174     }
+175 
+176 private:
+177     const float* m_source;
+178     size_t m_sourceFramesAvailable;
+179 };
+180 
+181 } // namespace
+182 
+183 void SincResampler::process(const float* source, float* destination, unsigned numberOfSourceFrames)
+184 {
+185     // Resample an in-memory buffer using an AudioSourceProvider.
+186     BufferSourceProvider sourceProvider(source, numberOfSourceFrames);
+187 
+188     unsigned numberOfDestinationFrames = static_cast&lt;unsigned&gt;(numberOfSourceFrames / m_scaleFactor);
+189     unsigned remaining = numberOfDestinationFrames;
+190 
+191     while (remaining) {
+192         unsigned framesThisTime = std::min(remaining, m_blockSize);
+193         process(&amp;sourceProvider, destination, framesThisTime);
+194 
+195         destination += framesThisTime;
+196         remaining -= framesThisTime;
+197     }
+198 }
+199 
+200 void SincResampler::process(AudioSourceProvider* sourceProvider, float* destination, size_t framesToProcess)
+201 {
+202     bool isGood = sourceProvider &amp;&amp; m_blockSize &gt; m_kernelSize &amp;&amp; m_inputBuffer.size() &gt;= m_blockSize + m_kernelSize &amp;&amp; !(m_kernelSize % 2);
+203     ASSERT(isGood);
+204     if (!isGood)
+205         return;
+206 
+207     m_sourceProvider = sourceProvider;
+208 
+209     unsigned numberOfDestinationFrames = framesToProcess;
+210 
+211     // Setup various region pointers in the buffer (see diagram above).
+212     float* r0 = m_inputBuffer.data() + m_kernelSize / 2;
+213     float* r1 = m_inputBuffer.data();
+214     float* r2 = r0;
+215     float* r3 = r0 + m_blockSize - m_kernelSize / 2;
+216     float* r4 = r0 + m_blockSize;
+217     float* r5 = r0 + m_kernelSize / 2;
+218 
+219     // Step (1)
+220     // Prime the input buffer at the start of the input stream.
+221     if (!m_isBufferPrimed) {
+222         consumeSource(r0, m_blockSize + m_kernelSize / 2);
+223         m_isBufferPrimed = true;
+224     }
+225 
+226     // Step (2)
+227 
+228     while (numberOfDestinationFrames) {
+229         while (m_virtualSourceIndex &lt; m_blockSize) {
+230             // m_virtualSourceIndex lies in between two kernel offsets so figure out what they are.
+231             int sourceIndexI = static_cast&lt;int&gt;(m_virtualSourceIndex);
+232             double subsampleRemainder = m_virtualSourceIndex - sourceIndexI;
+233 
+234             double virtualOffsetIndex = subsampleRemainder * m_numberOfKernelOffsets;
+235             int offsetIndex = static_cast&lt;int&gt;(virtualOffsetIndex);
+236 
+237             float* k1 = m_kernelStorage.data() + offsetIndex * m_kernelSize;
+238             float* k2 = k1 + m_kernelSize;
+239 
+240             // Initialize input pointer based on quantized m_virtualSourceIndex.
+241             float* inputP = r1 + sourceIndexI;
+242 
+243             // We&#39;ll compute &quot;convolutions&quot; for the two kernels which straddle m_virtualSourceIndex
+244             float sum1 = 0;
+245             float sum2 = 0;
+246 
+247             // Figure out how much to weight each kernel&#39;s &quot;convolution&quot;.
+248             double kernelInterpolationFactor = virtualOffsetIndex - offsetIndex;
+249 
+250             // Generate a single output sample.
+251             int n = m_kernelSize;
+252 
+253 #define CONVOLVE_ONE_SAMPLE      \
+254             input = *inputP++;   \
+255             sum1 += input * *k1; \
+256             sum2 += input * *k2; \
+257             ++k1;                \
+258             ++k2;
+259 
+260             {
+261                 float input;
+262 
+263 #if CPU(X86_SSE2)
+264                 // If the sourceP address is not 16-byte aligned, the first several frames (at most three) should be processed seperately.
+265                 while ((reinterpret_cast&lt;uintptr_t&gt;(inputP) &amp; 0x0F) &amp;&amp; n) {
+266                     CONVOLVE_ONE_SAMPLE
+267                     n--;
+268                 }
+269 
+270                 // Now the inputP is aligned and start to apply SSE.
+271                 float* endP = inputP + n - n % 4;
+272                 __m128 mInput;
+273                 __m128 mK1;
+274                 __m128 mK2;
+275                 __m128 mul1;
+276                 __m128 mul2;
+277 
+278                 __m128 sums1 = _mm_setzero_ps();
+279                 __m128 sums2 = _mm_setzero_ps();
+280                 bool k1Aligned = !(reinterpret_cast&lt;uintptr_t&gt;(k1) &amp; 0x0F);
+281                 bool k2Aligned = !(reinterpret_cast&lt;uintptr_t&gt;(k2) &amp; 0x0F);
+282 
+283 #define LOAD_DATA(l1, l2)                        \
+284                 mInput = _mm_load_ps(inputP);    \
+285                 mK1 = _mm_##l1##_ps(k1);         \
+286                 mK2 = _mm_##l2##_ps(k2);
+287 
+288 #define CONVOLVE_4_SAMPLES                       \
+289                 mul1 = _mm_mul_ps(mInput, mK1);  \
+290                 mul2 = _mm_mul_ps(mInput, mK2);  \
+291                 sums1 = _mm_add_ps(sums1, mul1); \
+292                 sums2 = _mm_add_ps(sums2, mul2); \
+293                 inputP += 4;                     \
+294                 k1 += 4;                         \
+295                 k2 += 4;
+296 
+297                 if (k1Aligned &amp;&amp; k2Aligned) { // both aligned
+298                     while (inputP &lt; endP) {
+299                         LOAD_DATA(load, load)
+300                         CONVOLVE_4_SAMPLES
+301                     }
+302                 } else if (!k1Aligned &amp;&amp; k2Aligned) { // only k2 aligned
+303                     while (inputP &lt; endP) {
+304                         LOAD_DATA(loadu, load)
+305                         CONVOLVE_4_SAMPLES
+306                     }
+307                 } else if (k1Aligned &amp;&amp; !k2Aligned) { // only k1 aligned
+308                     while (inputP &lt; endP) {
+309                         LOAD_DATA(load, loadu)
+310                         CONVOLVE_4_SAMPLES
+311                     }
+312                 } else { // both non-aligned
+313                     while (inputP &lt; endP) {
+314                         LOAD_DATA(loadu, loadu)
+315                         CONVOLVE_4_SAMPLES
+316                     }
+317                 }
+318 
+319                 // Summarize the SSE results to sum1 and sum2.
+320                 float* groupSumP = reinterpret_cast&lt;float*&gt;(&amp;sums1);
+321                 sum1 += groupSumP[0] + groupSumP[1] + groupSumP[2] + groupSumP[3];
+322                 groupSumP = reinterpret_cast&lt;float*&gt;(&amp;sums2);
+323                 sum2 += groupSumP[0] + groupSumP[1] + groupSumP[2] + groupSumP[3];
+324 
+325                 n %= 4;
+326                 while (n) {
+327                     CONVOLVE_ONE_SAMPLE
+328                     n--;
+329                 }
+330 #else
+331                 // FIXME: add ARM NEON optimizations for the following. The scalar code-path can probably also be optimized better.
+332 
+333                 // Optimize size 32 and size 64 kernels by unrolling the while loop.
+334                 // A 20 - 30% speed improvement was measured in some cases by using this approach.
+335 
+336                 if (n == 32) {
+337                     CONVOLVE_ONE_SAMPLE // 1
+338                     CONVOLVE_ONE_SAMPLE // 2
+339                     CONVOLVE_ONE_SAMPLE // 3
+340                     CONVOLVE_ONE_SAMPLE // 4
+341                     CONVOLVE_ONE_SAMPLE // 5
+342                     CONVOLVE_ONE_SAMPLE // 6
+343                     CONVOLVE_ONE_SAMPLE // 7
+344                     CONVOLVE_ONE_SAMPLE // 8
+345                     CONVOLVE_ONE_SAMPLE // 9
+346                     CONVOLVE_ONE_SAMPLE // 10
+347                     CONVOLVE_ONE_SAMPLE // 11
+348                     CONVOLVE_ONE_SAMPLE // 12
+349                     CONVOLVE_ONE_SAMPLE // 13
+350                     CONVOLVE_ONE_SAMPLE // 14
+351                     CONVOLVE_ONE_SAMPLE // 15
+352                     CONVOLVE_ONE_SAMPLE // 16
+353                     CONVOLVE_ONE_SAMPLE // 17
+354                     CONVOLVE_ONE_SAMPLE // 18
+355                     CONVOLVE_ONE_SAMPLE // 19
+356                     CONVOLVE_ONE_SAMPLE // 20
+357                     CONVOLVE_ONE_SAMPLE // 21
+358                     CONVOLVE_ONE_SAMPLE // 22
+359                     CONVOLVE_ONE_SAMPLE // 23
+360                     CONVOLVE_ONE_SAMPLE // 24
+361                     CONVOLVE_ONE_SAMPLE // 25
+362                     CONVOLVE_ONE_SAMPLE // 26
+363                     CONVOLVE_ONE_SAMPLE // 27
+364                     CONVOLVE_ONE_SAMPLE // 28
+365                     CONVOLVE_ONE_SAMPLE // 29
+366                     CONVOLVE_ONE_SAMPLE // 30
+367                     CONVOLVE_ONE_SAMPLE // 31
+368                     CONVOLVE_ONE_SAMPLE // 32
+369                 } else if (n == 64) {
+370                     CONVOLVE_ONE_SAMPLE // 1
+371                     CONVOLVE_ONE_SAMPLE // 2
+372                     CONVOLVE_ONE_SAMPLE // 3
+373                     CONVOLVE_ONE_SAMPLE // 4
+374                     CONVOLVE_ONE_SAMPLE // 5
+375                     CONVOLVE_ONE_SAMPLE // 6
+376                     CONVOLVE_ONE_SAMPLE // 7
+377                     CONVOLVE_ONE_SAMPLE // 8
+378                     CONVOLVE_ONE_SAMPLE // 9
+379                     CONVOLVE_ONE_SAMPLE // 10
+380                     CONVOLVE_ONE_SAMPLE // 11
+381                     CONVOLVE_ONE_SAMPLE // 12
+382                     CONVOLVE_ONE_SAMPLE // 13
+383                     CONVOLVE_ONE_SAMPLE // 14
+384                     CONVOLVE_ONE_SAMPLE // 15
+385                     CONVOLVE_ONE_SAMPLE // 16
+386                     CONVOLVE_ONE_SAMPLE // 17
+387                     CONVOLVE_ONE_SAMPLE // 18
+388                     CONVOLVE_ONE_SAMPLE // 19
+389                     CONVOLVE_ONE_SAMPLE // 20
+390                     CONVOLVE_ONE_SAMPLE // 21
+391                     CONVOLVE_ONE_SAMPLE // 22
+392                     CONVOLVE_ONE_SAMPLE // 23
+393                     CONVOLVE_ONE_SAMPLE // 24
+394                     CONVOLVE_ONE_SAMPLE // 25
+395                     CONVOLVE_ONE_SAMPLE // 26
+396                     CONVOLVE_ONE_SAMPLE // 27
+397                     CONVOLVE_ONE_SAMPLE // 28
+398                     CONVOLVE_ONE_SAMPLE // 29
+399                     CONVOLVE_ONE_SAMPLE // 30
+400                     CONVOLVE_ONE_SAMPLE // 31
+401                     CONVOLVE_ONE_SAMPLE // 32
+402                     CONVOLVE_ONE_SAMPLE // 33
+403                     CONVOLVE_ONE_SAMPLE // 34
+404                     CONVOLVE_ONE_SAMPLE // 35
+405                     CONVOLVE_ONE_SAMPLE // 36
+406                     CONVOLVE_ONE_SAMPLE // 37
+407                     CONVOLVE_ONE_SAMPLE // 38
+408                     CONVOLVE_ONE_SAMPLE // 39
+409                     CONVOLVE_ONE_SAMPLE // 40
+410                     CONVOLVE_ONE_SAMPLE // 41
+411                     CONVOLVE_ONE_SAMPLE // 42
+412                     CONVOLVE_ONE_SAMPLE // 43
+413                     CONVOLVE_ONE_SAMPLE // 44
+414                     CONVOLVE_ONE_SAMPLE // 45
+415                     CONVOLVE_ONE_SAMPLE // 46
+416                     CONVOLVE_ONE_SAMPLE // 47
+417                     CONVOLVE_ONE_SAMPLE // 48
+418                     CONVOLVE_ONE_SAMPLE // 49
+419                     CONVOLVE_ONE_SAMPLE // 50
+420                     CONVOLVE_ONE_SAMPLE // 51
+421                     CONVOLVE_ONE_SAMPLE // 52
+422                     CONVOLVE_ONE_SAMPLE // 53
+423                     CONVOLVE_ONE_SAMPLE // 54
+424                     CONVOLVE_ONE_SAMPLE // 55
+425                     CONVOLVE_ONE_SAMPLE // 56
+426                     CONVOLVE_ONE_SAMPLE // 57
+427                     CONVOLVE_ONE_SAMPLE // 58
+428                     CONVOLVE_ONE_SAMPLE // 59
+429                     CONVOLVE_ONE_SAMPLE // 60
+430                     CONVOLVE_ONE_SAMPLE // 61
+431                     CONVOLVE_ONE_SAMPLE // 62
+432                     CONVOLVE_ONE_SAMPLE // 63
+433                     CONVOLVE_ONE_SAMPLE // 64
+434                 } else {
+435                     while (n--) {
+436                         // Non-optimized using actual while loop.
+437                         CONVOLVE_ONE_SAMPLE
+438                     }
+439                 }
+440 #endif
+441             }
+442 
+443             // Linearly interpolate the two &quot;convolutions&quot;.
+444             double result = (1.0 - kernelInterpolationFactor) * sum1 + kernelInterpolationFactor * sum2;
+445 
+446             *destination++ = result;
+447 
+448             // Advance the virtual index.
+449             m_virtualSourceIndex += m_scaleFactor;
+450 
+451             --numberOfDestinationFrames;
+452             if (!numberOfDestinationFrames)
+453                 return;
+454         }
+455 
+456         // Wrap back around to the start.
+457         m_virtualSourceIndex -= m_blockSize;
+458 
+459         // Step (3) Copy r3 to r1 and r4 to r2.
+460         // This wraps the last input frames back to the start of the buffer.
+461         memcpy(r1, r3, sizeof(float) * (m_kernelSize / 2));
+462         memcpy(r2, r4, sizeof(float) * (m_kernelSize / 2));
+463 
+464         // Step (4)
+465         // Refresh the buffer with more input.
+466         consumeSource(r5, m_blockSize);
+467     }
+468 }
+469 
+470 } // namespace WebCore
+471 
+472 #endif // ENABLE(WEB_AUDIO)
+    </pre>
+  </body>
+</html>
