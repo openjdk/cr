@@ -1,0 +1,1419 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Old src/hotspot/share/gc/parallel/psParallelCompact.hpp</title>
+    <link rel="stylesheet" href="../../../../../style.css" />
+  </head>
+  <body>
+    <pre>
+   1 /*
+   2  * Copyright (c) 2005, 2020, Oracle and/or its affiliates. All rights reserved.
+   3  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+   4  *
+   5  * This code is free software; you can redistribute it and/or modify it
+   6  * under the terms of the GNU General Public License version 2 only, as
+   7  * published by the Free Software Foundation.
+   8  *
+   9  * This code is distributed in the hope that it will be useful, but WITHOUT
+  10  * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+  11  * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+  12  * version 2 for more details (a copy is included in the LICENSE file that
+  13  * accompanied this code).
+  14  *
+  15  * You should have received a copy of the GNU General Public License version
+  16  * 2 along with this work; if not, write to the Free Software Foundation,
+  17  * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+  18  *
+  19  * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+  20  * or visit www.oracle.com if you need additional information or have any
+  21  * questions.
+  22  *
+  23  */
+  24 
+  25 #ifndef SHARE_GC_PARALLEL_PSPARALLELCOMPACT_HPP
+  26 #define SHARE_GC_PARALLEL_PSPARALLELCOMPACT_HPP
+  27 
+  28 #include &quot;gc/parallel/mutableSpace.hpp&quot;
+  29 #include &quot;gc/parallel/objectStartArray.hpp&quot;
+  30 #include &quot;gc/parallel/parMarkBitMap.hpp&quot;
+  31 #include &quot;gc/parallel/parallelScavengeHeap.hpp&quot;
+  32 #include &quot;gc/shared/collectedHeap.hpp&quot;
+  33 #include &quot;gc/shared/collectorCounters.hpp&quot;
+  34 #include &quot;oops/oop.hpp&quot;
+  35 #include &quot;runtime/atomic.hpp&quot;
+  36 #include &quot;runtime/orderAccess.hpp&quot;
+  37 
+  38 class ParallelScavengeHeap;
+  39 class PSAdaptiveSizePolicy;
+  40 class PSYoungGen;
+  41 class PSOldGen;
+  42 class ParCompactionManager;
+  43 class ParallelTaskTerminator;
+  44 class PSParallelCompact;
+  45 class PreGCValues;
+  46 class MoveAndUpdateClosure;
+  47 class RefProcTaskExecutor;
+  48 class ParallelOldTracer;
+  49 class STWGCTimer;
+  50 
+  51 // The SplitInfo class holds the information needed to &#39;split&#39; a source region
+  52 // so that the live data can be copied to two destination *spaces*.  Normally,
+  53 // all the live data in a region is copied to a single destination space (e.g.,
+  54 // everything live in a region in eden is copied entirely into the old gen).
+  55 // However, when the heap is nearly full, all the live data in eden may not fit
+  56 // into the old gen.  Copying only some of the regions from eden to old gen
+  57 // requires finding a region that does not contain a partial object (i.e., no
+  58 // live object crosses the region boundary) somewhere near the last object that
+  59 // does fit into the old gen.  Since it&#39;s not always possible to find such a
+  60 // region, splitting is necessary for predictable behavior.
+  61 //
+  62 // A region is always split at the end of the partial object.  This avoids
+  63 // additional tests when calculating the new location of a pointer, which is a
+  64 // very hot code path.  The partial object and everything to its left will be
+  65 // copied to another space (call it dest_space_1).  The live data to the right
+  66 // of the partial object will be copied either within the space itself, or to a
+  67 // different destination space (distinct from dest_space_1).
+  68 //
+  69 // Split points are identified during the summary phase, when region
+  70 // destinations are computed:  data about the split, including the
+  71 // partial_object_size, is recorded in a SplitInfo record and the
+  72 // partial_object_size field in the summary data is set to zero.  The zeroing is
+  73 // possible (and necessary) since the partial object will move to a different
+  74 // destination space than anything to its right, thus the partial object should
+  75 // not affect the locations of any objects to its right.
+  76 //
+  77 // The recorded data is used during the compaction phase, but only rarely:  when
+  78 // the partial object on the split region will be copied across a destination
+  79 // region boundary.  This test is made once each time a region is filled, and is
+  80 // a simple address comparison, so the overhead is negligible (see
+  81 // PSParallelCompact::first_src_addr()).
+  82 //
+  83 // Notes:
+  84 //
+  85 // Only regions with partial objects are split; a region without a partial
+  86 // object does not need any extra bookkeeping.
+  87 //
+  88 // At most one region is split per space, so the amount of data required is
+  89 // constant.
+  90 //
+  91 // A region is split only when the destination space would overflow.  Once that
+  92 // happens, the destination space is abandoned and no other data (even from
+  93 // other source spaces) is targeted to that destination space.  Abandoning the
+  94 // destination space may leave a somewhat large unused area at the end, if a
+  95 // large object caused the overflow.
+  96 //
+  97 // Future work:
+  98 //
+  99 // More bookkeeping would be required to continue to use the destination space.
+ 100 // The most general solution would allow data from regions in two different
+ 101 // source spaces to be &quot;joined&quot; in a single destination region.  At the very
+ 102 // least, additional code would be required in next_src_region() to detect the
+ 103 // join and skip to an out-of-order source region.  If the join region was also
+ 104 // the last destination region to which a split region was copied (the most
+ 105 // likely case), then additional work would be needed to get fill_region() to
+ 106 // stop iteration and switch to a new source region at the right point.  Basic
+ 107 // idea would be to use a fake value for the top of the source space.  It is
+ 108 // doable, if a bit tricky.
+ 109 //
+ 110 // A simpler (but less general) solution would fill the remainder of the
+ 111 // destination region with a dummy object and continue filling the next
+ 112 // destination region.
+ 113 
+ 114 class SplitInfo
+ 115 {
+ 116 public:
+ 117   // Return true if this split info is valid (i.e., if a split has been
+ 118   // recorded).  The very first region cannot have a partial object and thus is
+ 119   // never split, so 0 is the &#39;invalid&#39; value.
+ 120   bool is_valid() const { return _src_region_idx &gt; 0; }
+ 121 
+ 122   // Return true if this split holds data for the specified source region.
+ 123   inline bool is_split(size_t source_region) const;
+ 124 
+ 125   // The index of the split region, the size of the partial object on that
+ 126   // region and the destination of the partial object.
+ 127   size_t    src_region_idx() const   { return _src_region_idx; }
+ 128   size_t    partial_obj_size() const { return _partial_obj_size; }
+ 129   HeapWord* destination() const      { return _destination; }
+ 130 
+ 131   // The destination count of the partial object referenced by this split
+ 132   // (either 1 or 2).  This must be added to the destination count of the
+ 133   // remainder of the source region.
+ 134   unsigned int destination_count() const { return _destination_count; }
+ 135 
+ 136   // If a word within the partial object will be written to the first word of a
+ 137   // destination region, this is the address of the destination region;
+ 138   // otherwise this is NULL.
+ 139   HeapWord* dest_region_addr() const     { return _dest_region_addr; }
+ 140 
+ 141   // If a word within the partial object will be written to the first word of a
+ 142   // destination region, this is the address of that word within the partial
+ 143   // object; otherwise this is NULL.
+ 144   HeapWord* first_src_addr() const       { return _first_src_addr; }
+ 145 
+ 146   // Record the data necessary to split the region src_region_idx.
+ 147   void record(size_t src_region_idx, size_t partial_obj_size,
+ 148               HeapWord* destination);
+ 149 
+ 150   void clear();
+ 151 
+ 152   DEBUG_ONLY(void verify_clear();)
+ 153 
+ 154 private:
+ 155   size_t       _src_region_idx;
+ 156   size_t       _partial_obj_size;
+ 157   HeapWord*    _destination;
+ 158   unsigned int _destination_count;
+ 159   HeapWord*    _dest_region_addr;
+ 160   HeapWord*    _first_src_addr;
+ 161 };
+ 162 
+ 163 inline bool SplitInfo::is_split(size_t region_idx) const
+ 164 {
+ 165   return _src_region_idx == region_idx &amp;&amp; is_valid();
+ 166 }
+ 167 
+ 168 class SpaceInfo
+ 169 {
+ 170  public:
+ 171   MutableSpace* space() const { return _space; }
+ 172 
+ 173   // Where the free space will start after the collection.  Valid only after the
+ 174   // summary phase completes.
+ 175   HeapWord* new_top() const { return _new_top; }
+ 176 
+ 177   // Allows new_top to be set.
+ 178   HeapWord** new_top_addr() { return &amp;_new_top; }
+ 179 
+ 180   // Where the smallest allowable dense prefix ends (used only for perm gen).
+ 181   HeapWord* min_dense_prefix() const { return _min_dense_prefix; }
+ 182 
+ 183   // Where the dense prefix ends, or the compacted region begins.
+ 184   HeapWord* dense_prefix() const { return _dense_prefix; }
+ 185 
+ 186   // The start array for the (generation containing the) space, or NULL if there
+ 187   // is no start array.
+ 188   ObjectStartArray* start_array() const { return _start_array; }
+ 189 
+ 190   SplitInfo&amp; split_info() { return _split_info; }
+ 191 
+ 192   void set_space(MutableSpace* s)           { _space = s; }
+ 193   void set_new_top(HeapWord* addr)          { _new_top = addr; }
+ 194   void set_min_dense_prefix(HeapWord* addr) { _min_dense_prefix = addr; }
+ 195   void set_dense_prefix(HeapWord* addr)     { _dense_prefix = addr; }
+ 196   void set_start_array(ObjectStartArray* s) { _start_array = s; }
+ 197 
+ 198   void publish_new_top() const              { _space-&gt;set_top(_new_top); }
+ 199 
+ 200  private:
+ 201   MutableSpace*     _space;
+ 202   HeapWord*         _new_top;
+ 203   HeapWord*         _min_dense_prefix;
+ 204   HeapWord*         _dense_prefix;
+ 205   ObjectStartArray* _start_array;
+ 206   SplitInfo         _split_info;
+ 207 };
+ 208 
+ 209 class ParallelCompactData
+ 210 {
+ 211 public:
+ 212   // Sizes are in HeapWords, unless indicated otherwise.
+ 213   static const size_t Log2RegionSize;
+ 214   static const size_t RegionSize;
+ 215   static const size_t RegionSizeBytes;
+ 216 
+ 217   // Mask for the bits in a size_t to get an offset within a region.
+ 218   static const size_t RegionSizeOffsetMask;
+ 219   // Mask for the bits in a pointer to get an offset within a region.
+ 220   static const size_t RegionAddrOffsetMask;
+ 221   // Mask for the bits in a pointer to get the address of the start of a region.
+ 222   static const size_t RegionAddrMask;
+ 223 
+ 224   static const size_t Log2BlockSize;
+ 225   static const size_t BlockSize;
+ 226   static const size_t BlockSizeBytes;
+ 227 
+ 228   static const size_t BlockSizeOffsetMask;
+ 229   static const size_t BlockAddrOffsetMask;
+ 230   static const size_t BlockAddrMask;
+ 231 
+ 232   static const size_t BlocksPerRegion;
+ 233   static const size_t Log2BlocksPerRegion;
+ 234 
+ 235   class RegionData
+ 236   {
+ 237   public:
+ 238     // Destination address of the region.
+ 239     HeapWord* destination() const { return _destination; }
+ 240 
+ 241     // The first region containing data destined for this region.
+ 242     size_t source_region() const { return _source_region; }
+ 243 
+ 244     // Reuse _source_region to store the corresponding shadow region index
+ 245     size_t shadow_region() const { return _source_region; }
+ 246 
+ 247     // The object (if any) starting in this region and ending in a different
+ 248     // region that could not be updated during the main (parallel) compaction
+ 249     // phase.  This is different from _partial_obj_addr, which is an object that
+ 250     // extends onto a source region.  However, the two uses do not overlap in
+ 251     // time, so the same field is used to save space.
+ 252     HeapWord* deferred_obj_addr() const { return _partial_obj_addr; }
+ 253 
+ 254     // The starting address of the partial object extending onto the region.
+ 255     HeapWord* partial_obj_addr() const { return _partial_obj_addr; }
+ 256 
+ 257     // Size of the partial object extending onto the region (words).
+ 258     size_t partial_obj_size() const { return _partial_obj_size; }
+ 259 
+ 260     // Size of live data that lies within this region due to objects that start
+ 261     // in this region (words).  This does not include the partial object
+ 262     // extending onto the region (if any), or the part of an object that extends
+ 263     // onto the next region (if any).
+ 264     size_t live_obj_size() const { return _dc_and_los &amp; los_mask; }
+ 265 
+ 266     // Total live data that lies within the region (words).
+ 267     size_t data_size() const { return partial_obj_size() + live_obj_size(); }
+ 268 
+ 269     // The destination_count is the number of other regions to which data from
+ 270     // this region will be copied.  At the end of the summary phase, the valid
+ 271     // values of destination_count are
+ 272     //
+ 273     // 0 - data from the region will be compacted completely into itself, or the
+ 274     //     region is empty.  The region can be claimed and then filled.
+ 275     // 1 - data from the region will be compacted into 1 other region; some
+ 276     //     data from the region may also be compacted into the region itself.
+ 277     // 2 - data from the region will be copied to 2 other regions.
+ 278     //
+ 279     // During compaction as regions are emptied, the destination_count is
+ 280     // decremented (atomically) and when it reaches 0, it can be claimed and
+ 281     // then filled.
+ 282     //
+ 283     // A region is claimed for processing by atomically changing the
+ 284     // destination_count to the claimed value (dc_claimed).  After a region has
+ 285     // been filled, the destination_count should be set to the completed value
+ 286     // (dc_completed).
+ 287     inline uint destination_count() const;
+ 288     inline uint destination_count_raw() const;
+ 289 
+ 290     // Whether the block table for this region has been filled.
+ 291     inline bool blocks_filled() const;
+ 292 
+ 293     // Number of times the block table was filled.
+ 294     DEBUG_ONLY(inline size_t blocks_filled_count() const;)
+ 295 
+ 296     // The location of the java heap data that corresponds to this region.
+ 297     inline HeapWord* data_location() const;
+ 298 
+ 299     // The highest address referenced by objects in this region.
+ 300     inline HeapWord* highest_ref() const;
+ 301 
+ 302     // Whether this region is available to be claimed, has been claimed, or has
+ 303     // been completed.
+ 304     //
+ 305     // Minor subtlety:  claimed() returns true if the region is marked
+ 306     // completed(), which is desirable since a region must be claimed before it
+ 307     // can be completed.
+ 308     bool available() const { return _dc_and_los &lt; dc_one; }
+ 309     bool claimed()   const { return _dc_and_los &gt;= dc_claimed; }
+ 310     bool completed() const { return _dc_and_los &gt;= dc_completed; }
+ 311 
+ 312     // These are not atomic.
+ 313     void set_destination(HeapWord* addr)       { _destination = addr; }
+ 314     void set_source_region(size_t region)      { _source_region = region; }
+ 315     void set_shadow_region(size_t region)      { _source_region = region; }
+ 316     void set_deferred_obj_addr(HeapWord* addr) { _partial_obj_addr = addr; }
+ 317     void set_partial_obj_addr(HeapWord* addr)  { _partial_obj_addr = addr; }
+ 318     void set_partial_obj_size(size_t words)    {
+ 319       _partial_obj_size = (region_sz_t) words;
+ 320     }
+ 321     inline void set_blocks_filled();
+ 322 
+ 323     inline void set_destination_count(uint count);
+ 324     inline void set_live_obj_size(size_t words);
+ 325     inline void set_data_location(HeapWord* addr);
+ 326     inline void set_completed();
+ 327     inline bool claim_unsafe();
+ 328 
+ 329     // These are atomic.
+ 330     inline void add_live_obj(size_t words);
+ 331     inline void set_highest_ref(HeapWord* addr);
+ 332     inline void decrement_destination_count();
+ 333     inline bool claim();
+ 334 
+ 335     // Possible values of _shadow_state, and transition is as follows
+ 336     // Normal Path:
+ 337     // UnusedRegion -&gt; mark_normal() -&gt; NormalRegion
+ 338     // Shadow Path:
+ 339     // UnusedRegion -&gt; mark_shadow() -&gt; ShadowRegion -&gt;
+ 340     // mark_filled() -&gt; FilledShadow -&gt; mark_copied() -&gt; CopiedShadow
+ 341     static const int UnusedRegion = 0; // The region is not collected yet
+ 342     static const int ShadowRegion = 1; // Stolen by an idle thread, and a shadow region is created for it
+ 343     static const int FilledShadow = 2; // Its shadow region has been filled and ready to be copied back
+ 344     static const int CopiedShadow = 3; // The data of the shadow region has been copied back
+ 345     static const int NormalRegion = 4; // The region will be collected by the original parallel algorithm
+ 346 
+ 347     // Mark the current region as normal or shadow to enter different processing paths
+ 348     inline bool mark_normal();
+ 349     inline bool mark_shadow();
+ 350     // Mark the shadow region as filled and ready to be copied back
+ 351     inline void mark_filled();
+ 352     // Mark the shadow region as copied back to avoid double copying.
+ 353     inline bool mark_copied();
+ 354     // Special case: see the comment in PSParallelCompact::fill_and_update_shadow_region.
+ 355     // Return to the normal path here
+ 356     inline void shadow_to_normal();
+ 357 
+ 358 
+ 359     int shadow_state() { return _shadow_state; }
+ 360 
+ 361   private:
+ 362     // The type used to represent object sizes within a region.
+ 363     typedef uint region_sz_t;
+ 364 
+ 365     // Constants for manipulating the _dc_and_los field, which holds both the
+ 366     // destination count and live obj size.  The live obj size lives at the
+ 367     // least significant end so no masking is necessary when adding.
+ 368     static const region_sz_t dc_shift;           // Shift amount.
+ 369     static const region_sz_t dc_mask;            // Mask for destination count.
+ 370     static const region_sz_t dc_one;             // 1, shifted appropriately.
+ 371     static const region_sz_t dc_claimed;         // Region has been claimed.
+ 372     static const region_sz_t dc_completed;       // Region has been completed.
+ 373     static const region_sz_t los_mask;           // Mask for live obj size.
+ 374 
+ 375     HeapWord*            _destination;
+ 376     size_t               _source_region;
+ 377     HeapWord*            _partial_obj_addr;
+ 378     region_sz_t          _partial_obj_size;
+ 379     region_sz_t volatile _dc_and_los;
+ 380     bool        volatile _blocks_filled;
+ 381     int         volatile _shadow_state;
+ 382 
+ 383 #ifdef ASSERT
+ 384     size_t               _blocks_filled_count;   // Number of block table fills.
+ 385 
+ 386     // These enable optimizations that are only partially implemented.  Use
+ 387     // debug builds to prevent the code fragments from breaking.
+ 388     HeapWord*            _data_location;
+ 389     HeapWord*            _highest_ref;
+ 390 #endif  // #ifdef ASSERT
+ 391 
+ 392 #ifdef ASSERT
+ 393    public:
+ 394     uint                 _pushed;   // 0 until region is pushed onto a stack
+ 395    private:
+ 396 #endif
+ 397   };
+ 398 
+ 399   // &quot;Blocks&quot; allow shorter sections of the bitmap to be searched.  Each Block
+ 400   // holds an offset, which is the amount of live data in the Region to the left
+ 401   // of the first live object that starts in the Block.
+ 402   class BlockData
+ 403   {
+ 404   public:
+ 405     typedef unsigned short int blk_ofs_t;
+ 406 
+ 407     blk_ofs_t offset() const    { return _offset; }
+ 408     void set_offset(size_t val) { _offset = (blk_ofs_t)val; }
+ 409 
+ 410   private:
+ 411     blk_ofs_t _offset;
+ 412   };
+ 413 
+ 414 public:
+ 415   ParallelCompactData();
+ 416   bool initialize(MemRegion covered_region);
+ 417 
+ 418   size_t region_count() const { return _region_count; }
+ 419   size_t reserved_byte_size() const { return _reserved_byte_size; }
+ 420 
+ 421   // Convert region indices to/from RegionData pointers.
+ 422   inline RegionData* region(size_t region_idx) const;
+ 423   inline size_t     region(const RegionData* const region_ptr) const;
+ 424 
+ 425   size_t block_count() const { return _block_count; }
+ 426   inline BlockData* block(size_t block_idx) const;
+ 427   inline size_t     block(const BlockData* block_ptr) const;
+ 428 
+ 429   void add_obj(HeapWord* addr, size_t len);
+ 430   void add_obj(oop p, size_t len) { add_obj(cast_from_oop&lt;HeapWord*&gt;(p), len); }
+ 431 
+ 432   // Fill in the regions covering [beg, end) so that no data moves; i.e., the
+ 433   // destination of region n is simply the start of region n.  The argument beg
+ 434   // must be region-aligned; end need not be.
+ 435   void summarize_dense_prefix(HeapWord* beg, HeapWord* end);
+ 436 
+ 437   HeapWord* summarize_split_space(size_t src_region, SplitInfo&amp; split_info,
+ 438                                   HeapWord* destination, HeapWord* target_end,
+ 439                                   HeapWord** target_next);
+ 440   bool summarize(SplitInfo&amp; split_info,
+ 441                  HeapWord* source_beg, HeapWord* source_end,
+ 442                  HeapWord** source_next,
+ 443                  HeapWord* target_beg, HeapWord* target_end,
+ 444                  HeapWord** target_next);
+ 445 
+ 446   void clear();
+ 447   void clear_range(size_t beg_region, size_t end_region);
+ 448   void clear_range(HeapWord* beg, HeapWord* end) {
+ 449     clear_range(addr_to_region_idx(beg), addr_to_region_idx(end));
+ 450   }
+ 451 
+ 452   // Return the number of words between addr and the start of the region
+ 453   // containing addr.
+ 454   inline size_t     region_offset(const HeapWord* addr) const;
+ 455 
+ 456   // Convert addresses to/from a region index or region pointer.
+ 457   inline size_t     addr_to_region_idx(const HeapWord* addr) const;
+ 458   inline RegionData* addr_to_region_ptr(const HeapWord* addr) const;
+ 459   inline HeapWord*  region_to_addr(size_t region) const;
+ 460   inline HeapWord*  region_to_addr(size_t region, size_t offset) const;
+ 461   inline HeapWord*  region_to_addr(const RegionData* region) const;
+ 462 
+ 463   inline HeapWord*  region_align_down(HeapWord* addr) const;
+ 464   inline HeapWord*  region_align_up(HeapWord* addr) const;
+ 465   inline bool       is_region_aligned(HeapWord* addr) const;
+ 466 
+ 467   // Analogous to region_offset() for blocks.
+ 468   size_t     block_offset(const HeapWord* addr) const;
+ 469   size_t     addr_to_block_idx(const HeapWord* addr) const;
+ 470   size_t     addr_to_block_idx(const oop obj) const {
+ 471     return addr_to_block_idx(cast_from_oop&lt;HeapWord*&gt;(obj));
+ 472   }
+ 473   inline BlockData* addr_to_block_ptr(const HeapWord* addr) const;
+ 474   inline HeapWord*  block_to_addr(size_t block) const;
+ 475   inline size_t     region_to_block_idx(size_t region) const;
+ 476 
+ 477   inline HeapWord*  block_align_down(HeapWord* addr) const;
+ 478   inline HeapWord*  block_align_up(HeapWord* addr) const;
+ 479   inline bool       is_block_aligned(HeapWord* addr) const;
+ 480 
+ 481   // Return the address one past the end of the partial object.
+ 482   HeapWord* partial_obj_end(size_t region_idx) const;
+ 483 
+ 484   // Return the location of the object after compaction.
+ 485   HeapWord* calc_new_pointer(HeapWord* addr, ParCompactionManager* cm);
+ 486 
+ 487   HeapWord* calc_new_pointer(oop p, ParCompactionManager* cm) {
+ 488     return calc_new_pointer(cast_from_oop&lt;HeapWord*&gt;(p), cm);
+ 489   }
+ 490 
+ 491 #ifdef  ASSERT
+ 492   void verify_clear(const PSVirtualSpace* vspace);
+ 493   void verify_clear();
+ 494 #endif  // #ifdef ASSERT
+ 495 
+ 496 private:
+ 497   bool initialize_block_data();
+ 498   bool initialize_region_data(size_t region_size);
+ 499   PSVirtualSpace* create_vspace(size_t count, size_t element_size);
+ 500 
+ 501 private:
+ 502   HeapWord*       _region_start;
+ 503 #ifdef  ASSERT
+ 504   HeapWord*       _region_end;
+ 505 #endif  // #ifdef ASSERT
+ 506 
+ 507   PSVirtualSpace* _region_vspace;
+ 508   size_t          _reserved_byte_size;
+ 509   RegionData*     _region_data;
+ 510   size_t          _region_count;
+ 511 
+ 512   PSVirtualSpace* _block_vspace;
+ 513   BlockData*      _block_data;
+ 514   size_t          _block_count;
+ 515 };
+ 516 
+ 517 inline uint
+ 518 ParallelCompactData::RegionData::destination_count_raw() const
+ 519 {
+ 520   return _dc_and_los &amp; dc_mask;
+ 521 }
+ 522 
+ 523 inline uint
+ 524 ParallelCompactData::RegionData::destination_count() const
+ 525 {
+ 526   return destination_count_raw() &gt;&gt; dc_shift;
+ 527 }
+ 528 
+ 529 inline bool
+ 530 ParallelCompactData::RegionData::blocks_filled() const
+ 531 {
+ 532   bool result = _blocks_filled;
+ 533   OrderAccess::acquire();
+ 534   return result;
+ 535 }
+ 536 
+ 537 #ifdef ASSERT
+ 538 inline size_t
+ 539 ParallelCompactData::RegionData::blocks_filled_count() const
+ 540 {
+ 541   return _blocks_filled_count;
+ 542 }
+ 543 #endif // #ifdef ASSERT
+ 544 
+ 545 inline void
+ 546 ParallelCompactData::RegionData::set_blocks_filled()
+ 547 {
+ 548   OrderAccess::release();
+ 549   _blocks_filled = true;
+ 550   // Debug builds count the number of times the table was filled.
+ 551   DEBUG_ONLY(Atomic::inc(&amp;_blocks_filled_count));
+ 552 }
+ 553 
+ 554 inline void
+ 555 ParallelCompactData::RegionData::set_destination_count(uint count)
+ 556 {
+ 557   assert(count &lt;= (dc_completed &gt;&gt; dc_shift), &quot;count too large&quot;);
+ 558   const region_sz_t live_sz = (region_sz_t) live_obj_size();
+ 559   _dc_and_los = (count &lt;&lt; dc_shift) | live_sz;
+ 560 }
+ 561 
+ 562 inline void ParallelCompactData::RegionData::set_live_obj_size(size_t words)
+ 563 {
+ 564   assert(words &lt;= los_mask, &quot;would overflow&quot;);
+ 565   _dc_and_los = destination_count_raw() | (region_sz_t)words;
+ 566 }
+ 567 
+ 568 inline void ParallelCompactData::RegionData::decrement_destination_count()
+ 569 {
+ 570   assert(_dc_and_los &lt; dc_claimed, &quot;already claimed&quot;);
+ 571   assert(_dc_and_los &gt;= dc_one, &quot;count would go negative&quot;);
+ 572   Atomic::add(&amp;_dc_and_los, dc_mask);
+ 573 }
+ 574 
+ 575 inline HeapWord* ParallelCompactData::RegionData::data_location() const
+ 576 {
+ 577   DEBUG_ONLY(return _data_location;)
+ 578   NOT_DEBUG(return NULL;)
+ 579 }
+ 580 
+ 581 inline HeapWord* ParallelCompactData::RegionData::highest_ref() const
+ 582 {
+ 583   DEBUG_ONLY(return _highest_ref;)
+ 584   NOT_DEBUG(return NULL;)
+ 585 }
+ 586 
+ 587 inline void ParallelCompactData::RegionData::set_data_location(HeapWord* addr)
+ 588 {
+ 589   DEBUG_ONLY(_data_location = addr;)
+ 590 }
+ 591 
+ 592 inline void ParallelCompactData::RegionData::set_completed()
+ 593 {
+ 594   assert(claimed(), &quot;must be claimed first&quot;);
+ 595   _dc_and_los = dc_completed | (region_sz_t) live_obj_size();
+ 596 }
+ 597 
+ 598 // MT-unsafe claiming of a region.  Should only be used during single threaded
+ 599 // execution.
+ 600 inline bool ParallelCompactData::RegionData::claim_unsafe()
+ 601 {
+ 602   if (available()) {
+ 603     _dc_and_los |= dc_claimed;
+ 604     return true;
+ 605   }
+ 606   return false;
+ 607 }
+ 608 
+ 609 inline void ParallelCompactData::RegionData::add_live_obj(size_t words)
+ 610 {
+ 611   assert(words &lt;= (size_t)los_mask - live_obj_size(), &quot;overflow&quot;);
+ 612   Atomic::add(&amp;_dc_and_los, static_cast&lt;region_sz_t&gt;(words));
+ 613 }
+ 614 
+ 615 inline void ParallelCompactData::RegionData::set_highest_ref(HeapWord* addr)
+ 616 {
+ 617 #ifdef ASSERT
+ 618   HeapWord* tmp = _highest_ref;
+ 619   while (addr &gt; tmp) {
+ 620     tmp = Atomic::cmpxchg(&amp;_highest_ref, tmp, addr);
+ 621   }
+ 622 #endif  // #ifdef ASSERT
+ 623 }
+ 624 
+ 625 inline bool ParallelCompactData::RegionData::claim()
+ 626 {
+ 627   const region_sz_t los = static_cast&lt;region_sz_t&gt;(live_obj_size());
+ 628   const region_sz_t old = Atomic::cmpxchg(&amp;_dc_and_los, los, dc_claimed | los);
+ 629   return old == los;
+ 630 }
+ 631 
+ 632 inline bool ParallelCompactData::RegionData::mark_normal() {
+ 633   return Atomic::cmpxchg(&amp;_shadow_state, UnusedRegion, NormalRegion) == UnusedRegion;
+ 634 }
+ 635 
+ 636 inline bool ParallelCompactData::RegionData::mark_shadow() {
+ 637   if (_shadow_state != UnusedRegion) return false;
+ 638   return Atomic::cmpxchg(&amp;_shadow_state, UnusedRegion, ShadowRegion) == UnusedRegion;
+ 639 }
+ 640 
+ 641 inline void ParallelCompactData::RegionData::mark_filled() {
+ 642   int old = Atomic::cmpxchg(&amp;_shadow_state, ShadowRegion, FilledShadow);
+ 643   assert(old == ShadowRegion, &quot;Fail to mark the region as filled&quot;);
+ 644 }
+ 645 
+ 646 inline bool ParallelCompactData::RegionData::mark_copied() {
+ 647   return Atomic::cmpxchg(&amp;_shadow_state, FilledShadow, CopiedShadow) == FilledShadow;
+ 648 }
+ 649 
+ 650 void ParallelCompactData::RegionData::shadow_to_normal() {
+ 651   int old = Atomic::cmpxchg(&amp;_shadow_state, ShadowRegion, NormalRegion);
+ 652   assert(old == ShadowRegion, &quot;Fail to mark the region as finish&quot;);
+ 653 }
+ 654 
+ 655 inline ParallelCompactData::RegionData*
+ 656 ParallelCompactData::region(size_t region_idx) const
+ 657 {
+ 658   assert(region_idx &lt;= region_count(), &quot;bad arg&quot;);
+ 659   return _region_data + region_idx;
+ 660 }
+ 661 
+ 662 inline size_t
+ 663 ParallelCompactData::region(const RegionData* const region_ptr) const
+ 664 {
+ 665   assert(region_ptr &gt;= _region_data, &quot;bad arg&quot;);
+ 666   assert(region_ptr &lt;= _region_data + region_count(), &quot;bad arg&quot;);
+ 667   return pointer_delta(region_ptr, _region_data, sizeof(RegionData));
+ 668 }
+ 669 
+ 670 inline ParallelCompactData::BlockData*
+ 671 ParallelCompactData::block(size_t n) const {
+ 672   assert(n &lt; block_count(), &quot;bad arg&quot;);
+ 673   return _block_data + n;
+ 674 }
+ 675 
+ 676 inline size_t
+ 677 ParallelCompactData::region_offset(const HeapWord* addr) const
+ 678 {
+ 679   assert(addr &gt;= _region_start, &quot;bad addr&quot;);
+ 680   assert(addr &lt;= _region_end, &quot;bad addr&quot;);
+ 681   return (size_t(addr) &amp; RegionAddrOffsetMask) &gt;&gt; LogHeapWordSize;
+ 682 }
+ 683 
+ 684 inline size_t
+ 685 ParallelCompactData::addr_to_region_idx(const HeapWord* addr) const
+ 686 {
+ 687   assert(addr &gt;= _region_start, &quot;bad addr &quot; PTR_FORMAT &quot; _region_start &quot; PTR_FORMAT, p2i(addr), p2i(_region_start));
+ 688   assert(addr &lt;= _region_end, &quot;bad addr &quot; PTR_FORMAT &quot; _region_end &quot; PTR_FORMAT, p2i(addr), p2i(_region_end));
+ 689   return pointer_delta(addr, _region_start) &gt;&gt; Log2RegionSize;
+ 690 }
+ 691 
+ 692 inline ParallelCompactData::RegionData*
+ 693 ParallelCompactData::addr_to_region_ptr(const HeapWord* addr) const
+ 694 {
+ 695   return region(addr_to_region_idx(addr));
+ 696 }
+ 697 
+ 698 inline HeapWord*
+ 699 ParallelCompactData::region_to_addr(size_t region) const
+ 700 {
+ 701   assert(region &lt;= _region_count, &quot;region out of range&quot;);
+ 702   return _region_start + (region &lt;&lt; Log2RegionSize);
+ 703 }
+ 704 
+ 705 inline HeapWord*
+ 706 ParallelCompactData::region_to_addr(const RegionData* region) const
+ 707 {
+ 708   return region_to_addr(pointer_delta(region, _region_data,
+ 709                                       sizeof(RegionData)));
+ 710 }
+ 711 
+ 712 inline HeapWord*
+ 713 ParallelCompactData::region_to_addr(size_t region, size_t offset) const
+ 714 {
+ 715   assert(region &lt;= _region_count, &quot;region out of range&quot;);
+ 716   assert(offset &lt; RegionSize, &quot;offset too big&quot;);  // This may be too strict.
+ 717   return region_to_addr(region) + offset;
+ 718 }
+ 719 
+ 720 inline HeapWord*
+ 721 ParallelCompactData::region_align_down(HeapWord* addr) const
+ 722 {
+ 723   assert(addr &gt;= _region_start, &quot;bad addr&quot;);
+ 724   assert(addr &lt; _region_end + RegionSize, &quot;bad addr&quot;);
+ 725   return (HeapWord*)(size_t(addr) &amp; RegionAddrMask);
+ 726 }
+ 727 
+ 728 inline HeapWord*
+ 729 ParallelCompactData::region_align_up(HeapWord* addr) const
+ 730 {
+ 731   assert(addr &gt;= _region_start, &quot;bad addr&quot;);
+ 732   assert(addr &lt;= _region_end, &quot;bad addr&quot;);
+ 733   return region_align_down(addr + RegionSizeOffsetMask);
+ 734 }
+ 735 
+ 736 inline bool
+ 737 ParallelCompactData::is_region_aligned(HeapWord* addr) const
+ 738 {
+ 739   return region_offset(addr) == 0;
+ 740 }
+ 741 
+ 742 inline size_t
+ 743 ParallelCompactData::block_offset(const HeapWord* addr) const
+ 744 {
+ 745   assert(addr &gt;= _region_start, &quot;bad addr&quot;);
+ 746   assert(addr &lt;= _region_end, &quot;bad addr&quot;);
+ 747   return (size_t(addr) &amp; BlockAddrOffsetMask) &gt;&gt; LogHeapWordSize;
+ 748 }
+ 749 
+ 750 inline size_t
+ 751 ParallelCompactData::addr_to_block_idx(const HeapWord* addr) const
+ 752 {
+ 753   assert(addr &gt;= _region_start, &quot;bad addr&quot;);
+ 754   assert(addr &lt;= _region_end, &quot;bad addr&quot;);
+ 755   return pointer_delta(addr, _region_start) &gt;&gt; Log2BlockSize;
+ 756 }
+ 757 
+ 758 inline ParallelCompactData::BlockData*
+ 759 ParallelCompactData::addr_to_block_ptr(const HeapWord* addr) const
+ 760 {
+ 761   return block(addr_to_block_idx(addr));
+ 762 }
+ 763 
+ 764 inline HeapWord*
+ 765 ParallelCompactData::block_to_addr(size_t block) const
+ 766 {
+ 767   assert(block &lt; _block_count, &quot;block out of range&quot;);
+ 768   return _region_start + (block &lt;&lt; Log2BlockSize);
+ 769 }
+ 770 
+ 771 inline size_t
+ 772 ParallelCompactData::region_to_block_idx(size_t region) const
+ 773 {
+ 774   return region &lt;&lt; Log2BlocksPerRegion;
+ 775 }
+ 776 
+ 777 inline HeapWord*
+ 778 ParallelCompactData::block_align_down(HeapWord* addr) const
+ 779 {
+ 780   assert(addr &gt;= _region_start, &quot;bad addr&quot;);
+ 781   assert(addr &lt; _region_end + RegionSize, &quot;bad addr&quot;);
+ 782   return (HeapWord*)(size_t(addr) &amp; BlockAddrMask);
+ 783 }
+ 784 
+ 785 inline HeapWord*
+ 786 ParallelCompactData::block_align_up(HeapWord* addr) const
+ 787 {
+ 788   assert(addr &gt;= _region_start, &quot;bad addr&quot;);
+ 789   assert(addr &lt;= _region_end, &quot;bad addr&quot;);
+ 790   return block_align_down(addr + BlockSizeOffsetMask);
+ 791 }
+ 792 
+ 793 inline bool
+ 794 ParallelCompactData::is_block_aligned(HeapWord* addr) const
+ 795 {
+ 796   return block_offset(addr) == 0;
+ 797 }
+ 798 
+ 799 // Abstract closure for use with ParMarkBitMap::iterate(), which will invoke the
+ 800 // do_addr() method.
+ 801 //
+ 802 // The closure is initialized with the number of heap words to process
+ 803 // (words_remaining()), and becomes &#39;full&#39; when it reaches 0.  The do_addr()
+ 804 // methods in subclasses should update the total as words are processed.  Since
+ 805 // only one subclass actually uses this mechanism to terminate iteration, the
+ 806 // default initial value is &gt; 0.  The implementation is here and not in the
+ 807 // single subclass that uses it to avoid making is_full() virtual, and thus
+ 808 // adding a virtual call per live object.
+ 809 
+ 810 class ParMarkBitMapClosure: public StackObj {
+ 811  public:
+ 812   typedef ParMarkBitMap::idx_t idx_t;
+ 813   typedef ParMarkBitMap::IterationStatus IterationStatus;
+ 814 
+ 815  public:
+ 816   inline ParMarkBitMapClosure(ParMarkBitMap* mbm, ParCompactionManager* cm,
+ 817                               size_t words = max_uintx);
+ 818 
+ 819   inline ParCompactionManager* compaction_manager() const;
+ 820   inline ParMarkBitMap*        bitmap() const;
+ 821   inline size_t                words_remaining() const;
+ 822   inline bool                  is_full() const;
+ 823   inline HeapWord*             source() const;
+ 824 
+ 825   inline void                  set_source(HeapWord* addr);
+ 826 
+ 827   virtual IterationStatus do_addr(HeapWord* addr, size_t words) = 0;
+ 828 
+ 829  protected:
+ 830   inline void decrement_words_remaining(size_t words);
+ 831 
+ 832  private:
+ 833   ParMarkBitMap* const        _bitmap;
+ 834   ParCompactionManager* const _compaction_manager;
+ 835   DEBUG_ONLY(const size_t     _initial_words_remaining;) // Useful in debugger.
+ 836   size_t                      _words_remaining; // Words left to copy.
+ 837 
+ 838  protected:
+ 839   HeapWord*                   _source;          // Next addr that would be read.
+ 840 };
+ 841 
+ 842 inline
+ 843 ParMarkBitMapClosure::ParMarkBitMapClosure(ParMarkBitMap* bitmap,
+ 844                                            ParCompactionManager* cm,
+ 845                                            size_t words):
+ 846   _bitmap(bitmap), _compaction_manager(cm)
+ 847 #ifdef  ASSERT
+ 848   , _initial_words_remaining(words)
+ 849 #endif
+ 850 {
+ 851   _words_remaining = words;
+ 852   _source = NULL;
+ 853 }
+ 854 
+ 855 inline ParCompactionManager* ParMarkBitMapClosure::compaction_manager() const {
+ 856   return _compaction_manager;
+ 857 }
+ 858 
+ 859 inline ParMarkBitMap* ParMarkBitMapClosure::bitmap() const {
+ 860   return _bitmap;
+ 861 }
+ 862 
+ 863 inline size_t ParMarkBitMapClosure::words_remaining() const {
+ 864   return _words_remaining;
+ 865 }
+ 866 
+ 867 inline bool ParMarkBitMapClosure::is_full() const {
+ 868   return words_remaining() == 0;
+ 869 }
+ 870 
+ 871 inline HeapWord* ParMarkBitMapClosure::source() const {
+ 872   return _source;
+ 873 }
+ 874 
+ 875 inline void ParMarkBitMapClosure::set_source(HeapWord* addr) {
+ 876   _source = addr;
+ 877 }
+ 878 
+ 879 inline void ParMarkBitMapClosure::decrement_words_remaining(size_t words) {
+ 880   assert(_words_remaining &gt;= words, &quot;processed too many words&quot;);
+ 881   _words_remaining -= words;
+ 882 }
+ 883 
+ 884 // The Parallel collector is a stop-the-world garbage collector that
+ 885 // does parts of the collection using parallel threads.  The collection includes
+ 886 // the tenured generation and the young generation.
+ 887 //
+ 888 // There are four phases of the collection.
+ 889 //
+ 890 //      - marking phase
+ 891 //      - summary phase
+ 892 //      - compacting phase
+ 893 //      - clean up phase
+ 894 //
+ 895 // Roughly speaking these phases correspond, respectively, to
+ 896 //      - mark all the live objects
+ 897 //      - calculate the destination of each object at the end of the collection
+ 898 //      - move the objects to their destination
+ 899 //      - update some references and reinitialize some variables
+ 900 //
+ 901 // These three phases are invoked in PSParallelCompact::invoke_no_policy().  The
+ 902 // marking phase is implemented in PSParallelCompact::marking_phase() and does a
+ 903 // complete marking of the heap.  The summary phase is implemented in
+ 904 // PSParallelCompact::summary_phase().  The move and update phase is implemented
+ 905 // in PSParallelCompact::compact().
+ 906 //
+ 907 // A space that is being collected is divided into regions and with each region
+ 908 // is associated an object of type ParallelCompactData.  Each region is of a
+ 909 // fixed size and typically will contain more than 1 object and may have parts
+ 910 // of objects at the front and back of the region.
+ 911 //
+ 912 // region            -----+---------------------+----------
+ 913 // objects covered   [ AAA  )[ BBB )[ CCC   )[ DDD     )
+ 914 //
+ 915 // The marking phase does a complete marking of all live objects in the heap.
+ 916 // The marking also compiles the size of the data for all live objects covered
+ 917 // by the region.  This size includes the part of any live object spanning onto
+ 918 // the region (part of AAA if it is live) from the front, all live objects
+ 919 // contained in the region (BBB and/or CCC if they are live), and the part of
+ 920 // any live objects covered by the region that extends off the region (part of
+ 921 // DDD if it is live).  The marking phase uses multiple GC threads and marking
+ 922 // is done in a bit array of type ParMarkBitMap.  The marking of the bit map is
+ 923 // done atomically as is the accumulation of the size of the live objects
+ 924 // covered by a region.
+ 925 //
+ 926 // The summary phase calculates the total live data to the left of each region
+ 927 // XXX.  Based on that total and the bottom of the space, it can calculate the
+ 928 // starting location of the live data in XXX.  The summary phase calculates for
+ 929 // each region XXX quantities such as
+ 930 //
+ 931 //      - the amount of live data at the beginning of a region from an object
+ 932 //        entering the region.
+ 933 //      - the location of the first live data on the region
+ 934 //      - a count of the number of regions receiving live data from XXX.
+ 935 //
+ 936 // See ParallelCompactData for precise details.  The summary phase also
+ 937 // calculates the dense prefix for the compaction.  The dense prefix is a
+ 938 // portion at the beginning of the space that is not moved.  The objects in the
+ 939 // dense prefix do need to have their object references updated.  See method
+ 940 // summarize_dense_prefix().
+ 941 //
+ 942 // The summary phase is done using 1 GC thread.
+ 943 //
+ 944 // The compaction phase moves objects to their new location and updates all
+ 945 // references in the object.
+ 946 //
+ 947 // A current exception is that objects that cross a region boundary are moved
+ 948 // but do not have their references updated.  References are not updated because
+ 949 // it cannot easily be determined if the klass pointer KKK for the object AAA
+ 950 // has been updated.  KKK likely resides in a region to the left of the region
+ 951 // containing AAA.  These AAA&#39;s have there references updated at the end in a
+ 952 // clean up phase.  See the method PSParallelCompact::update_deferred_objects().
+ 953 // An alternate strategy is being investigated for this deferral of updating.
+ 954 //
+ 955 // Compaction is done on a region basis.  A region that is ready to be filled is
+ 956 // put on a ready list and GC threads take region off the list and fill them.  A
+ 957 // region is ready to be filled if it empty of live objects.  Such a region may
+ 958 // have been initially empty (only contained dead objects) or may have had all
+ 959 // its live objects copied out already.  A region that compacts into itself is
+ 960 // also ready for filling.  The ready list is initially filled with empty
+ 961 // regions and regions compacting into themselves.  There is always at least 1
+ 962 // region that can be put on the ready list.  The regions are atomically added
+ 963 // and removed from the ready list.
+ 964 
+ 965 class TaskQueue;
+ 966 
+ 967 class PSParallelCompact : AllStatic {
+ 968  public:
+ 969   // Convenient access to type names.
+ 970   typedef ParMarkBitMap::idx_t idx_t;
+ 971   typedef ParallelCompactData::RegionData RegionData;
+ 972   typedef ParallelCompactData::BlockData BlockData;
+ 973 
+ 974   typedef enum {
+ 975     old_space_id, eden_space_id,
+ 976     from_space_id, to_space_id, last_space_id
+ 977   } SpaceId;
+ 978 
+ 979   struct UpdateDensePrefixTask : public CHeapObj&lt;mtGC&gt; {
+ 980     SpaceId _space_id;
+ 981     size_t _region_index_start;
+ 982     size_t _region_index_end;
+ 983 
+ 984     UpdateDensePrefixTask() :
+ 985         _space_id(SpaceId(0)),
+ 986         _region_index_start(0),
+ 987         _region_index_end(0) {}
+ 988 
+ 989     UpdateDensePrefixTask(SpaceId space_id,
+ 990                           size_t region_index_start,
+ 991                           size_t region_index_end) :
+ 992         _space_id(space_id),
+ 993         _region_index_start(region_index_start),
+ 994         _region_index_end(region_index_end) {}
+ 995   };
+ 996 
+ 997  public:
+ 998   // Inline closure decls
+ 999   //
+1000   class IsAliveClosure: public BoolObjectClosure {
+1001    public:
+1002     virtual bool do_object_b(oop p);
+1003   };
+1004 
+1005   friend class RefProcTaskProxy;
+1006   friend class PSParallelCompactTest;
+1007 
+1008  private:
+1009   static STWGCTimer           _gc_timer;
+1010   static ParallelOldTracer    _gc_tracer;
+1011   static elapsedTimer         _accumulated_time;
+1012   static unsigned int         _total_invocations;
+1013   static unsigned int         _maximum_compaction_gc_num;
+1014   static jlong                _time_of_last_gc;   // ms
+1015   static CollectorCounters*   _counters;
+1016   static ParMarkBitMap        _mark_bitmap;
+1017   static ParallelCompactData  _summary_data;
+1018   static IsAliveClosure       _is_alive_closure;
+1019   static SpaceInfo            _space_info[last_space_id];
+1020 
+1021   // Reference processing (used in ...follow_contents)
+1022   static SpanSubjectToDiscoveryClosure  _span_based_discoverer;
+1023   static ReferenceProcessor*  _ref_processor;
+1024 
+1025   // Values computed at initialization and used by dead_wood_limiter().
+1026   static double _dwl_mean;
+1027   static double _dwl_std_dev;
+1028   static double _dwl_first_term;
+1029   static double _dwl_adjustment;
+1030 #ifdef  ASSERT
+1031   static bool   _dwl_initialized;
+1032 #endif  // #ifdef ASSERT
+1033 
+1034  public:
+1035   static ParallelOldTracer* gc_tracer() { return &amp;_gc_tracer; }
+1036 
+1037  private:
+1038 
+1039   static void initialize_space_info();
+1040 
+1041   // Clear the marking bitmap and summary data that cover the specified space.
+1042   static void clear_data_covering_space(SpaceId id);
+1043 
+1044   static void pre_compact();
+1045   static void post_compact();
+1046 
+1047   // Mark live objects
+1048   static void marking_phase(ParCompactionManager* cm,
+1049                             bool maximum_heap_compaction,
+1050                             ParallelOldTracer *gc_tracer);
+1051 
+1052   // Compute the dense prefix for the designated space.  This is an experimental
+1053   // implementation currently not used in production.
+1054   static HeapWord* compute_dense_prefix_via_density(const SpaceId id,
+1055                                                     bool maximum_compaction);
+1056 
+1057   // Methods used to compute the dense prefix.
+1058 
+1059   // Compute the value of the normal distribution at x = density.  The mean and
+1060   // standard deviation are values saved by initialize_dead_wood_limiter().
+1061   static inline double normal_distribution(double density);
+1062 
+1063   // Initialize the static vars used by dead_wood_limiter().
+1064   static void initialize_dead_wood_limiter();
+1065 
+1066   // Return the percentage of space that can be treated as &quot;dead wood&quot; (i.e.,
+1067   // not reclaimed).
+1068   static double dead_wood_limiter(double density, size_t min_percent);
+1069 
+1070   // Find the first (left-most) region in the range [beg, end) that has at least
+1071   // dead_words of dead space to the left.  The argument beg must be the first
+1072   // region in the space that is not completely live.
+1073   static RegionData* dead_wood_limit_region(const RegionData* beg,
+1074                                             const RegionData* end,
+1075                                             size_t dead_words);
+1076 
+1077   // Return a pointer to the first region in the range [beg, end) that is not
+1078   // completely full.
+1079   static RegionData* first_dead_space_region(const RegionData* beg,
+1080                                              const RegionData* end);
+1081 
+1082   // Return a value indicating the benefit or &#39;yield&#39; if the compacted region
+1083   // were to start (or equivalently if the dense prefix were to end) at the
+1084   // candidate region.  Higher values are better.
+1085   //
+1086   // The value is based on the amount of space reclaimed vs. the costs of (a)
+1087   // updating references in the dense prefix plus (b) copying objects and
+1088   // updating references in the compacted region.
+1089   static inline double reclaimed_ratio(const RegionData* const candidate,
+1090                                        HeapWord* const bottom,
+1091                                        HeapWord* const top,
+1092                                        HeapWord* const new_top);
+1093 
+1094   // Compute the dense prefix for the designated space.
+1095   static HeapWord* compute_dense_prefix(const SpaceId id,
+1096                                         bool maximum_compaction);
+1097 
+1098   // Return true if dead space crosses onto the specified Region; bit must be
+1099   // the bit index corresponding to the first word of the Region.
+1100   static inline bool dead_space_crosses_boundary(const RegionData* region,
+1101                                                  idx_t bit);
+1102 
+1103   // Summary phase utility routine to fill dead space (if any) at the dense
+1104   // prefix boundary.  Should only be called if the the dense prefix is
+1105   // non-empty.
+1106   static void fill_dense_prefix_end(SpaceId id);
+1107 
+1108   static void summarize_spaces_quick();
+1109   static void summarize_space(SpaceId id, bool maximum_compaction);
+1110   static void summary_phase(ParCompactionManager* cm, bool maximum_compaction);
+1111 
+1112   // Adjust addresses in roots.  Does not adjust addresses in heap.
+1113   static void adjust_roots(ParCompactionManager* cm);
+1114 
+1115   DEBUG_ONLY(static void write_block_fill_histogram();)
+1116 
+1117   // Move objects to new locations.
+1118   static void compact_perm(ParCompactionManager* cm);
+1119   static void compact();
+1120 
+1121   // Add available regions to the stack and draining tasks to the task queue.
+1122   static void prepare_region_draining_tasks(uint parallel_gc_threads);
+1123 
+1124   // Add dense prefix update tasks to the task queue.
+1125   static void enqueue_dense_prefix_tasks(TaskQueue&amp; task_queue,
+1126                                          uint parallel_gc_threads);
+1127 
+1128   // If objects are left in eden after a collection, try to move the boundary
+1129   // and absorb them into the old gen.  Returns true if eden was emptied.
+1130   static bool absorb_live_data_from_eden(PSAdaptiveSizePolicy* size_policy,
+1131                                          PSYoungGen* young_gen,
+1132                                          PSOldGen* old_gen);
+1133 
+1134   // Reset time since last full gc
+1135   static void reset_millis_since_last_gc();
+1136 
+1137 #ifndef PRODUCT
+1138   // Print generic summary data
+1139   static void print_generic_summary_data(ParallelCompactData&amp; summary_data,
+1140                                          HeapWord* const beg_addr,
+1141                                          HeapWord* const end_addr);
+1142 #endif  // #ifndef PRODUCT
+1143 
+1144  public:
+1145 
+1146   PSParallelCompact();
+1147 
+1148   static void invoke(bool maximum_heap_compaction);
+1149   static bool invoke_no_policy(bool maximum_heap_compaction);
+1150 
+1151   static void post_initialize();
+1152   // Perform initialization for PSParallelCompact that requires
+1153   // allocations.  This should be called during the VM initialization
+1154   // at a pointer where it would be appropriate to return a JNI_ENOMEM
+1155   // in the event of a failure.
+1156   static bool initialize();
+1157 
+1158   // Closure accessors
+1159   static BoolObjectClosure* is_alive_closure()     { return (BoolObjectClosure*)&amp;_is_alive_closure; }
+1160 
+1161   // Public accessors
+1162   static elapsedTimer* accumulated_time() { return &amp;_accumulated_time; }
+1163   static unsigned int total_invocations() { return _total_invocations; }
+1164   static CollectorCounters* counters()    { return _counters; }
+1165 
+1166   // Marking support
+1167   static inline bool mark_obj(oop obj);
+1168   static inline bool is_marked(oop obj);
+1169 
+1170   template &lt;class T&gt; static inline void adjust_pointer(T* p, ParCompactionManager* cm);
+1171 
+1172   // Compaction support.
+1173   // Return true if p is in the range [beg_addr, end_addr).
+1174   static inline bool is_in(HeapWord* p, HeapWord* beg_addr, HeapWord* end_addr);
+1175   static inline bool is_in(oop* p, HeapWord* beg_addr, HeapWord* end_addr);
+1176 
+1177   // Convenience wrappers for per-space data kept in _space_info.
+1178   static inline MutableSpace*     space(SpaceId space_id);
+1179   static inline HeapWord*         new_top(SpaceId space_id);
+1180   static inline HeapWord*         dense_prefix(SpaceId space_id);
+1181   static inline ObjectStartArray* start_array(SpaceId space_id);
+1182 
+1183   // Process the end of the given region range in the dense prefix.
+1184   // This includes saving any object not updated.
+1185   static void dense_prefix_regions_epilogue(ParCompactionManager* cm,
+1186                                             size_t region_start_index,
+1187                                             size_t region_end_index,
+1188                                             idx_t exiting_object_offset,
+1189                                             idx_t region_offset_start,
+1190                                             idx_t region_offset_end);
+1191 
+1192   // Update a region in the dense prefix.  For each live object
+1193   // in the region, update it&#39;s interior references.  For each
+1194   // dead object, fill it with deadwood. Dead space at the end
+1195   // of a region range will be filled to the start of the next
+1196   // live object regardless of the region_index_end.  None of the
+1197   // objects in the dense prefix move and dead space is dead
+1198   // (holds only dead objects that don&#39;t need any processing), so
+1199   // dead space can be filled in any order.
+1200   static void update_and_deadwood_in_dense_prefix(ParCompactionManager* cm,
+1201                                                   SpaceId space_id,
+1202                                                   size_t region_index_start,
+1203                                                   size_t region_index_end);
+1204 
+1205   // Return the address of the count + 1st live word in the range [beg, end).
+1206   static HeapWord* skip_live_words(HeapWord* beg, HeapWord* end, size_t count);
+1207 
+1208   // Return the address of the word to be copied to dest_addr, which must be
+1209   // aligned to a region boundary.
+1210   static HeapWord* first_src_addr(HeapWord* const dest_addr,
+1211                                   SpaceId src_space_id,
+1212                                   size_t src_region_idx);
+1213 
+1214   // Determine the next source region, set closure.source() to the start of the
+1215   // new region return the region index.  Parameter end_addr is the address one
+1216   // beyond the end of source range just processed.  If necessary, switch to a
+1217   // new source space and set src_space_id (in-out parameter) and src_space_top
+1218   // (out parameter) accordingly.
+1219   static size_t next_src_region(MoveAndUpdateClosure&amp; closure,
+1220                                 SpaceId&amp; src_space_id,
+1221                                 HeapWord*&amp; src_space_top,
+1222                                 HeapWord* end_addr);
+1223 
+1224   // Decrement the destination count for each non-empty source region in the
+1225   // range [beg_region, region(region_align_up(end_addr))).  If the destination
+1226   // count for a region goes to 0 and it needs to be filled, enqueue it.
+1227   static void decrement_destination_counts(ParCompactionManager* cm,
+1228                                            SpaceId src_space_id,
+1229                                            size_t beg_region,
+1230                                            HeapWord* end_addr);
+1231 
+1232   static void fill_region(ParCompactionManager* cm, MoveAndUpdateClosure&amp; closure, size_t region);
+1233   static void fill_and_update_region(ParCompactionManager* cm, size_t region);
+1234 
+1235   static bool steal_unavailable_region(ParCompactionManager* cm, size_t&amp; region_idx);
+1236   static void fill_and_update_shadow_region(ParCompactionManager* cm, size_t region);
+1237   // Copy the content of a shadow region back to its corresponding heap region
+1238   static void copy_back(HeapWord* shadow_addr, HeapWord* region_addr);
+1239   // Collect empty regions as shadow regions and initialize the
+1240   // _next_shadow_region filed for each compact manager
+1241   static void initialize_shadow_regions(uint parallel_gc_threads);
+1242 
+1243   // Fill in the block table for the specified region.
+1244   static void fill_blocks(size_t region_idx);
+1245 
+1246   // Update the deferred objects in the space.
+1247   static void update_deferred_objects(ParCompactionManager* cm, SpaceId id);
+1248 
+1249   static ParMarkBitMap* mark_bitmap() { return &amp;_mark_bitmap; }
+1250   static ParallelCompactData&amp; summary_data() { return _summary_data; }
+1251 
+1252   // Reference Processing
+1253   static ReferenceProcessor* const ref_processor() { return _ref_processor; }
+1254 
+1255   static STWGCTimer* gc_timer() { return &amp;_gc_timer; }
+1256 
+1257   // Return the SpaceId for the given address.
+1258   static SpaceId space_id(HeapWord* addr);
+1259 
+1260   // Time since last full gc (in milliseconds).
+1261   static jlong millis_since_last_gc();
+1262 
+1263   static void print_on_error(outputStream* st);
+1264 
+1265 #ifndef PRODUCT
+1266   // Debugging support.
+1267   static const char* space_names[last_space_id];
+1268   static void print_region_ranges();
+1269   static void print_dense_prefix_stats(const char* const algorithm,
+1270                                        const SpaceId id,
+1271                                        const bool maximum_compaction,
+1272                                        HeapWord* const addr);
+1273   static void summary_phase_msg(SpaceId dst_space_id,
+1274                                 HeapWord* dst_beg, HeapWord* dst_end,
+1275                                 SpaceId src_space_id,
+1276                                 HeapWord* src_beg, HeapWord* src_end);
+1277 #endif  // #ifndef PRODUCT
+1278 
+1279 #ifdef  ASSERT
+1280   // Sanity check the new location of a word in the heap.
+1281   static inline void check_new_location(HeapWord* old_addr, HeapWord* new_addr);
+1282   // Verify that all the regions have been emptied.
+1283   static void verify_complete(SpaceId space_id);
+1284 #endif  // #ifdef ASSERT
+1285 };
+1286 
+1287 class MoveAndUpdateClosure: public ParMarkBitMapClosure {
+1288   static inline size_t calculate_words_remaining(size_t region);
+1289  public:
+1290   inline MoveAndUpdateClosure(ParMarkBitMap* bitmap, ParCompactionManager* cm,
+1291                               size_t region);
+1292 
+1293   // Accessors.
+1294   HeapWord* destination() const         { return _destination; }
+1295   HeapWord* copy_destination() const    { return _destination + _offset; }
+1296 
+1297   // If the object will fit (size &lt;= words_remaining()), copy it to the current
+1298   // destination, update the interior oops and the start array and return either
+1299   // full (if the closure is full) or incomplete.  If the object will not fit,
+1300   // return would_overflow.
+1301   IterationStatus do_addr(HeapWord* addr, size_t size);
+1302 
+1303   // Copy enough words to fill this closure, starting at source().  Interior
+1304   // oops and the start array are not updated.  Return full.
+1305   IterationStatus copy_until_full();
+1306 
+1307   // Copy enough words to fill this closure or to the end of an object,
+1308   // whichever is smaller, starting at source().  Interior oops and the start
+1309   // array are not updated.
+1310   void copy_partial_obj();
+1311 
+1312   virtual void complete_region(ParCompactionManager* cm, HeapWord* dest_addr,
+1313                                PSParallelCompact::RegionData* region_ptr);
+1314 
+1315 protected:
+1316   // Update variables to indicate that word_count words were processed.
+1317   inline void update_state(size_t word_count);
+1318 
+1319  protected:
+1320   HeapWord*               _destination;         // Next addr to be written.
+1321   ObjectStartArray* const _start_array;
+1322   size_t                  _offset;
+1323 };
+1324 
+1325 inline size_t MoveAndUpdateClosure::calculate_words_remaining(size_t region) {
+1326   HeapWord* dest_addr = PSParallelCompact::summary_data().region_to_addr(region);
+1327   PSParallelCompact::SpaceId dest_space_id = PSParallelCompact::space_id(dest_addr);
+1328   HeapWord* new_top = PSParallelCompact::new_top(dest_space_id);
+1329   assert(dest_addr &lt; new_top, &quot;sanity&quot;);
+1330 
+1331   return MIN2(pointer_delta(new_top, dest_addr), ParallelCompactData::RegionSize);
+1332 }
+1333 
+1334 inline
+1335 MoveAndUpdateClosure::MoveAndUpdateClosure(ParMarkBitMap* bitmap,
+1336                                            ParCompactionManager* cm,
+1337                                            size_t region_idx) :
+1338   ParMarkBitMapClosure(bitmap, cm, calculate_words_remaining(region_idx)),
+1339   _destination(PSParallelCompact::summary_data().region_to_addr(region_idx)),
+1340   _start_array(PSParallelCompact::start_array(PSParallelCompact::space_id(_destination))),
+1341   _offset(0) { }
+1342 
+1343 
+1344 inline void MoveAndUpdateClosure::update_state(size_t words)
+1345 {
+1346   decrement_words_remaining(words);
+1347   _source += words;
+1348   _destination += words;
+1349 }
+1350 
+1351 class MoveAndUpdateShadowClosure: public MoveAndUpdateClosure {
+1352   inline size_t calculate_shadow_offset(size_t region_idx, size_t shadow_idx);
+1353 public:
+1354   inline MoveAndUpdateShadowClosure(ParMarkBitMap* bitmap, ParCompactionManager* cm,
+1355                        size_t region, size_t shadow);
+1356 
+1357   virtual void complete_region(ParCompactionManager* cm, HeapWord* dest_addr,
+1358                                PSParallelCompact::RegionData* region_ptr);
+1359 
+1360 private:
+1361   size_t _shadow;
+1362 };
+1363 
+1364 inline size_t MoveAndUpdateShadowClosure::calculate_shadow_offset(size_t region_idx, size_t shadow_idx) {
+1365   ParallelCompactData&amp; sd = PSParallelCompact::summary_data();
+1366   HeapWord* dest_addr = sd.region_to_addr(region_idx);
+1367   HeapWord* shadow_addr = sd.region_to_addr(shadow_idx);
+1368   return pointer_delta(shadow_addr, dest_addr);
+1369 }
+1370 
+1371 inline
+1372 MoveAndUpdateShadowClosure::MoveAndUpdateShadowClosure(ParMarkBitMap *bitmap,
+1373                                                        ParCompactionManager *cm,
+1374                                                        size_t region,
+1375                                                        size_t shadow) :
+1376   MoveAndUpdateClosure(bitmap, cm, region),
+1377   _shadow(shadow) {
+1378   _offset = calculate_shadow_offset(region, shadow);
+1379 }
+1380 
+1381 class UpdateOnlyClosure: public ParMarkBitMapClosure {
+1382  private:
+1383   const PSParallelCompact::SpaceId _space_id;
+1384   ObjectStartArray* const          _start_array;
+1385 
+1386  public:
+1387   UpdateOnlyClosure(ParMarkBitMap* mbm,
+1388                     ParCompactionManager* cm,
+1389                     PSParallelCompact::SpaceId space_id);
+1390 
+1391   // Update the object.
+1392   virtual IterationStatus do_addr(HeapWord* addr, size_t words);
+1393 
+1394   inline void do_addr(HeapWord* addr);
+1395 };
+1396 
+1397 class FillClosure: public ParMarkBitMapClosure {
+1398  public:
+1399   FillClosure(ParCompactionManager* cm, PSParallelCompact::SpaceId space_id);
+1400 
+1401   virtual IterationStatus do_addr(HeapWord* addr, size_t size);
+1402 
+1403  private:
+1404   ObjectStartArray* const _start_array;
+1405 };
+1406 
+1407 #endif // SHARE_GC_PARALLEL_PSPARALLELCOMPACT_HPP
+    </pre>
+  </body>
+</html>
