@@ -1,0 +1,2615 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>New src/hotspot/share/runtime/synchronizer.cpp</title>
+    <link rel="stylesheet" href="../../../../style.css" />
+  </head>
+  <body>
+    <pre>
+   1 /*
+   2  * Copyright (c) 1998, 2020, Oracle and/or its affiliates. All rights reserved.
+   3  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+   4  *
+   5  * This code is free software; you can redistribute it and/or modify it
+   6  * under the terms of the GNU General Public License version 2 only, as
+   7  * published by the Free Software Foundation.
+   8  *
+   9  * This code is distributed in the hope that it will be useful, but WITHOUT
+  10  * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+  11  * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+  12  * version 2 for more details (a copy is included in the LICENSE file that
+  13  * accompanied this code).
+  14  *
+  15  * You should have received a copy of the GNU General Public License version
+  16  * 2 along with this work; if not, write to the Free Software Foundation,
+  17  * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+  18  *
+  19  * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+  20  * or visit www.oracle.com if you need additional information or have any
+  21  * questions.
+  22  *
+  23  */
+  24 
+  25 #include &quot;precompiled.hpp&quot;
+  26 #include &quot;classfile/vmSymbols.hpp&quot;
+  27 #include &quot;logging/log.hpp&quot;
+  28 #include &quot;logging/logStream.hpp&quot;
+  29 #include &quot;jfr/jfrEvents.hpp&quot;
+  30 #include &quot;memory/allocation.inline.hpp&quot;
+  31 #include &quot;memory/metaspaceShared.hpp&quot;
+  32 #include &quot;memory/padded.hpp&quot;
+  33 #include &quot;memory/resourceArea.hpp&quot;
+  34 #include &quot;memory/universe.hpp&quot;
+  35 #include &quot;oops/markWord.hpp&quot;
+  36 #include &quot;oops/oop.inline.hpp&quot;
+  37 #include &quot;runtime/atomic.hpp&quot;
+  38 #include &quot;runtime/biasedLocking.hpp&quot;
+  39 #include &quot;runtime/handles.inline.hpp&quot;
+  40 #include &quot;runtime/interfaceSupport.inline.hpp&quot;
+  41 #include &quot;runtime/mutexLocker.hpp&quot;
+  42 #include &quot;runtime/objectMonitor.hpp&quot;
+  43 #include &quot;runtime/objectMonitor.inline.hpp&quot;
+  44 #include &quot;runtime/osThread.hpp&quot;
+  45 #include &quot;runtime/safepointVerifiers.hpp&quot;
+  46 #include &quot;runtime/sharedRuntime.hpp&quot;
+  47 #include &quot;runtime/stubRoutines.hpp&quot;
+  48 #include &quot;runtime/synchronizer.hpp&quot;
+  49 #include &quot;runtime/thread.inline.hpp&quot;
+  50 #include &quot;runtime/timer.hpp&quot;
+  51 #include &quot;runtime/vframe.hpp&quot;
+  52 #include &quot;runtime/vmThread.hpp&quot;
+  53 #include &quot;utilities/align.hpp&quot;
+  54 #include &quot;utilities/dtrace.hpp&quot;
+  55 #include &quot;utilities/events.hpp&quot;
+  56 #include &quot;utilities/preserveException.hpp&quot;
+  57 
+  58 // The &quot;core&quot; versions of monitor enter and exit reside in this file.
+  59 // The interpreter and compilers contain specialized transliterated
+  60 // variants of the enter-exit fast-path operations.  See i486.ad fast_lock(),
+  61 // for instance.  If you make changes here, make sure to modify the
+  62 // interpreter, and both C1 and C2 fast-path inline locking code emission.
+  63 //
+  64 // -----------------------------------------------------------------------------
+  65 
+  66 #ifdef DTRACE_ENABLED
+  67 
+  68 // Only bother with this argument setup if dtrace is available
+  69 // TODO-FIXME: probes should not fire when caller is _blocked.  assert() accordingly.
+  70 
+  71 #define DTRACE_MONITOR_PROBE_COMMON(obj, thread)                           \
+  72   char* bytes = NULL;                                                      \
+  73   int len = 0;                                                             \
+  74   jlong jtid = SharedRuntime::get_java_tid(thread);                        \
+  75   Symbol* klassname = ((oop)(obj))-&gt;klass()-&gt;name();                       \
+  76   if (klassname != NULL) {                                                 \
+  77     bytes = (char*)klassname-&gt;bytes();                                     \
+  78     len = klassname-&gt;utf8_length();                                        \
+  79   }
+  80 
+  81 #define DTRACE_MONITOR_WAIT_PROBE(monitor, obj, thread, millis)            \
+  82   {                                                                        \
+  83     if (DTraceMonitorProbes) {                                             \
+  84       DTRACE_MONITOR_PROBE_COMMON(obj, thread);                            \
+  85       HOTSPOT_MONITOR_WAIT(jtid,                                           \
+  86                            (uintptr_t)(monitor), bytes, len, (millis));    \
+  87     }                                                                      \
+  88   }
+  89 
+  90 #define HOTSPOT_MONITOR_PROBE_notify HOTSPOT_MONITOR_NOTIFY
+  91 #define HOTSPOT_MONITOR_PROBE_notifyAll HOTSPOT_MONITOR_NOTIFYALL
+  92 #define HOTSPOT_MONITOR_PROBE_waited HOTSPOT_MONITOR_WAITED
+  93 
+  94 #define DTRACE_MONITOR_PROBE(probe, monitor, obj, thread)                  \
+  95   {                                                                        \
+  96     if (DTraceMonitorProbes) {                                             \
+  97       DTRACE_MONITOR_PROBE_COMMON(obj, thread);                            \
+  98       HOTSPOT_MONITOR_PROBE_##probe(jtid, /* probe = waited */             \
+  99                                     (uintptr_t)(monitor), bytes, len);     \
+ 100     }                                                                      \
+ 101   }
+ 102 
+ 103 #else //  ndef DTRACE_ENABLED
+ 104 
+ 105 #define DTRACE_MONITOR_WAIT_PROBE(obj, thread, millis, mon)    {;}
+ 106 #define DTRACE_MONITOR_PROBE(probe, obj, thread, mon)          {;}
+ 107 
+ 108 #endif // ndef DTRACE_ENABLED
+ 109 
+ 110 // This exists only as a workaround of dtrace bug 6254741
+ 111 int dtrace_waited_probe(ObjectMonitor* monitor, Handle obj, Thread* thr) {
+ 112   DTRACE_MONITOR_PROBE(waited, monitor, obj(), thr);
+ 113   return 0;
+ 114 }
+ 115 
+ 116 #define NINFLATIONLOCKS 256
+ 117 static volatile intptr_t gInflationLocks[NINFLATIONLOCKS];
+ 118 
+ 119 // global list of blocks of monitors
+ 120 PaddedObjectMonitor* ObjectSynchronizer::g_block_list = NULL;
+ 121 
+ 122 struct ObjectMonitorListGlobals {
+ 123   char         _pad_prefix[OM_CACHE_LINE_SIZE];
+ 124   // These are highly shared list related variables.
+ 125   // To avoid false-sharing they need to be the sole occupants of a cache line.
+ 126 
+ 127   // Global ObjectMonitor free list. Newly allocated and deflated
+ 128   // ObjectMonitors are prepended here.
+ 129   ObjectMonitor* _free_list;
+ 130   DEFINE_PAD_MINUS_SIZE(1, OM_CACHE_LINE_SIZE, sizeof(ObjectMonitor*));
+ 131 
+ 132   // Global ObjectMonitor in-use list. When a JavaThread is exiting,
+ 133   // ObjectMonitors on its per-thread in-use list are prepended here.
+ 134   ObjectMonitor* _in_use_list;
+ 135   DEFINE_PAD_MINUS_SIZE(2, OM_CACHE_LINE_SIZE, sizeof(ObjectMonitor*));
+ 136 
+ 137   int _free_count;    // # on free_list
+ 138   DEFINE_PAD_MINUS_SIZE(3, OM_CACHE_LINE_SIZE, sizeof(int));
+ 139 
+ 140   int _in_use_count;  // # on in_use_list
+ 141   DEFINE_PAD_MINUS_SIZE(4, OM_CACHE_LINE_SIZE, sizeof(int));
+ 142 
+ 143   int _population;    // # Extant -- in circulation
+ 144   DEFINE_PAD_MINUS_SIZE(5, OM_CACHE_LINE_SIZE, sizeof(int));
+ 145 };
+ 146 static ObjectMonitorListGlobals om_list_globals;
+ 147 
+ 148 #define CHAINMARKER (cast_to_oop&lt;intptr_t&gt;(-1))
+ 149 
+ 150 
+ 151 // =====================&gt; Spin-lock functions
+ 152 
+ 153 // ObjectMonitors are not lockable outside of this file. We use spin-locks
+ 154 // implemented using a bit in the _next_om field instead of the heavier
+ 155 // weight locking mechanisms for faster list management.
+ 156 
+ 157 #define OM_LOCK_BIT 0x1
+ 158 
+ 159 // Return true if the ObjectMonitor is locked.
+ 160 // Otherwise returns false.
+ 161 static bool is_locked(ObjectMonitor* om) {
+ 162   return ((intptr_t)om-&gt;next_om() &amp; OM_LOCK_BIT) == OM_LOCK_BIT;
+ 163 }
+ 164 
+ 165 // Mark an ObjectMonitor* with OM_LOCK_BIT and return it.
+ 166 static ObjectMonitor* mark_om_ptr(ObjectMonitor* om) {
+ 167   return (ObjectMonitor*)((intptr_t)om | OM_LOCK_BIT);
+ 168 }
+ 169 
+ 170 // Return the unmarked next field in an ObjectMonitor. Note: the next
+ 171 // field may or may not have been marked with OM_LOCK_BIT originally.
+ 172 static ObjectMonitor* unmarked_next(ObjectMonitor* om) {
+ 173   return (ObjectMonitor*)((intptr_t)om-&gt;next_om() &amp; ~OM_LOCK_BIT);
+ 174 }
+ 175 
+ 176 // Try to lock an ObjectMonitor. Returns true if locking was successful.
+ 177 // Otherwise returns false.
+ 178 static bool try_om_lock(ObjectMonitor* om) {
+ 179   // Get current next field without any OM_LOCK_BIT value.
+ 180   ObjectMonitor* next = unmarked_next(om);
+ 181   if (om-&gt;try_set_next_om(next, mark_om_ptr(next)) != next) {
+ 182     return false;  // Cannot lock the ObjectMonitor.
+ 183   }
+ 184   return true;
+ 185 }
+ 186 
+ 187 // Lock an ObjectMonitor.
+ 188 static void om_lock(ObjectMonitor* om) {
+ 189   while (true) {
+ 190     if (try_om_lock(om)) {
+ 191       return;
+ 192     }
+ 193   }
+ 194 }
+ 195 
+ 196 // Unlock an ObjectMonitor.
+ 197 static void om_unlock(ObjectMonitor* om) {
+ 198   ObjectMonitor* next = om-&gt;next_om();
+ 199   guarantee(((intptr_t)next &amp; OM_LOCK_BIT) == OM_LOCK_BIT, &quot;next=&quot; INTPTR_FORMAT
+ 200             &quot; must have OM_LOCK_BIT=%x set.&quot;, p2i(next), OM_LOCK_BIT);
+ 201 
+ 202   next = (ObjectMonitor*)((intptr_t)next &amp; ~OM_LOCK_BIT);  // Clear OM_LOCK_BIT.
+ 203   om-&gt;set_next_om(next);
+ 204 }
+ 205 
+ 206 // Get the list head after locking it. Returns the list head or NULL
+ 207 // if the list is empty.
+ 208 static ObjectMonitor* get_list_head_locked(ObjectMonitor** list_p) {
+ 209   while (true) {
+ 210     ObjectMonitor* mid = Atomic::load(list_p);
+ 211     if (mid == NULL) {
+ 212       return NULL;  // The list is empty.
+ 213     }
+ 214     if (try_om_lock(mid)) {
+ 215       if (Atomic::load(list_p) != mid) {
+ 216         // The list head changed before we could lock it so we have to retry.
+ 217         om_unlock(mid);
+ 218         continue;
+ 219       }
+ 220       return mid;
+ 221     }
+ 222   }
+ 223 }
+ 224 
+ 225 #undef OM_LOCK_BIT
+ 226 
+ 227 
+ 228 // =====================&gt; List Management functions
+ 229 
+ 230 // Prepend a list of ObjectMonitors to the specified *list_p. &#39;tail&#39; is
+ 231 // the last ObjectMonitor in the list and there are &#39;count&#39; on the list.
+ 232 // Also updates the specified *count_p.
+ 233 static void prepend_list_to_common(ObjectMonitor* list, ObjectMonitor* tail,
+ 234                                    int count, ObjectMonitor** list_p,
+ 235                                    int* count_p) {
+ 236   while (true) {
+ 237     ObjectMonitor* cur = Atomic::load(list_p);
+ 238     // Prepend list to *list_p.
+ 239     if (!try_om_lock(tail)) {
+ 240       // Failed to lock tail due to a list walker so try it all again.
+ 241       continue;
+ 242     }
+ 243     tail-&gt;set_next_om(cur);  // tail now points to cur (and unlocks tail)
+ 244     if (cur == NULL) {
+ 245       // No potential race with takers or other prependers since
+ 246       // *list_p is empty.
+ 247       if (Atomic::cmpxchg(list_p, cur, list) == cur) {
+ 248         // Successfully switched *list_p to the list value.
+ 249         Atomic::add(count_p, count);
+ 250         break;
+ 251       }
+ 252       // Implied else: try it all again
+ 253     } else {
+ 254       if (!try_om_lock(cur)) {
+ 255         continue;  // failed to lock cur so try it all again
+ 256       }
+ 257       // We locked cur so try to switch *list_p to the list value.
+ 258       if (Atomic::cmpxchg(list_p, cur, list) != cur) {
+ 259         // The list head has changed so unlock cur and try again:
+ 260         om_unlock(cur);
+ 261         continue;
+ 262       }
+ 263       Atomic::add(count_p, count);
+ 264       om_unlock(cur);
+ 265       break;
+ 266     }
+ 267   }
+ 268 }
+ 269 
+ 270 // Prepend a newly allocated block of ObjectMonitors to g_block_list and
+ 271 // om_list_globals._free_list. Also updates om_list_globals._population
+ 272 // and om_list_globals._free_count.
+ 273 void ObjectSynchronizer::prepend_block_to_lists(PaddedObjectMonitor* new_blk) {
+ 274   // First we handle g_block_list:
+ 275   while (true) {
+ 276     PaddedObjectMonitor* cur = Atomic::load(&amp;g_block_list);
+ 277     // Prepend new_blk to g_block_list. The first ObjectMonitor in
+ 278     // a block is reserved for use as linkage to the next block.
+ 279     new_blk[0].set_next_om(cur);
+ 280     if (Atomic::cmpxchg(&amp;g_block_list, cur, new_blk) == cur) {
+ 281       // Successfully switched g_block_list to the new_blk value.
+ 282       Atomic::add(&amp;om_list_globals._population, _BLOCKSIZE - 1);
+ 283       break;
+ 284     }
+ 285     // Implied else: try it all again
+ 286   }
+ 287 
+ 288   // Second we handle om_list_globals._free_list:
+ 289   prepend_list_to_common(new_blk + 1, &amp;new_blk[_BLOCKSIZE - 1], _BLOCKSIZE - 1,
+ 290                          &amp;om_list_globals._free_list, &amp;om_list_globals._free_count);
+ 291 }
+ 292 
+ 293 // Prepend a list of ObjectMonitors to om_list_globals._free_list.
+ 294 // &#39;tail&#39; is the last ObjectMonitor in the list and there are &#39;count&#39;
+ 295 // on the list. Also updates om_list_globals._free_count.
+ 296 static void prepend_list_to_global_free_list(ObjectMonitor* list,
+ 297                                              ObjectMonitor* tail, int count) {
+ 298   prepend_list_to_common(list, tail, count, &amp;om_list_globals._free_list,
+ 299                          &amp;om_list_globals._free_count);
+ 300 }
+ 301 
+ 302 // Prepend a list of ObjectMonitors to om_list_globals._in_use_list.
+ 303 // &#39;tail&#39; is the last ObjectMonitor in the list and there are &#39;count&#39;
+ 304 // on the list. Also updates om_list_globals._in_use_list.
+ 305 static void prepend_list_to_global_in_use_list(ObjectMonitor* list,
+ 306                                                ObjectMonitor* tail, int count) {
+ 307   prepend_list_to_common(list, tail, count, &amp;om_list_globals._in_use_list,
+ 308                          &amp;om_list_globals._in_use_count);
+ 309 }
+ 310 
+ 311 // Prepend an ObjectMonitor to the specified list. Also updates
+ 312 // the specified counter.
+ 313 static void prepend_to_common(ObjectMonitor* m, ObjectMonitor** list_p,
+ 314                               int* count_p) {
+ 315   while (true) {
+ 316     om_lock(m);  // Lock m so we can safely update its next field.
+ 317     ObjectMonitor* cur = NULL;
+ 318     // Lock the list head to guard against races with a list walker
+ 319     // thread:
+ 320     if ((cur = get_list_head_locked(list_p)) != NULL) {
+ 321       // List head is now locked so we can safely switch it.
+ 322       m-&gt;set_next_om(cur);  // m now points to cur (and unlocks m)
+ 323       Atomic::store(list_p, m);  // Switch list head to unlocked m.
+ 324       om_unlock(cur);
+ 325       break;
+ 326     }
+ 327     // The list is empty so try to set the list head.
+ 328     assert(cur == NULL, &quot;cur must be NULL: cur=&quot; INTPTR_FORMAT, p2i(cur));
+ 329     m-&gt;set_next_om(cur);  // m now points to NULL (and unlocks m)
+ 330     if (Atomic::cmpxchg(list_p, cur, m) == cur) {
+ 331       // List head is now unlocked m.
+ 332       break;
+ 333     }
+ 334     // Implied else: try it all again
+ 335   }
+ 336   Atomic::inc(count_p);
+ 337 }
+ 338 
+ 339 // Prepend an ObjectMonitor to a per-thread om_free_list.
+ 340 // Also updates the per-thread om_free_count.
+ 341 static void prepend_to_om_free_list(Thread* self, ObjectMonitor* m) {
+ 342   prepend_to_common(m, &amp;self-&gt;om_free_list, &amp;self-&gt;om_free_count);
+ 343 }
+ 344 
+ 345 // Prepend an ObjectMonitor to a per-thread om_in_use_list.
+ 346 // Also updates the per-thread om_in_use_count.
+ 347 static void prepend_to_om_in_use_list(Thread* self, ObjectMonitor* m) {
+ 348   prepend_to_common(m, &amp;self-&gt;om_in_use_list, &amp;self-&gt;om_in_use_count);
+ 349 }
+ 350 
+ 351 // Take an ObjectMonitor from the start of the specified list. Also
+ 352 // decrements the specified counter. Returns NULL if none are available.
+ 353 static ObjectMonitor* take_from_start_of_common(ObjectMonitor** list_p,
+ 354                                                 int* count_p) {
+ 355   ObjectMonitor* take = NULL;
+ 356   // Lock the list head to guard against races with a list walker
+ 357   // thread:
+ 358   if ((take = get_list_head_locked(list_p)) == NULL) {
+ 359     return NULL;  // None are available.
+ 360   }
+ 361   ObjectMonitor* next = unmarked_next(take);
+ 362   // Switch locked list head to next (which unlocks the list head, but
+ 363   // leaves take locked):
+ 364   Atomic::store(list_p, next);
+ 365   Atomic::dec(count_p);
+ 366   // Unlock take, but leave the next value for any lagging list
+ 367   // walkers. It will get cleaned up when take is prepended to
+ 368   // the in-use list:
+ 369   om_unlock(take);
+ 370   return take;
+ 371 }
+ 372 
+ 373 // Take an ObjectMonitor from the start of the om_list_globals._free_list.
+ 374 // Also updates om_list_globals._free_count. Returns NULL if none are
+ 375 // available.
+ 376 static ObjectMonitor* take_from_start_of_global_free_list() {
+ 377   return take_from_start_of_common(&amp;om_list_globals._free_list,
+ 378                                    &amp;om_list_globals._free_count);
+ 379 }
+ 380 
+ 381 // Take an ObjectMonitor from the start of a per-thread free-list.
+ 382 // Also updates om_free_count. Returns NULL if none are available.
+ 383 static ObjectMonitor* take_from_start_of_om_free_list(Thread* self) {
+ 384   return take_from_start_of_common(&amp;self-&gt;om_free_list, &amp;self-&gt;om_free_count);
+ 385 }
+ 386 
+ 387 
+ 388 // =====================&gt; Quick functions
+ 389 
+ 390 // The quick_* forms are special fast-path variants used to improve
+ 391 // performance.  In the simplest case, a &quot;quick_*&quot; implementation could
+ 392 // simply return false, in which case the caller will perform the necessary
+ 393 // state transitions and call the slow-path form.
+ 394 // The fast-path is designed to handle frequently arising cases in an efficient
+ 395 // manner and is just a degenerate &quot;optimistic&quot; variant of the slow-path.
+ 396 // returns true  -- to indicate the call was satisfied.
+ 397 // returns false -- to indicate the call needs the services of the slow-path.
+ 398 // A no-loitering ordinance is in effect for code in the quick_* family
+ 399 // operators: safepoints or indefinite blocking (blocking that might span a
+ 400 // safepoint) are forbidden. Generally the thread_state() is _in_Java upon
+ 401 // entry.
+ 402 //
+ 403 // Consider: An interesting optimization is to have the JIT recognize the
+ 404 // following common idiom:
+ 405 //   synchronized (someobj) { .... ; notify(); }
+ 406 // That is, we find a notify() or notifyAll() call that immediately precedes
+ 407 // the monitorexit operation.  In that case the JIT could fuse the operations
+ 408 // into a single notifyAndExit() runtime primitive.
+ 409 
+ 410 bool ObjectSynchronizer::quick_notify(oopDesc* obj, Thread* self, bool all) {
+ 411   assert(!SafepointSynchronize::is_at_safepoint(), &quot;invariant&quot;);
+ 412   assert(self-&gt;is_Java_thread(), &quot;invariant&quot;);
+ 413   assert(((JavaThread *) self)-&gt;thread_state() == _thread_in_Java, &quot;invariant&quot;);
+ 414   NoSafepointVerifier nsv;
+ 415   if (obj == NULL) return false;  // slow-path for invalid obj
+ 416   const markWord mark = obj-&gt;mark();
+ 417 
+ 418   if (mark.has_locker() &amp;&amp; self-&gt;is_lock_owned((address)mark.locker())) {
+ 419     // Degenerate notify
+ 420     // stack-locked by caller so by definition the implied waitset is empty.
+ 421     return true;
+ 422   }
+ 423 
+ 424   if (mark.has_monitor()) {
+ 425     ObjectMonitor* const mon = mark.monitor();
+ 426     assert(mon-&gt;object() == obj, &quot;invariant&quot;);
+ 427     if (mon-&gt;owner() != self) return false;  // slow-path for IMS exception
+ 428 
+ 429     if (mon-&gt;first_waiter() != NULL) {
+ 430       // We have one or more waiters. Since this is an inflated monitor
+ 431       // that we own, we can transfer one or more threads from the waitset
+ 432       // to the entrylist here and now, avoiding the slow-path.
+ 433       if (all) {
+ 434         DTRACE_MONITOR_PROBE(notifyAll, mon, obj, self);
+ 435       } else {
+ 436         DTRACE_MONITOR_PROBE(notify, mon, obj, self);
+ 437       }
+ 438       int free_count = 0;
+ 439       do {
+ 440         mon-&gt;INotify(self);
+ 441         ++free_count;
+ 442       } while (mon-&gt;first_waiter() != NULL &amp;&amp; all);
+ 443       OM_PERFDATA_OP(Notifications, inc(free_count));
+ 444     }
+ 445     return true;
+ 446   }
+ 447 
+ 448   // biased locking and any other IMS exception states take the slow-path
+ 449   return false;
+ 450 }
+ 451 
+ 452 
+ 453 // The LockNode emitted directly at the synchronization site would have
+ 454 // been too big if it were to have included support for the cases of inflated
+ 455 // recursive enter and exit, so they go here instead.
+ 456 // Note that we can&#39;t safely call AsyncPrintJavaStack() from within
+ 457 // quick_enter() as our thread state remains _in_Java.
+ 458 
+ 459 bool ObjectSynchronizer::quick_enter(oop obj, Thread* self,
+ 460                                      BasicLock * lock) {
+ 461   assert(!SafepointSynchronize::is_at_safepoint(), &quot;invariant&quot;);
+ 462   assert(self-&gt;is_Java_thread(), &quot;invariant&quot;);
+ 463   assert(((JavaThread *) self)-&gt;thread_state() == _thread_in_Java, &quot;invariant&quot;);
+ 464   NoSafepointVerifier nsv;
+ 465   if (obj == NULL) return false;       // Need to throw NPE
+ 466   const markWord mark = obj-&gt;mark();
+ 467 
+ 468   if (mark.has_monitor()) {
+ 469     ObjectMonitor* const m = mark.monitor();
+ 470     assert(m-&gt;object() == obj, &quot;invariant&quot;);
+ 471     Thread* const owner = (Thread *) m-&gt;_owner;
+ 472 
+ 473     // Lock contention and Transactional Lock Elision (TLE) diagnostics
+ 474     // and observability
+ 475     // Case: light contention possibly amenable to TLE
+ 476     // Case: TLE inimical operations such as nested/recursive synchronization
+ 477 
+ 478     if (owner == self) {
+ 479       m-&gt;_recursions++;
+ 480       return true;
+ 481     }
+ 482 
+ 483     // This Java Monitor is inflated so obj&#39;s header will never be
+ 484     // displaced to this thread&#39;s BasicLock. Make the displaced header
+ 485     // non-NULL so this BasicLock is not seen as recursive nor as
+ 486     // being locked. We do this unconditionally so that this thread&#39;s
+ 487     // BasicLock cannot be mis-interpreted by any stack walkers. For
+ 488     // performance reasons, stack walkers generally first check for
+ 489     // Biased Locking in the object&#39;s header, the second check is for
+ 490     // stack-locking in the object&#39;s header, the third check is for
+ 491     // recursive stack-locking in the displaced header in the BasicLock,
+ 492     // and last are the inflated Java Monitor (ObjectMonitor) checks.
+ 493     lock-&gt;set_displaced_header(markWord::unused_mark());
+ 494 
+ 495     if (owner == NULL &amp;&amp; m-&gt;try_set_owner_from(NULL, self) == NULL) {
+ 496       assert(m-&gt;_recursions == 0, &quot;invariant&quot;);
+ 497       return true;
+ 498     }
+ 499   }
+ 500 
+ 501   // Note that we could inflate in quick_enter.
+ 502   // This is likely a useful optimization
+ 503   // Critically, in quick_enter() we must not:
+ 504   // -- perform bias revocation, or
+ 505   // -- block indefinitely, or
+ 506   // -- reach a safepoint
+ 507 
+ 508   return false;        // revert to slow-path
+ 509 }
+ 510 
+ 511 // -----------------------------------------------------------------------------
+ 512 // Monitor Enter/Exit
+ 513 // The interpreter and compiler assembly code tries to lock using the fast path
+ 514 // of this algorithm. Make sure to update that code if the following function is
+ 515 // changed. The implementation is extremely sensitive to race condition. Be careful.
+ 516 
+ 517 void ObjectSynchronizer::enter(Handle obj, BasicLock* lock, TRAPS) {
+ 518   if (UseBiasedLocking) {
+ 519     if (!SafepointSynchronize::is_at_safepoint()) {
+ 520       BiasedLocking::revoke(obj, THREAD);
+ 521     } else {
+ 522       BiasedLocking::revoke_at_safepoint(obj);
+ 523     }
+ 524   }
+ 525 
+ 526   markWord mark = obj-&gt;mark();
+ 527   assert(!mark.has_bias_pattern(), &quot;should not see bias pattern here&quot;);
+ 528 
+ 529   if (mark.is_neutral()) {
+ 530     // Anticipate successful CAS -- the ST of the displaced mark must
+ 531     // be visible &lt;= the ST performed by the CAS.
+ 532     lock-&gt;set_displaced_header(mark);
+ 533     if (mark == obj()-&gt;cas_set_mark(markWord::from_pointer(lock), mark)) {
+ 534       return;
+ 535     }
+ 536     // Fall through to inflate() ...
+ 537   } else if (mark.has_locker() &amp;&amp;
+ 538              THREAD-&gt;is_lock_owned((address)mark.locker())) {
+ 539     assert(lock != mark.locker(), &quot;must not re-lock the same lock&quot;);
+ 540     assert(lock != (BasicLock*)obj-&gt;mark().value(), &quot;don&#39;t relock with same BasicLock&quot;);
+ 541     lock-&gt;set_displaced_header(markWord::from_pointer(NULL));
+ 542     return;
+ 543   }
+ 544 
+ 545   // The object header will never be displaced to this lock,
+ 546   // so it does not matter what the value is, except that it
+ 547   // must be non-zero to avoid looking like a re-entrant lock,
+ 548   // and must not look locked either.
+ 549   lock-&gt;set_displaced_header(markWord::unused_mark());
+ 550   inflate(THREAD, obj(), inflate_cause_monitor_enter)-&gt;enter(THREAD);
+ 551 }
+ 552 
+ 553 void ObjectSynchronizer::exit(oop object, BasicLock* lock, TRAPS) {
+ 554   markWord mark = object-&gt;mark();
+ 555   // We cannot check for Biased Locking if we are racing an inflation.
+ 556   assert(mark == markWord::INFLATING() ||
+ 557          !mark.has_bias_pattern(), &quot;should not see bias pattern here&quot;);
+ 558 
+ 559   markWord dhw = lock-&gt;displaced_header();
+ 560   if (dhw.value() == 0) {
+ 561     // If the displaced header is NULL, then this exit matches up with
+ 562     // a recursive enter. No real work to do here except for diagnostics.
+ 563 #ifndef PRODUCT
+ 564     if (mark != markWord::INFLATING()) {
+ 565       // Only do diagnostics if we are not racing an inflation. Simply
+ 566       // exiting a recursive enter of a Java Monitor that is being
+ 567       // inflated is safe; see the has_monitor() comment below.
+ 568       assert(!mark.is_neutral(), &quot;invariant&quot;);
+ 569       assert(!mark.has_locker() ||
+ 570              THREAD-&gt;is_lock_owned((address)mark.locker()), &quot;invariant&quot;);
+ 571       if (mark.has_monitor()) {
+ 572         // The BasicLock&#39;s displaced_header is marked as a recursive
+ 573         // enter and we have an inflated Java Monitor (ObjectMonitor).
+ 574         // This is a special case where the Java Monitor was inflated
+ 575         // after this thread entered the stack-lock recursively. When a
+ 576         // Java Monitor is inflated, we cannot safely walk the Java
+ 577         // Monitor owner&#39;s stack and update the BasicLocks because a
+ 578         // Java Monitor can be asynchronously inflated by a thread that
+ 579         // does not own the Java Monitor.
+ 580         ObjectMonitor* m = mark.monitor();
+ 581         assert(((oop)(m-&gt;object()))-&gt;mark() == mark, &quot;invariant&quot;);
+ 582         assert(m-&gt;is_entered(THREAD), &quot;invariant&quot;);
+ 583       }
+ 584     }
+ 585 #endif
+ 586     return;
+ 587   }
+ 588 
+ 589   if (mark == markWord::from_pointer(lock)) {
+ 590     // If the object is stack-locked by the current thread, try to
+ 591     // swing the displaced header from the BasicLock back to the mark.
+ 592     assert(dhw.is_neutral(), &quot;invariant&quot;);
+ 593     if (object-&gt;cas_set_mark(dhw, mark) == mark) {
+ 594       return;
+ 595     }
+ 596   }
+ 597 
+ 598   // We have to take the slow-path of possible inflation and then exit.
+ 599   inflate(THREAD, object, inflate_cause_vm_internal)-&gt;exit(true, THREAD);
+ 600 }
+ 601 
+ 602 // -----------------------------------------------------------------------------
+ 603 // Class Loader  support to workaround deadlocks on the class loader lock objects
+ 604 // Also used by GC
+ 605 // complete_exit()/reenter() are used to wait on a nested lock
+ 606 // i.e. to give up an outer lock completely and then re-enter
+ 607 // Used when holding nested locks - lock acquisition order: lock1 then lock2
+ 608 //  1) complete_exit lock1 - saving recursion count
+ 609 //  2) wait on lock2
+ 610 //  3) when notified on lock2, unlock lock2
+ 611 //  4) reenter lock1 with original recursion count
+ 612 //  5) lock lock2
+ 613 // NOTE: must use heavy weight monitor to handle complete_exit/reenter()
+ 614 intx ObjectSynchronizer::complete_exit(Handle obj, TRAPS) {
+ 615   if (UseBiasedLocking) {
+ 616     BiasedLocking::revoke(obj, THREAD);
+ 617     assert(!obj-&gt;mark().has_bias_pattern(), &quot;biases should be revoked by now&quot;);
+ 618   }
+ 619 
+ 620   ObjectMonitor* monitor = inflate(THREAD, obj(), inflate_cause_vm_internal);
+ 621 
+ 622   return monitor-&gt;complete_exit(THREAD);
+ 623 }
+ 624 
+ 625 // NOTE: must use heavy weight monitor to handle complete_exit/reenter()
+ 626 void ObjectSynchronizer::reenter(Handle obj, intx recursions, TRAPS) {
+ 627   if (UseBiasedLocking) {
+ 628     BiasedLocking::revoke(obj, THREAD);
+ 629     assert(!obj-&gt;mark().has_bias_pattern(), &quot;biases should be revoked by now&quot;);
+ 630   }
+ 631 
+ 632   ObjectMonitor* monitor = inflate(THREAD, obj(), inflate_cause_vm_internal);
+ 633 
+ 634   monitor-&gt;reenter(recursions, THREAD);
+ 635 }
+ 636 // -----------------------------------------------------------------------------
+ 637 // JNI locks on java objects
+ 638 // NOTE: must use heavy weight monitor to handle jni monitor enter
+ 639 void ObjectSynchronizer::jni_enter(Handle obj, TRAPS) {
+ 640   // the current locking is from JNI instead of Java code
+ 641   if (UseBiasedLocking) {
+ 642     BiasedLocking::revoke(obj, THREAD);
+ 643     assert(!obj-&gt;mark().has_bias_pattern(), &quot;biases should be revoked by now&quot;);
+ 644   }
+ 645   THREAD-&gt;set_current_pending_monitor_is_from_java(false);
+ 646   inflate(THREAD, obj(), inflate_cause_jni_enter)-&gt;enter(THREAD);
+ 647   THREAD-&gt;set_current_pending_monitor_is_from_java(true);
+ 648 }
+ 649 
+ 650 // NOTE: must use heavy weight monitor to handle jni monitor exit
+ 651 void ObjectSynchronizer::jni_exit(oop obj, Thread* THREAD) {
+ 652   if (UseBiasedLocking) {
+ 653     Handle h_obj(THREAD, obj);
+ 654     BiasedLocking::revoke(h_obj, THREAD);
+ 655     obj = h_obj();
+ 656   }
+ 657   assert(!obj-&gt;mark().has_bias_pattern(), &quot;biases should be revoked by now&quot;);
+ 658 
+ 659   ObjectMonitor* monitor = inflate(THREAD, obj, inflate_cause_jni_exit);
+ 660   // If this thread has locked the object, exit the monitor. We
+ 661   // intentionally do not use CHECK here because we must exit the
+ 662   // monitor even if an exception is pending.
+ 663   if (monitor-&gt;check_owner(THREAD)) {
+ 664     monitor-&gt;exit(true, THREAD);
+ 665   }
+ 666 }
+ 667 
+ 668 // -----------------------------------------------------------------------------
+ 669 // Internal VM locks on java objects
+ 670 // standard constructor, allows locking failures
+ 671 ObjectLocker::ObjectLocker(Handle obj, Thread* thread, bool do_lock) {
+ 672   _dolock = do_lock;
+ 673   _thread = thread;
+ 674   _thread-&gt;check_for_valid_safepoint_state();
+ 675   _obj = obj;
+ 676 
+ 677   if (_dolock) {
+ 678     ObjectSynchronizer::enter(_obj, &amp;_lock, _thread);
+ 679   }
+ 680 }
+ 681 
+ 682 ObjectLocker::~ObjectLocker() {
+ 683   if (_dolock) {
+ 684     ObjectSynchronizer::exit(_obj(), &amp;_lock, _thread);
+ 685   }
+ 686 }
+ 687 
+ 688 
+ 689 // -----------------------------------------------------------------------------
+ 690 //  Wait/Notify/NotifyAll
+ 691 // NOTE: must use heavy weight monitor to handle wait()
+ 692 int ObjectSynchronizer::wait(Handle obj, jlong millis, TRAPS) {
+ 693   if (UseBiasedLocking) {
+ 694     BiasedLocking::revoke(obj, THREAD);
+ 695     assert(!obj-&gt;mark().has_bias_pattern(), &quot;biases should be revoked by now&quot;);
+ 696   }
+ 697   if (millis &lt; 0) {
+ 698     THROW_MSG_0(vmSymbols::java_lang_IllegalArgumentException(), &quot;timeout value is negative&quot;);
+ 699   }
+ 700   ObjectMonitor* monitor = inflate(THREAD, obj(), inflate_cause_wait);
+ 701 
+ 702   DTRACE_MONITOR_WAIT_PROBE(monitor, obj(), THREAD, millis);
+ 703   monitor-&gt;wait(millis, true, THREAD);
+ 704 
+ 705   // This dummy call is in place to get around dtrace bug 6254741.  Once
+ 706   // that&#39;s fixed we can uncomment the following line, remove the call
+ 707   // and change this function back into a &quot;void&quot; func.
+ 708   // DTRACE_MONITOR_PROBE(waited, monitor, obj(), THREAD);
+ 709   return dtrace_waited_probe(monitor, obj, THREAD);
+ 710 }
+ 711 
+ 712 void ObjectSynchronizer::wait_uninterruptibly(Handle obj, jlong millis, TRAPS) {
+ 713   if (UseBiasedLocking) {
+ 714     BiasedLocking::revoke(obj, THREAD);
+ 715     assert(!obj-&gt;mark().has_bias_pattern(), &quot;biases should be revoked by now&quot;);
+ 716   }
+ 717   if (millis &lt; 0) {
+ 718     THROW_MSG(vmSymbols::java_lang_IllegalArgumentException(), &quot;timeout value is negative&quot;);
+ 719   }
+ 720   inflate(THREAD, obj(), inflate_cause_wait)-&gt;wait(millis, false, THREAD);
+ 721 }
+ 722 
+ 723 void ObjectSynchronizer::notify(Handle obj, TRAPS) {
+ 724   if (UseBiasedLocking) {
+ 725     BiasedLocking::revoke(obj, THREAD);
+ 726     assert(!obj-&gt;mark().has_bias_pattern(), &quot;biases should be revoked by now&quot;);
+ 727   }
+ 728 
+ 729   markWord mark = obj-&gt;mark();
+ 730   if (mark.has_locker() &amp;&amp; THREAD-&gt;is_lock_owned((address)mark.locker())) {
+ 731     return;
+ 732   }
+ 733   inflate(THREAD, obj(), inflate_cause_notify)-&gt;notify(THREAD);
+ 734 }
+ 735 
+ 736 // NOTE: see comment of notify()
+ 737 void ObjectSynchronizer::notifyall(Handle obj, TRAPS) {
+ 738   if (UseBiasedLocking) {
+ 739     BiasedLocking::revoke(obj, THREAD);
+ 740     assert(!obj-&gt;mark().has_bias_pattern(), &quot;biases should be revoked by now&quot;);
+ 741   }
+ 742 
+ 743   markWord mark = obj-&gt;mark();
+ 744   if (mark.has_locker() &amp;&amp; THREAD-&gt;is_lock_owned((address)mark.locker())) {
+ 745     return;
+ 746   }
+ 747   inflate(THREAD, obj(), inflate_cause_notify)-&gt;notifyAll(THREAD);
+ 748 }
+ 749 
+ 750 // -----------------------------------------------------------------------------
+ 751 // Hash Code handling
+ 752 //
+ 753 // Performance concern:
+ 754 // OrderAccess::storestore() calls release() which at one time stored 0
+ 755 // into the global volatile OrderAccess::dummy variable. This store was
+ 756 // unnecessary for correctness. Many threads storing into a common location
+ 757 // causes considerable cache migration or &quot;sloshing&quot; on large SMP systems.
+ 758 // As such, I avoided using OrderAccess::storestore(). In some cases
+ 759 // OrderAccess::fence() -- which incurs local latency on the executing
+ 760 // processor -- is a better choice as it scales on SMP systems.
+ 761 //
+ 762 // See http://blogs.oracle.com/dave/entry/biased_locking_in_hotspot for
+ 763 // a discussion of coherency costs. Note that all our current reference
+ 764 // platforms provide strong ST-ST order, so the issue is moot on IA32,
+ 765 // x64, and SPARC.
+ 766 //
+ 767 // As a general policy we use &quot;volatile&quot; to control compiler-based reordering
+ 768 // and explicit fences (barriers) to control for architectural reordering
+ 769 // performed by the CPU(s) or platform.
+ 770 
+ 771 struct SharedGlobals {
+ 772   char         _pad_prefix[OM_CACHE_LINE_SIZE];
+ 773   // These are highly shared mostly-read variables.
+ 774   // To avoid false-sharing they need to be the sole occupants of a cache line.
+ 775   volatile int stw_random;
+ 776   volatile int stw_cycle;
+ 777   DEFINE_PAD_MINUS_SIZE(1, OM_CACHE_LINE_SIZE, sizeof(volatile int) * 2);
+ 778   // Hot RW variable -- Sequester to avoid false-sharing
+ 779   volatile int hc_sequence;
+ 780   DEFINE_PAD_MINUS_SIZE(2, OM_CACHE_LINE_SIZE, sizeof(volatile int));
+ 781 };
+ 782 
+ 783 static SharedGlobals GVars;
+ 784 static int _forceMonitorScavenge = 0; // Scavenge required and pending
+ 785 
+ 786 static markWord read_stable_mark(oop obj) {
+ 787   markWord mark = obj-&gt;mark();
+ 788   if (!mark.is_being_inflated()) {
+ 789     return mark;       // normal fast-path return
+ 790   }
+ 791 
+ 792   int its = 0;
+ 793   for (;;) {
+ 794     markWord mark = obj-&gt;mark();
+ 795     if (!mark.is_being_inflated()) {
+ 796       return mark;    // normal fast-path return
+ 797     }
+ 798 
+ 799     // The object is being inflated by some other thread.
+ 800     // The caller of read_stable_mark() must wait for inflation to complete.
+ 801     // Avoid live-lock
+ 802     // TODO: consider calling SafepointSynchronize::do_call_back() while
+ 803     // spinning to see if there&#39;s a safepoint pending.  If so, immediately
+ 804     // yielding or blocking would be appropriate.  Avoid spinning while
+ 805     // there is a safepoint pending.
+ 806     // TODO: add inflation contention performance counters.
+ 807     // TODO: restrict the aggregate number of spinners.
+ 808 
+ 809     ++its;
+ 810     if (its &gt; 10000 || !os::is_MP()) {
+ 811       if (its &amp; 1) {
+ 812         os::naked_yield();
+ 813       } else {
+ 814         // Note that the following code attenuates the livelock problem but is not
+ 815         // a complete remedy.  A more complete solution would require that the inflating
+ 816         // thread hold the associated inflation lock.  The following code simply restricts
+ 817         // the number of spinners to at most one.  We&#39;ll have N-2 threads blocked
+ 818         // on the inflationlock, 1 thread holding the inflation lock and using
+ 819         // a yield/park strategy, and 1 thread in the midst of inflation.
+ 820         // A more refined approach would be to change the encoding of INFLATING
+ 821         // to allow encapsulation of a native thread pointer.  Threads waiting for
+ 822         // inflation to complete would use CAS to push themselves onto a singly linked
+ 823         // list rooted at the markword.  Once enqueued, they&#39;d loop, checking a per-thread flag
+ 824         // and calling park().  When inflation was complete the thread that accomplished inflation
+ 825         // would detach the list and set the markword to inflated with a single CAS and
+ 826         // then for each thread on the list, set the flag and unpark() the thread.
+ 827         // This is conceptually similar to muxAcquire-muxRelease, except that muxRelease
+ 828         // wakes at most one thread whereas we need to wake the entire list.
+ 829         int ix = (cast_from_oop&lt;intptr_t&gt;(obj) &gt;&gt; 5) &amp; (NINFLATIONLOCKS-1);
+ 830         int YieldThenBlock = 0;
+ 831         assert(ix &gt;= 0 &amp;&amp; ix &lt; NINFLATIONLOCKS, &quot;invariant&quot;);
+ 832         assert((NINFLATIONLOCKS &amp; (NINFLATIONLOCKS-1)) == 0, &quot;invariant&quot;);
+ 833         Thread::muxAcquire(gInflationLocks + ix, &quot;gInflationLock&quot;);
+ 834         while (obj-&gt;mark() == markWord::INFLATING()) {
+ 835           // Beware: NakedYield() is advisory and has almost no effect on some platforms
+ 836           // so we periodically call self-&gt;_ParkEvent-&gt;park(1).
+ 837           // We use a mixed spin/yield/block mechanism.
+ 838           if ((YieldThenBlock++) &gt;= 16) {
+ 839             Thread::current()-&gt;_ParkEvent-&gt;park(1);
+ 840           } else {
+ 841             os::naked_yield();
+ 842           }
+ 843         }
+ 844         Thread::muxRelease(gInflationLocks + ix);
+ 845       }
+ 846     } else {
+ 847       SpinPause();       // SMP-polite spinning
+ 848     }
+ 849   }
+ 850 }
+ 851 
+ 852 // hashCode() generation :
+ 853 //
+ 854 // Possibilities:
+ 855 // * MD5Digest of {obj,stw_random}
+ 856 // * CRC32 of {obj,stw_random} or any linear-feedback shift register function.
+ 857 // * A DES- or AES-style SBox[] mechanism
+ 858 // * One of the Phi-based schemes, such as:
+ 859 //   2654435761 = 2^32 * Phi (golden ratio)
+ 860 //   HashCodeValue = ((uintptr_t(obj) &gt;&gt; 3) * 2654435761) ^ GVars.stw_random ;
+ 861 // * A variation of Marsaglia&#39;s shift-xor RNG scheme.
+ 862 // * (obj ^ stw_random) is appealing, but can result
+ 863 //   in undesirable regularity in the hashCode values of adjacent objects
+ 864 //   (objects allocated back-to-back, in particular).  This could potentially
+ 865 //   result in hashtable collisions and reduced hashtable efficiency.
+ 866 //   There are simple ways to &quot;diffuse&quot; the middle address bits over the
+ 867 //   generated hashCode values:
+ 868 
+ 869 static inline intptr_t get_next_hash(Thread* self, oop obj) {
+ 870   intptr_t value = 0;
+ 871   if (hashCode == 0) {
+ 872     // This form uses global Park-Miller RNG.
+ 873     // On MP system we&#39;ll have lots of RW access to a global, so the
+ 874     // mechanism induces lots of coherency traffic.
+ 875     value = os::random();
+ 876   } else if (hashCode == 1) {
+ 877     // This variation has the property of being stable (idempotent)
+ 878     // between STW operations.  This can be useful in some of the 1-0
+ 879     // synchronization schemes.
+ 880     intptr_t addr_bits = cast_from_oop&lt;intptr_t&gt;(obj) &gt;&gt; 3;
+ 881     value = addr_bits ^ (addr_bits &gt;&gt; 5) ^ GVars.stw_random;
+ 882   } else if (hashCode == 2) {
+ 883     value = 1;            // for sensitivity testing
+ 884   } else if (hashCode == 3) {
+ 885     value = ++GVars.hc_sequence;
+ 886   } else if (hashCode == 4) {
+ 887     value = cast_from_oop&lt;intptr_t&gt;(obj);
+ 888   } else {
+ 889     // Marsaglia&#39;s xor-shift scheme with thread-specific state
+ 890     // This is probably the best overall implementation -- we&#39;ll
+ 891     // likely make this the default in future releases.
+ 892     unsigned t = self-&gt;_hashStateX;
+ 893     t ^= (t &lt;&lt; 11);
+ 894     self-&gt;_hashStateX = self-&gt;_hashStateY;
+ 895     self-&gt;_hashStateY = self-&gt;_hashStateZ;
+ 896     self-&gt;_hashStateZ = self-&gt;_hashStateW;
+ 897     unsigned v = self-&gt;_hashStateW;
+ 898     v = (v ^ (v &gt;&gt; 19)) ^ (t ^ (t &gt;&gt; 8));
+ 899     self-&gt;_hashStateW = v;
+ 900     value = v;
+ 901   }
+ 902 
+ 903   value &amp;= markWord::hash_mask;
+ 904   if (value == 0) value = 0xBAD;
+ 905   assert(value != markWord::no_hash, &quot;invariant&quot;);
+ 906   return value;
+ 907 }
+ 908 
+ 909 intptr_t ObjectSynchronizer::FastHashCode(Thread* self, oop obj) {
+ 910   if (UseBiasedLocking) {
+ 911     // NOTE: many places throughout the JVM do not expect a safepoint
+ 912     // to be taken here, in particular most operations on perm gen
+ 913     // objects. However, we only ever bias Java instances and all of
+ 914     // the call sites of identity_hash that might revoke biases have
+ 915     // been checked to make sure they can handle a safepoint. The
+ 916     // added check of the bias pattern is to avoid useless calls to
+ 917     // thread-local storage.
+ 918     if (obj-&gt;mark().has_bias_pattern()) {
+ 919       // Handle for oop obj in case of STW safepoint
+ 920       Handle hobj(self, obj);
+ 921       // Relaxing assertion for bug 6320749.
+ 922       assert(Universe::verify_in_progress() ||
+ 923              !SafepointSynchronize::is_at_safepoint(),
+ 924              &quot;biases should not be seen by VM thread here&quot;);
+ 925       BiasedLocking::revoke(hobj, JavaThread::current());
+ 926       obj = hobj();
+ 927       assert(!obj-&gt;mark().has_bias_pattern(), &quot;biases should be revoked by now&quot;);
+ 928     }
+ 929   }
+ 930 
+ 931   // hashCode() is a heap mutator ...
+ 932   // Relaxing assertion for bug 6320749.
+ 933   assert(Universe::verify_in_progress() || DumpSharedSpaces ||
+ 934          !SafepointSynchronize::is_at_safepoint(), &quot;invariant&quot;);
+ 935   assert(Universe::verify_in_progress() || DumpSharedSpaces ||
+ 936          self-&gt;is_Java_thread() , &quot;invariant&quot;);
+ 937   assert(Universe::verify_in_progress() || DumpSharedSpaces ||
+ 938          ((JavaThread *)self)-&gt;thread_state() != _thread_blocked, &quot;invariant&quot;);
+ 939 
+ 940   ObjectMonitor* monitor = NULL;
+ 941   markWord temp, test;
+ 942   intptr_t hash;
+ 943   markWord mark = read_stable_mark(obj);
+ 944 
+ 945   // object should remain ineligible for biased locking
+ 946   assert(!mark.has_bias_pattern(), &quot;invariant&quot;);
+ 947 
+ 948   if (mark.is_neutral()) {            // if this is a normal header
+ 949     hash = mark.hash();
+ 950     if (hash != 0) {                  // if it has a hash, just return it
+ 951       return hash;
+ 952     }
+ 953     hash = get_next_hash(self, obj);  // get a new hash
+ 954     temp = mark.copy_set_hash(hash);  // merge the hash into header
+ 955                                       // try to install the hash
+ 956     test = obj-&gt;cas_set_mark(temp, mark);
+ 957     if (test == mark) {               // if the hash was installed, return it
+ 958       return hash;
+ 959     }
+ 960     // Failed to install the hash. It could be that another thread
+ 961     // installed the hash just before our attempt or inflation has
+ 962     // occurred or... so we fall thru to inflate the monitor for
+ 963     // stability and then install the hash.
+ 964   } else if (mark.has_monitor()) {
+ 965     monitor = mark.monitor();
+ 966     temp = monitor-&gt;header();
+ 967     assert(temp.is_neutral(), &quot;invariant: header=&quot; INTPTR_FORMAT, temp.value());
+ 968     hash = temp.hash();
+ 969     if (hash != 0) {                  // if it has a hash, just return it
+ 970       return hash;
+ 971     }
+ 972     // Fall thru so we only have one place that installs the hash in
+ 973     // the ObjectMonitor.
+ 974   } else if (self-&gt;is_lock_owned((address)mark.locker())) {
+ 975     // This is a stack lock owned by the calling thread so fetch the
+ 976     // displaced markWord from the BasicLock on the stack.
+ 977     temp = mark.displaced_mark_helper();
+ 978     assert(temp.is_neutral(), &quot;invariant: header=&quot; INTPTR_FORMAT, temp.value());
+ 979     hash = temp.hash();
+ 980     if (hash != 0) {                  // if it has a hash, just return it
+ 981       return hash;
+ 982     }
+ 983     // WARNING:
+ 984     // The displaced header in the BasicLock on a thread&#39;s stack
+ 985     // is strictly immutable. It CANNOT be changed in ANY cases.
+ 986     // So we have to inflate the stack lock into an ObjectMonitor
+ 987     // even if the current thread owns the lock. The BasicLock on
+ 988     // a thread&#39;s stack can be asynchronously read by other threads
+ 989     // during an inflate() call so any change to that stack memory
+ 990     // may not propagate to other threads correctly.
+ 991   }
+ 992 
+ 993   // Inflate the monitor to set the hash.
+ 994   monitor = inflate(self, obj, inflate_cause_hash_code);
+ 995   // Load ObjectMonitor&#39;s header/dmw field and see if it has a hash.
+ 996   mark = monitor-&gt;header();
+ 997   assert(mark.is_neutral(), &quot;invariant: header=&quot; INTPTR_FORMAT, mark.value());
+ 998   hash = mark.hash();
+ 999   if (hash == 0) {                    // if it does not have a hash
+1000     hash = get_next_hash(self, obj);  // get a new hash
+1001     temp = mark.copy_set_hash(hash);  // merge the hash into header
+1002     assert(temp.is_neutral(), &quot;invariant: header=&quot; INTPTR_FORMAT, temp.value());
+1003     uintptr_t v = Atomic::cmpxchg((volatile uintptr_t*)monitor-&gt;header_addr(), mark.value(), temp.value());
+1004     test = markWord(v);
+1005     if (test != mark) {
+1006       // The attempt to update the ObjectMonitor&#39;s header/dmw field
+1007       // did not work. This can happen if another thread managed to
+1008       // merge in the hash just before our cmpxchg().
+1009       // If we add any new usages of the header/dmw field, this code
+1010       // will need to be updated.
+1011       hash = test.hash();
+1012       assert(test.is_neutral(), &quot;invariant: header=&quot; INTPTR_FORMAT, test.value());
+1013       assert(hash != 0, &quot;should only have lost the race to a thread that set a non-zero hash&quot;);
+1014     }
+1015   }
+1016   // We finally get the hash.
+1017   return hash;
+1018 }
+1019 
+1020 // Deprecated -- use FastHashCode() instead.
+1021 
+1022 intptr_t ObjectSynchronizer::identity_hash_value_for(Handle obj) {
+1023   return FastHashCode(Thread::current(), obj());
+1024 }
+1025 
+1026 
+1027 bool ObjectSynchronizer::current_thread_holds_lock(JavaThread* thread,
+1028                                                    Handle h_obj) {
+1029   if (UseBiasedLocking) {
+1030     BiasedLocking::revoke(h_obj, thread);
+1031     assert(!h_obj-&gt;mark().has_bias_pattern(), &quot;biases should be revoked by now&quot;);
+1032   }
+1033 
+1034   assert(thread == JavaThread::current(), &quot;Can only be called on current thread&quot;);
+1035   oop obj = h_obj();
+1036 
+1037   markWord mark = read_stable_mark(obj);
+1038 
+1039   // Uncontended case, header points to stack
+1040   if (mark.has_locker()) {
+1041     return thread-&gt;is_lock_owned((address)mark.locker());
+1042   }
+1043   // Contended case, header points to ObjectMonitor (tagged pointer)
+1044   if (mark.has_monitor()) {
+1045     ObjectMonitor* monitor = mark.monitor();
+1046     return monitor-&gt;is_entered(thread) != 0;
+1047   }
+1048   // Unlocked case, header in place
+1049   assert(mark.is_neutral(), &quot;sanity check&quot;);
+1050   return false;
+1051 }
+1052 
+1053 // Be aware of this method could revoke bias of the lock object.
+1054 // This method queries the ownership of the lock handle specified by &#39;h_obj&#39;.
+1055 // If the current thread owns the lock, it returns owner_self. If no
+1056 // thread owns the lock, it returns owner_none. Otherwise, it will return
+1057 // owner_other.
+1058 ObjectSynchronizer::LockOwnership ObjectSynchronizer::query_lock_ownership
+1059 (JavaThread *self, Handle h_obj) {
+1060   // The caller must beware this method can revoke bias, and
+1061   // revocation can result in a safepoint.
+1062   assert(!SafepointSynchronize::is_at_safepoint(), &quot;invariant&quot;);
+1063   assert(self-&gt;thread_state() != _thread_blocked, &quot;invariant&quot;);
+1064 
+1065   // Possible mark states: neutral, biased, stack-locked, inflated
+1066 
+1067   if (UseBiasedLocking &amp;&amp; h_obj()-&gt;mark().has_bias_pattern()) {
+1068     // CASE: biased
+1069     BiasedLocking::revoke(h_obj, self);
+1070     assert(!h_obj-&gt;mark().has_bias_pattern(),
+1071            &quot;biases should be revoked by now&quot;);
+1072   }
+1073 
+1074   assert(self == JavaThread::current(), &quot;Can only be called on current thread&quot;);
+1075   oop obj = h_obj();
+1076   markWord mark = read_stable_mark(obj);
+1077 
+1078   // CASE: stack-locked.  Mark points to a BasicLock on the owner&#39;s stack.
+1079   if (mark.has_locker()) {
+1080     return self-&gt;is_lock_owned((address)mark.locker()) ?
+1081       owner_self : owner_other;
+1082   }
+1083 
+1084   // CASE: inflated. Mark (tagged pointer) points to an ObjectMonitor.
+1085   // The Object:ObjectMonitor relationship is stable as long as we&#39;re
+1086   // not at a safepoint.
+1087   if (mark.has_monitor()) {
+1088     void* owner = mark.monitor()-&gt;_owner;
+1089     if (owner == NULL) return owner_none;
+1090     return (owner == self ||
+1091             self-&gt;is_lock_owned((address)owner)) ? owner_self : owner_other;
+1092   }
+1093 
+1094   // CASE: neutral
+1095   assert(mark.is_neutral(), &quot;sanity check&quot;);
+1096   return owner_none;           // it&#39;s unlocked
+1097 }
+1098 
+1099 // FIXME: jvmti should call this
+1100 JavaThread* ObjectSynchronizer::get_lock_owner(ThreadsList * t_list, Handle h_obj) {
+1101   if (UseBiasedLocking) {
+1102     if (SafepointSynchronize::is_at_safepoint()) {
+1103       BiasedLocking::revoke_at_safepoint(h_obj);
+1104     } else {
+1105       BiasedLocking::revoke(h_obj, JavaThread::current());
+1106     }
+1107     assert(!h_obj-&gt;mark().has_bias_pattern(), &quot;biases should be revoked by now&quot;);
+1108   }
+1109 
+1110   oop obj = h_obj();
+1111   address owner = NULL;
+1112 
+1113   markWord mark = read_stable_mark(obj);
+1114 
+1115   // Uncontended case, header points to stack
+1116   if (mark.has_locker()) {
+1117     owner = (address) mark.locker();
+1118   }
+1119 
+1120   // Contended case, header points to ObjectMonitor (tagged pointer)
+1121   else if (mark.has_monitor()) {
+1122     ObjectMonitor* monitor = mark.monitor();
+1123     assert(monitor != NULL, &quot;monitor should be non-null&quot;);
+1124     owner = (address) monitor-&gt;owner();
+1125   }
+1126 
+1127   if (owner != NULL) {
+1128     // owning_thread_from_monitor_owner() may also return NULL here
+1129     return Threads::owning_thread_from_monitor_owner(t_list, owner);
+1130   }
+1131 
+1132   // Unlocked case, header in place
+1133   // Cannot have assertion since this object may have been
+1134   // locked by another thread when reaching here.
+1135   // assert(mark.is_neutral(), &quot;sanity check&quot;);
+1136 
+1137   return NULL;
+1138 }
+1139 
+1140 // Visitors ...
+1141 
+1142 void ObjectSynchronizer::monitors_iterate(MonitorClosure* closure) {
+1143   PaddedObjectMonitor* block = Atomic::load(&amp;g_block_list);
+1144   while (block != NULL) {
+1145     assert(block-&gt;object() == CHAINMARKER, &quot;must be a block header&quot;);
+1146     for (int i = _BLOCKSIZE - 1; i &gt; 0; i--) {
+1147       ObjectMonitor* mid = (ObjectMonitor *)(block + i);
+1148       oop object = (oop)mid-&gt;object();
+1149       if (object != NULL) {
+1150         // Only process with closure if the object is set.
+1151         closure-&gt;do_monitor(mid);
+1152       }
+1153     }
+1154     // unmarked_next() is not needed with g_block_list (no locking
+1155     // used with block linkage _next_om fields).
+1156     block = (PaddedObjectMonitor*)block-&gt;next_om();
+1157   }
+1158 }
+1159 
+1160 static bool monitors_used_above_threshold() {
+1161   int population = Atomic::load(&amp;om_list_globals._population);
+1162   if (population == 0) {
+1163     return false;
+1164   }
+1165   if (MonitorUsedDeflationThreshold &gt; 0) {
+1166     int monitors_used = population - Atomic::load(&amp;om_list_globals._free_count);
+1167     int monitor_usage = (monitors_used * 100LL) / population;
+1168     return monitor_usage &gt; MonitorUsedDeflationThreshold;
+1169   }
+1170   return false;
+1171 }
+1172 
+1173 // Returns true if MonitorBound is set (&gt; 0) and if the specified
+1174 // cnt is &gt; MonitorBound. Otherwise returns false.
+1175 static bool is_MonitorBound_exceeded(const int cnt) {
+1176   const int mx = MonitorBound;
+1177   return mx &gt; 0 &amp;&amp; cnt &gt; mx;
+1178 }
+1179 
+1180 bool ObjectSynchronizer::is_cleanup_needed() {
+1181   if (monitors_used_above_threshold()) {
+1182     // Too many monitors in use.
+1183     return true;
+1184   }
+1185   return needs_monitor_scavenge();
+1186 }
+1187 
+1188 bool ObjectSynchronizer::needs_monitor_scavenge() {
+1189   if (Atomic::load(&amp;_forceMonitorScavenge) == 1) {
+1190     log_info(monitorinflation)(&quot;Monitor scavenge needed, triggering safepoint cleanup.&quot;);
+1191     return true;
+1192   }
+1193   return false;
+1194 }
+1195 
+1196 void ObjectSynchronizer::oops_do(OopClosure* f) {
+1197   // We only scan the global used list here (for moribund threads), and
+1198   // the thread-local monitors in Thread::oops_do().
+1199   global_used_oops_do(f);
+1200 }
+1201 
+1202 void ObjectSynchronizer::global_used_oops_do(OopClosure* f) {
+1203   assert(SafepointSynchronize::is_at_safepoint(), &quot;must be at safepoint&quot;);
+1204   list_oops_do(Atomic::load(&amp;om_list_globals._in_use_list), f);
+1205 }
+1206 
+1207 void ObjectSynchronizer::thread_local_used_oops_do(Thread* thread, OopClosure* f) {
+1208   assert(SafepointSynchronize::is_at_safepoint(), &quot;must be at safepoint&quot;);
+1209   list_oops_do(thread-&gt;om_in_use_list, f);
+1210 }
+1211 
+1212 void ObjectSynchronizer::list_oops_do(ObjectMonitor* list, OopClosure* f) {
+1213   assert(SafepointSynchronize::is_at_safepoint(), &quot;must be at safepoint&quot;);
+1214   // The oops_do() phase does not overlap with monitor deflation
+1215   // so no need to lock ObjectMonitors for the list traversal.
+1216   for (ObjectMonitor* mid = list; mid != NULL; mid = unmarked_next(mid)) {
+1217     if (mid-&gt;object() != NULL) {
+1218       f-&gt;do_oop((oop*)mid-&gt;object_addr());
+1219     }
+1220   }
+1221 }
+1222 
+1223 
+1224 // -----------------------------------------------------------------------------
+1225 // ObjectMonitor Lifecycle
+1226 // -----------------------
+1227 // Inflation unlinks monitors from om_list_globals._free_list or a per-thread
+1228 // free list and associates them with objects. Deflation -- which occurs at
+1229 // STW-time -- disassociates idle monitors from objects.
+1230 // Such scavenged monitors are returned to the om_list_globals._free_list.
+1231 //
+1232 // ObjectMonitors reside in type-stable memory (TSM) and are immortal.
+1233 //
+1234 // Lifecycle:
+1235 // --   unassigned and on the om_list_globals._free_list
+1236 // --   unassigned and on a per-thread free list
+1237 // --   assigned to an object.  The object is inflated and the mark refers
+1238 //      to the ObjectMonitor.
+1239 
+1240 
+1241 // Constraining monitor pool growth via MonitorBound ...
+1242 //
+1243 // If MonitorBound is not set (&lt;= 0), MonitorBound checks are disabled.
+1244 //
+1245 // The monitor pool is grow-only.  We scavenge at STW safepoint-time, but the
+1246 // the rate of scavenging is driven primarily by GC.  As such,  we can find
+1247 // an inordinate number of monitors in circulation.
+1248 // To avoid that scenario we can artificially induce a STW safepoint
+1249 // if the pool appears to be growing past some reasonable bound.
+1250 // Generally we favor time in space-time tradeoffs, but as there&#39;s no
+1251 // natural back-pressure on the # of extant monitors we need to impose some
+1252 // type of limit.  Beware that if MonitorBound is set to too low a value
+1253 // we could just loop. In addition, if MonitorBound is set to a low value
+1254 // we&#39;ll incur more safepoints, which are harmful to performance.
+1255 // See also: GuaranteedSafepointInterval
+1256 //
+1257 // If MonitorBound is set, the boundry applies to
+1258 //     (om_list_globals._population - om_list_globals._free_count)
+1259 // i.e., if there are not enough ObjectMonitors on the global free list,
+1260 // then a safepoint deflation is induced. Picking a good MonitorBound value
+1261 // is non-trivial.
+1262 
+1263 static void InduceScavenge(Thread* self, const char * Whence) {
+1264   // Induce STW safepoint to trim monitors
+1265   // Ultimately, this results in a call to deflate_idle_monitors() in the near future.
+1266   // More precisely, trigger a cleanup safepoint as the number
+1267   // of active monitors passes the specified threshold.
+1268   // TODO: assert thread state is reasonable
+1269 
+1270   if (Atomic::xchg(&amp;_forceMonitorScavenge, 1) == 0) {
+1271     VMThread::check_for_forced_cleanup();
+1272   }
+1273 }
+1274 
+1275 ObjectMonitor* ObjectSynchronizer::om_alloc(Thread* self) {
+1276   // A large MAXPRIVATE value reduces both list lock contention
+1277   // and list coherency traffic, but also tends to increase the
+1278   // number of ObjectMonitors in circulation as well as the STW
+1279   // scavenge costs.  As usual, we lean toward time in space-time
+1280   // tradeoffs.
+1281   const int MAXPRIVATE = 1024;
+1282   NoSafepointVerifier nsv;
+1283 
+1284   stringStream ss;
+1285   for (;;) {
+1286     ObjectMonitor* m;
+1287 
+1288     // 1: try to allocate from the thread&#39;s local om_free_list.
+1289     // Threads will attempt to allocate first from their local list, then
+1290     // from the global list, and only after those attempts fail will the
+1291     // thread attempt to instantiate new monitors. Thread-local free lists
+1292     // improve allocation latency, as well as reducing coherency traffic
+1293     // on the shared global list.
+1294     m = take_from_start_of_om_free_list(self);
+1295     if (m != NULL) {
+1296       guarantee(m-&gt;object() == NULL, &quot;invariant&quot;);
+1297       prepend_to_om_in_use_list(self, m);
+1298       return m;
+1299     }
+1300 
+1301     // 2: try to allocate from the global om_list_globals._free_list
+1302     // If we&#39;re using thread-local free lists then try
+1303     // to reprovision the caller&#39;s free list.
+1304     if (Atomic::load(&amp;om_list_globals._free_list) != NULL) {
+1305       // Reprovision the thread&#39;s om_free_list.
+1306       // Use bulk transfers to reduce the allocation rate and heat
+1307       // on various locks.
+1308       for (int i = self-&gt;om_free_provision; --i &gt;= 0;) {
+1309         ObjectMonitor* take = take_from_start_of_global_free_list();
+1310         if (take == NULL) {
+1311           break;  // No more are available.
+1312         }
+1313         guarantee(take-&gt;object() == NULL, &quot;invariant&quot;);
+1314         take-&gt;Recycle();
+1315         om_release(self, take, false);
+1316       }
+1317       self-&gt;om_free_provision += 1 + (self-&gt;om_free_provision / 2);
+1318       if (self-&gt;om_free_provision &gt; MAXPRIVATE) self-&gt;om_free_provision = MAXPRIVATE;
+1319 
+1320       if (is_MonitorBound_exceeded(Atomic::load(&amp;om_list_globals._population) -
+1321                                    Atomic::load(&amp;om_list_globals._free_count))) {
+1322         // Not enough ObjectMonitors on the global free list.
+1323         // We can&#39;t safely induce a STW safepoint from om_alloc() as our thread
+1324         // state may not be appropriate for such activities and callers may hold
+1325         // naked oops, so instead we defer the action.
+1326         InduceScavenge(self, &quot;om_alloc&quot;);
+1327       }
+1328       continue;
+1329     }
+1330 
+1331     // 3: allocate a block of new ObjectMonitors
+1332     // Both the local and global free lists are empty -- resort to malloc().
+1333     // In the current implementation ObjectMonitors are TSM - immortal.
+1334     // Ideally, we&#39;d write &quot;new ObjectMonitor[_BLOCKSIZE], but we want
+1335     // each ObjectMonitor to start at the beginning of a cache line,
+1336     // so we use align_up().
+1337     // A better solution would be to use C++ placement-new.
+1338     // BEWARE: As it stands currently, we don&#39;t run the ctors!
+1339     assert(_BLOCKSIZE &gt; 1, &quot;invariant&quot;);
+1340     size_t neededsize = sizeof(PaddedObjectMonitor) * _BLOCKSIZE;
+1341     PaddedObjectMonitor* temp;
+1342     size_t aligned_size = neededsize + (OM_CACHE_LINE_SIZE - 1);
+1343     void* real_malloc_addr = NEW_C_HEAP_ARRAY(char, aligned_size, mtInternal);
+1344     temp = (PaddedObjectMonitor*)align_up(real_malloc_addr, OM_CACHE_LINE_SIZE);
+1345     (void)memset((void *) temp, 0, neededsize);
+1346 
+1347     // Format the block.
+1348     // initialize the linked list, each monitor points to its next
+1349     // forming the single linked free list, the very first monitor
+1350     // will points to next block, which forms the block list.
+1351     // The trick of using the 1st element in the block as g_block_list
+1352     // linkage should be reconsidered.  A better implementation would
+1353     // look like: class Block { Block * next; int N; ObjectMonitor Body [N] ; }
+1354 
+1355     for (int i = 1; i &lt; _BLOCKSIZE; i++) {
+1356       temp[i].set_next_om((ObjectMonitor*)&amp;temp[i + 1]);
+1357     }
+1358 
+1359     // terminate the last monitor as the end of list
+1360     temp[_BLOCKSIZE - 1].set_next_om((ObjectMonitor*)NULL);
+1361 
+1362     // Element [0] is reserved for global list linkage
+1363     temp[0].set_object(CHAINMARKER);
+1364 
+1365     // Consider carving out this thread&#39;s current request from the
+1366     // block in hand.  This avoids some lock traffic and redundant
+1367     // list activity.
+1368 
+1369     prepend_block_to_lists(temp);
+1370   }
+1371 }
+1372 
+1373 // Place &quot;m&quot; on the caller&#39;s private per-thread om_free_list.
+1374 // In practice there&#39;s no need to clamp or limit the number of
+1375 // monitors on a thread&#39;s om_free_list as the only non-allocation time
+1376 // we&#39;ll call om_release() is to return a monitor to the free list after
+1377 // a CAS attempt failed. This doesn&#39;t allow unbounded #s of monitors to
+1378 // accumulate on a thread&#39;s free list.
+1379 //
+1380 // Key constraint: all ObjectMonitors on a thread&#39;s free list and the global
+1381 // free list must have their object field set to null. This prevents the
+1382 // scavenger -- deflate_monitor_list() -- from reclaiming them while we
+1383 // are trying to release them.
+1384 
+1385 void ObjectSynchronizer::om_release(Thread* self, ObjectMonitor* m,
+1386                                     bool from_per_thread_alloc) {
+1387   guarantee(m-&gt;header().value() == 0, &quot;invariant&quot;);
+1388   guarantee(m-&gt;object() == NULL, &quot;invariant&quot;);
+1389   NoSafepointVerifier nsv;
+1390 
+1391   stringStream ss;
+1392   guarantee((m-&gt;is_busy() | m-&gt;_recursions) == 0, &quot;freeing in-use monitor: &quot;
+1393             &quot;%s, recursions=&quot; INTX_FORMAT, m-&gt;is_busy_to_string(&amp;ss),
+1394             m-&gt;_recursions);
+1395   // _next_om is used for both per-thread in-use and free lists so
+1396   // we have to remove &#39;m&#39; from the in-use list first (as needed).
+1397   if (from_per_thread_alloc) {
+1398     // Need to remove &#39;m&#39; from om_in_use_list.
+1399     ObjectMonitor* mid = NULL;
+1400     ObjectMonitor* next = NULL;
+1401 
+1402     // This list walk can only race with another list walker since
+1403     // deflation can only happen at a safepoint so we don&#39;t have to
+1404     // worry about an ObjectMonitor being removed from this list
+1405     // while we are walking it.
+1406 
+1407     // Lock the list head to avoid racing with another list walker.
+1408     if ((mid = get_list_head_locked(&amp;self-&gt;om_in_use_list)) == NULL) {
+1409       fatal(&quot;thread=&quot; INTPTR_FORMAT &quot; in-use list must not be empty.&quot;, p2i(self));
+1410     }
+1411     next = unmarked_next(mid);
+1412     if (m == mid) {
+1413       // First special case:
+1414       // &#39;m&#39; matches mid, is the list head and is locked. Switch the list
+1415       // head to next which unlocks the list head, but leaves the extracted
+1416       // mid locked:
+1417       Atomic::store(&amp;self-&gt;om_in_use_list, next);
+1418     } else if (m == next) {
+1419       // Second special case:
+1420       // &#39;m&#39; matches next after the list head and we already have the list
+1421       // head locked so set mid to what we are extracting:
+1422       mid = next;
+1423       // Lock mid to prevent races with a list walker:
+1424       om_lock(mid);
+1425       // Update next to what follows mid (if anything):
+1426       next = unmarked_next(mid);
+1427       // Switch next after the list head to new next which unlocks the
+1428       // list head, but leaves the extracted mid locked:
+1429       self-&gt;om_in_use_list-&gt;set_next_om(next);
+1430     } else {
+1431       // We have to search the list to find &#39;m&#39;.
+1432       om_unlock(mid);  // unlock the list head
+1433       guarantee(next != NULL, &quot;thread=&quot; INTPTR_FORMAT &quot;: om_in_use_list=&quot; INTPTR_FORMAT
+1434                 &quot; is too short.&quot;, p2i(self), p2i(self-&gt;om_in_use_list));
+1435       // Our starting anchor is next after the list head which is the
+1436       // last ObjectMonitor we checked:
+1437       ObjectMonitor* anchor = next;
+1438       while ((mid = unmarked_next(anchor)) != NULL) {
+1439         if (m == mid) {
+1440           // We found &#39;m&#39; on the per-thread in-use list so extract it.
+1441           om_lock(anchor);  // Lock the anchor so we can safely modify it.
+1442           // Update next to what follows mid (if anything):
+1443           next = unmarked_next(mid);
+1444           // Switch next after the anchor to new next which unlocks the
+1445           // anchor, but leaves the extracted mid locked:
+1446           anchor-&gt;set_next_om(next);
+1447           break;
+1448         } else {
+1449           anchor = mid;
+1450         }
+1451       }
+1452     }
+1453 
+1454     if (mid == NULL) {
+1455       // Reached end of the list and didn&#39;t find &#39;m&#39; so:
+1456       fatal(&quot;thread=&quot; INTPTR_FORMAT &quot; must find m=&quot; INTPTR_FORMAT &quot;on om_in_use_list=&quot;
+1457             INTPTR_FORMAT, p2i(self), p2i(m), p2i(self-&gt;om_in_use_list));
+1458     }
+1459 
+1460     // At this point mid is disconnected from the in-use list so
+1461     // its lock no longer has any effects on the in-use list.
+1462     Atomic::dec(&amp;self-&gt;om_in_use_count);
+1463     // Unlock mid, but leave the next value for any lagging list
+1464     // walkers. It will get cleaned up when mid is prepended to
+1465     // the thread&#39;s free list:
+1466     om_unlock(mid);
+1467   }
+1468 
+1469   prepend_to_om_free_list(self, m);
+1470 }
+1471 
+1472 // Return ObjectMonitors on a moribund thread&#39;s free and in-use
+1473 // lists to the appropriate global lists. The ObjectMonitors on the
+1474 // per-thread in-use list may still be in use by other threads.
+1475 //
+1476 // We currently call om_flush() from Threads::remove() before the
+1477 // thread has been excised from the thread list and is no longer a
+1478 // mutator. This means that om_flush() cannot run concurrently with
+1479 // a safepoint and interleave with deflate_idle_monitors(). In
+1480 // particular, this ensures that the thread&#39;s in-use monitors are
+1481 // scanned by a GC safepoint, either via Thread::oops_do() (before
+1482 // om_flush() is called) or via ObjectSynchronizer::oops_do() (after
+1483 // om_flush() is called).
+1484 
+1485 void ObjectSynchronizer::om_flush(Thread* self) {
+1486   // Process the per-thread in-use list first to be consistent.
+1487   int in_use_count = 0;
+1488   ObjectMonitor* in_use_list = NULL;
+1489   ObjectMonitor* in_use_tail = NULL;
+1490   NoSafepointVerifier nsv;
+1491 
+1492   // This function can race with a list walker thread so we lock the
+1493   // list head to prevent confusion.
+1494   if ((in_use_list = get_list_head_locked(&amp;self-&gt;om_in_use_list)) != NULL) {
+1495     // At this point, we have locked the in-use list head so a racing
+1496     // thread cannot come in after us. However, a racing thread could
+1497     // be ahead of us; we&#39;ll detect that and delay to let it finish.
+1498     //
+1499     // The thread is going away, however the ObjectMonitors on the
+1500     // om_in_use_list may still be in-use by other threads. Link
+1501     // them to in_use_tail, which will be linked into the global
+1502     // in-use list (om_list_globals._in_use_list) below.
+1503     //
+1504     // Account for the in-use list head before the loop since it is
+1505     // already locked (by this thread):
+1506     in_use_tail = in_use_list;
+1507     in_use_count++;
+1508     for (ObjectMonitor* cur_om = unmarked_next(in_use_list); cur_om != NULL; cur_om = unmarked_next(cur_om)) {
+1509       if (is_locked(cur_om)) {
+1510         // cur_om is locked so there must be a racing walker thread ahead
+1511         // of us so we&#39;ll give it a chance to finish.
+1512         while (is_locked(cur_om)) {
+1513           os::naked_short_sleep(1);
+1514         }
+1515       }
+1516       in_use_tail = cur_om;
+1517       in_use_count++;
+1518     }
+1519     guarantee(in_use_tail != NULL, &quot;invariant&quot;);
+1520     int l_om_in_use_count = Atomic::load(&amp;self-&gt;om_in_use_count);
+1521     assert(l_om_in_use_count == in_use_count, &quot;in-use counts don&#39;t match: &quot;
+1522           &quot;l_om_in_use_count=%d, in_use_count=%d&quot;, l_om_in_use_count, in_use_count);
+1523     Atomic::store(&amp;self-&gt;om_in_use_count, 0);
+1524     // Clear the in-use list head (which also unlocks it):
+1525     Atomic::store(&amp;self-&gt;om_in_use_list, (ObjectMonitor*)NULL);
+1526     om_unlock(in_use_list);
+1527   }
+1528 
+1529   int free_count = 0;
+1530   ObjectMonitor* free_list = NULL;
+1531   ObjectMonitor* free_tail = NULL;
+1532   // This function can race with a list walker thread so we lock the
+1533   // list head to prevent confusion.
+1534   if ((free_list = get_list_head_locked(&amp;self-&gt;om_free_list)) != NULL) {
+1535     // At this point, we have locked the free list head so a racing
+1536     // thread cannot come in after us. However, a racing thread could
+1537     // be ahead of us; we&#39;ll detect that and delay to let it finish.
+1538     //
+1539     // The thread is going away. Set &#39;free_tail&#39; to the last per-thread free
+1540     // monitor which will be linked to om_list_globals._free_list below.
+1541     //
+1542     // Account for the free list head before the loop since it is
+1543     // already locked (by this thread):
+1544     free_tail = free_list;
+1545     free_count++;
+1546     for (ObjectMonitor* s = unmarked_next(free_list); s != NULL; s = unmarked_next(s)) {
+1547       if (is_locked(s)) {
+1548         // s is locked so there must be a racing walker thread ahead
+1549         // of us so we&#39;ll give it a chance to finish.
+1550         while (is_locked(s)) {
+1551           os::naked_short_sleep(1);
+1552         }
+1553       }
+1554       free_tail = s;
+1555       free_count++;
+1556       guarantee(s-&gt;object() == NULL, &quot;invariant&quot;);
+1557       stringStream ss;
+1558       guarantee(!s-&gt;is_busy(), &quot;must be !is_busy: %s&quot;, s-&gt;is_busy_to_string(&amp;ss));
+1559     }
+1560     guarantee(free_tail != NULL, &quot;invariant&quot;);
+1561     int l_om_free_count = Atomic::load(&amp;self-&gt;om_free_count);
+1562     assert(l_om_free_count == free_count, &quot;free counts don&#39;t match: &quot;
+1563            &quot;l_om_free_count=%d, free_count=%d&quot;, l_om_free_count, free_count);
+1564     Atomic::store(&amp;self-&gt;om_free_count, 0);
+1565     Atomic::store(&amp;self-&gt;om_free_list, (ObjectMonitor*)NULL);
+1566     om_unlock(free_list);
+1567   }
+1568 
+1569   if (free_tail != NULL) {
+1570     prepend_list_to_global_free_list(free_list, free_tail, free_count);
+1571   }
+1572 
+1573   if (in_use_tail != NULL) {
+1574     prepend_list_to_global_in_use_list(in_use_list, in_use_tail, in_use_count);
+1575   }
+1576 
+1577   LogStreamHandle(Debug, monitorinflation) lsh_debug;
+1578   LogStreamHandle(Info, monitorinflation) lsh_info;
+1579   LogStream* ls = NULL;
+1580   if (log_is_enabled(Debug, monitorinflation)) {
+1581     ls = &amp;lsh_debug;
+1582   } else if ((free_count != 0 || in_use_count != 0) &amp;&amp;
+1583              log_is_enabled(Info, monitorinflation)) {
+1584     ls = &amp;lsh_info;
+1585   }
+1586   if (ls != NULL) {
+1587     ls-&gt;print_cr(&quot;om_flush: jt=&quot; INTPTR_FORMAT &quot;, free_count=%d&quot;
+1588                  &quot;, in_use_count=%d&quot; &quot;, om_free_provision=%d&quot;,
+1589                  p2i(self), free_count, in_use_count, self-&gt;om_free_provision);
+1590   }
+1591 }
+1592 
+1593 static void post_monitor_inflate_event(EventJavaMonitorInflate* event,
+1594                                        const oop obj,
+1595                                        ObjectSynchronizer::InflateCause cause) {
+1596   assert(event != NULL, &quot;invariant&quot;);
+1597   assert(event-&gt;should_commit(), &quot;invariant&quot;);
+1598   event-&gt;set_monitorClass(obj-&gt;klass());
+1599   event-&gt;set_address((uintptr_t)(void*)obj);
+1600   event-&gt;set_cause((u1)cause);
+1601   event-&gt;commit();
+1602 }
+1603 
+1604 // Fast path code shared by multiple functions
+1605 void ObjectSynchronizer::inflate_helper(oop obj) {
+1606   markWord mark = obj-&gt;mark();
+1607   if (mark.has_monitor()) {
+1608     assert(ObjectSynchronizer::verify_objmon_isinpool(mark.monitor()), &quot;monitor is invalid&quot;);
+1609     assert(mark.monitor()-&gt;header().is_neutral(), &quot;monitor must record a good object header&quot;);
+1610     return;
+1611   }
+1612   inflate(Thread::current(), obj, inflate_cause_vm_internal);
+1613 }
+1614 
+1615 ObjectMonitor* ObjectSynchronizer::inflate(Thread* self,
+1616                                            oop object, const InflateCause cause) {
+1617   // Inflate mutates the heap ...
+1618   // Relaxing assertion for bug 6320749.
+1619   assert(Universe::verify_in_progress() ||
+1620          !SafepointSynchronize::is_at_safepoint(), &quot;invariant&quot;);
+1621 
+1622   EventJavaMonitorInflate event;
+1623 
+1624   for (;;) {
+1625     const markWord mark = object-&gt;mark();
+1626     assert(!mark.has_bias_pattern(), &quot;invariant&quot;);
+1627 
+1628     // The mark can be in one of the following states:
+1629     // *  Inflated     - just return
+1630     // *  Stack-locked - coerce it to inflated
+1631     // *  INFLATING    - busy wait for conversion to complete
+1632     // *  Neutral      - aggressively inflate the object.
+1633     // *  BIASED       - Illegal.  We should never see this
+1634 
+1635     // CASE: inflated
+1636     if (mark.has_monitor()) {
+1637       ObjectMonitor* inf = mark.monitor();
+1638       markWord dmw = inf-&gt;header();
+1639       assert(dmw.is_neutral(), &quot;invariant: header=&quot; INTPTR_FORMAT, dmw.value());
+1640       assert(inf-&gt;object() == object, &quot;invariant&quot;);
+1641       assert(ObjectSynchronizer::verify_objmon_isinpool(inf), &quot;monitor is invalid&quot;);
+1642       return inf;
+1643     }
+1644 
+1645     // CASE: inflation in progress - inflating over a stack-lock.
+1646     // Some other thread is converting from stack-locked to inflated.
+1647     // Only that thread can complete inflation -- other threads must wait.
+1648     // The INFLATING value is transient.
+1649     // Currently, we spin/yield/park and poll the markword, waiting for inflation to finish.
+1650     // We could always eliminate polling by parking the thread on some auxiliary list.
+1651     if (mark == markWord::INFLATING()) {
+1652       read_stable_mark(object);
+1653       continue;
+1654     }
+1655 
+1656     // CASE: stack-locked
+1657     // Could be stack-locked either by this thread or by some other thread.
+1658     //
+1659     // Note that we allocate the objectmonitor speculatively, _before_ attempting
+1660     // to install INFLATING into the mark word.  We originally installed INFLATING,
+1661     // allocated the objectmonitor, and then finally STed the address of the
+1662     // objectmonitor into the mark.  This was correct, but artificially lengthened
+1663     // the interval in which INFLATED appeared in the mark, thus increasing
+1664     // the odds of inflation contention.
+1665     //
+1666     // We now use per-thread private objectmonitor free lists.
+1667     // These list are reprovisioned from the global free list outside the
+1668     // critical INFLATING...ST interval.  A thread can transfer
+1669     // multiple objectmonitors en-mass from the global free list to its local free list.
+1670     // This reduces coherency traffic and lock contention on the global free list.
+1671     // Using such local free lists, it doesn&#39;t matter if the om_alloc() call appears
+1672     // before or after the CAS(INFLATING) operation.
+1673     // See the comments in om_alloc().
+1674 
+1675     LogStreamHandle(Trace, monitorinflation) lsh;
+1676 
+1677     if (mark.has_locker()) {
+1678       ObjectMonitor* m = om_alloc(self);
+1679       // Optimistically prepare the objectmonitor - anticipate successful CAS
+1680       // We do this before the CAS in order to minimize the length of time
+1681       // in which INFLATING appears in the mark.
+1682       m-&gt;Recycle();
+1683       m-&gt;_Responsible  = NULL;
+1684       m-&gt;_SpinDuration = ObjectMonitor::Knob_SpinLimit;   // Consider: maintain by type/class
+1685 
+1686       markWord cmp = object-&gt;cas_set_mark(markWord::INFLATING(), mark);
+1687       if (cmp != mark) {
+1688         om_release(self, m, true);
+1689         continue;       // Interference -- just retry
+1690       }
+1691 
+1692       // We&#39;ve successfully installed INFLATING (0) into the mark-word.
+1693       // This is the only case where 0 will appear in a mark-word.
+1694       // Only the singular thread that successfully swings the mark-word
+1695       // to 0 can perform (or more precisely, complete) inflation.
+1696       //
+1697       // Why do we CAS a 0 into the mark-word instead of just CASing the
+1698       // mark-word from the stack-locked value directly to the new inflated state?
+1699       // Consider what happens when a thread unlocks a stack-locked object.
+1700       // It attempts to use CAS to swing the displaced header value from the
+1701       // on-stack BasicLock back into the object header.  Recall also that the
+1702       // header value (hash code, etc) can reside in (a) the object header, or
+1703       // (b) a displaced header associated with the stack-lock, or (c) a displaced
+1704       // header in an ObjectMonitor.  The inflate() routine must copy the header
+1705       // value from the BasicLock on the owner&#39;s stack to the ObjectMonitor, all
+1706       // the while preserving the hashCode stability invariants.  If the owner
+1707       // decides to release the lock while the value is 0, the unlock will fail
+1708       // and control will eventually pass from slow_exit() to inflate.  The owner
+1709       // will then spin, waiting for the 0 value to disappear.   Put another way,
+1710       // the 0 causes the owner to stall if the owner happens to try to
+1711       // drop the lock (restoring the header from the BasicLock to the object)
+1712       // while inflation is in-progress.  This protocol avoids races that might
+1713       // would otherwise permit hashCode values to change or &quot;flicker&quot; for an object.
+1714       // Critically, while object-&gt;mark is 0 mark.displaced_mark_helper() is stable.
+1715       // 0 serves as a &quot;BUSY&quot; inflate-in-progress indicator.
+1716 
+1717 
+1718       // fetch the displaced mark from the owner&#39;s stack.
+1719       // The owner can&#39;t die or unwind past the lock while our INFLATING
+1720       // object is in the mark.  Furthermore the owner can&#39;t complete
+1721       // an unlock on the object, either.
+1722       markWord dmw = mark.displaced_mark_helper();
+1723       // Catch if the object&#39;s header is not neutral (not locked and
+1724       // not marked is what we care about here).
+1725       assert(dmw.is_neutral(), &quot;invariant: header=&quot; INTPTR_FORMAT, dmw.value());
+1726 
+1727       // Setup monitor fields to proper values -- prepare the monitor
+1728       m-&gt;set_header(dmw);
+1729 
+1730       // Optimization: if the mark.locker stack address is associated
+1731       // with this thread we could simply set m-&gt;_owner = self.
+1732       // Note that a thread can inflate an object
+1733       // that it has stack-locked -- as might happen in wait() -- directly
+1734       // with CAS.  That is, we can avoid the xchg-NULL .... ST idiom.
+1735       m-&gt;set_owner_from(NULL, mark.locker());
+1736       m-&gt;set_object(object);
+1737       // TODO-FIXME: assert BasicLock-&gt;dhw != 0.
+1738 
+1739       // Must preserve store ordering. The monitor state must
+1740       // be stable at the time of publishing the monitor address.
+1741       guarantee(object-&gt;mark() == markWord::INFLATING(), &quot;invariant&quot;);
+1742       object-&gt;release_set_mark(markWord::encode(m));
+1743 
+1744       // Hopefully the performance counters are allocated on distinct cache lines
+1745       // to avoid false sharing on MP systems ...
+1746       OM_PERFDATA_OP(Inflations, inc());
+1747       if (log_is_enabled(Trace, monitorinflation)) {
+1748         ResourceMark rm(self);
+1749         lsh.print_cr(&quot;inflate(has_locker): object=&quot; INTPTR_FORMAT &quot;, mark=&quot;
+1750                      INTPTR_FORMAT &quot;, type=&#39;%s&#39;&quot;, p2i(object),
+1751                      object-&gt;mark().value(), object-&gt;klass()-&gt;external_name());
+1752       }
+1753       if (event.should_commit()) {
+1754         post_monitor_inflate_event(&amp;event, object, cause);
+1755       }
+1756       return m;
+1757     }
+1758 
+1759     // CASE: neutral
+1760     // TODO-FIXME: for entry we currently inflate and then try to CAS _owner.
+1761     // If we know we&#39;re inflating for entry it&#39;s better to inflate by swinging a
+1762     // pre-locked ObjectMonitor pointer into the object header.   A successful
+1763     // CAS inflates the object *and* confers ownership to the inflating thread.
+1764     // In the current implementation we use a 2-step mechanism where we CAS()
+1765     // to inflate and then CAS() again to try to swing _owner from NULL to self.
+1766     // An inflateTry() method that we could call from enter() would be useful.
+1767 
+1768     // Catch if the object&#39;s header is not neutral (not locked and
+1769     // not marked is what we care about here).
+1770     assert(mark.is_neutral(), &quot;invariant: header=&quot; INTPTR_FORMAT, mark.value());
+1771     ObjectMonitor* m = om_alloc(self);
+1772     // prepare m for installation - set monitor to initial state
+1773     m-&gt;Recycle();
+1774     m-&gt;set_header(mark);
+1775     m-&gt;set_object(object);
+1776     m-&gt;_Responsible  = NULL;
+1777     m-&gt;_SpinDuration = ObjectMonitor::Knob_SpinLimit;       // consider: keep metastats by type/class
+1778 
+1779     if (object-&gt;cas_set_mark(markWord::encode(m), mark) != mark) {
+1780       m-&gt;set_header(markWord::zero());
+1781       m-&gt;set_object(NULL);
+1782       m-&gt;Recycle();
+1783       om_release(self, m, true);
+1784       m = NULL;
+1785       continue;
+1786       // interference - the markword changed - just retry.
+1787       // The state-transitions are one-way, so there&#39;s no chance of
+1788       // live-lock -- &quot;Inflated&quot; is an absorbing state.
+1789     }
+1790 
+1791     // Hopefully the performance counters are allocated on distinct
+1792     // cache lines to avoid false sharing on MP systems ...
+1793     OM_PERFDATA_OP(Inflations, inc());
+1794     if (log_is_enabled(Trace, monitorinflation)) {
+1795       ResourceMark rm(self);
+1796       lsh.print_cr(&quot;inflate(neutral): object=&quot; INTPTR_FORMAT &quot;, mark=&quot;
+1797                    INTPTR_FORMAT &quot;, type=&#39;%s&#39;&quot;, p2i(object),
+1798                    object-&gt;mark().value(), object-&gt;klass()-&gt;external_name());
+1799     }
+1800     if (event.should_commit()) {
+1801       post_monitor_inflate_event(&amp;event, object, cause);
+1802     }
+1803     return m;
+1804   }
+1805 }
+1806 
+1807 
+1808 // We maintain a list of in-use monitors for each thread.
+1809 //
+1810 // deflate_thread_local_monitors() scans a single thread&#39;s in-use list, while
+1811 // deflate_idle_monitors() scans only a global list of in-use monitors which
+1812 // is populated only as a thread dies (see om_flush()).
+1813 //
+1814 // These operations are called at all safepoints, immediately after mutators
+1815 // are stopped, but before any objects have moved. Collectively they traverse
+1816 // the population of in-use monitors, deflating where possible. The scavenged
+1817 // monitors are returned to the global monitor free list.
+1818 //
+1819 // Beware that we scavenge at *every* stop-the-world point. Having a large
+1820 // number of monitors in-use could negatively impact performance. We also want
+1821 // to minimize the total # of monitors in circulation, as they incur a small
+1822 // footprint penalty.
+1823 //
+1824 // Perversely, the heap size -- and thus the STW safepoint rate --
+1825 // typically drives the scavenge rate.  Large heaps can mean infrequent GC,
+1826 // which in turn can mean large(r) numbers of ObjectMonitors in circulation.
+1827 // This is an unfortunate aspect of this design.
+1828 
+1829 // Deflate a single monitor if not in-use
+1830 // Return true if deflated, false if in-use
+1831 bool ObjectSynchronizer::deflate_monitor(ObjectMonitor* mid, oop obj,
+1832                                          ObjectMonitor** free_head_p,
+1833                                          ObjectMonitor** free_tail_p) {
+1834   bool deflated;
+1835   // Normal case ... The monitor is associated with obj.
+1836   const markWord mark = obj-&gt;mark();
+1837   guarantee(mark == markWord::encode(mid), &quot;should match: mark=&quot;
+1838             INTPTR_FORMAT &quot;, encoded mid=&quot; INTPTR_FORMAT, mark.value(),
+1839             markWord::encode(mid).value());
+1840   // Make sure that mark.monitor() and markWord::encode() agree:
+1841   guarantee(mark.monitor() == mid, &quot;should match: monitor()=&quot; INTPTR_FORMAT
+1842             &quot;, mid=&quot; INTPTR_FORMAT, p2i(mark.monitor()), p2i(mid));
+1843   const markWord dmw = mid-&gt;header();
+1844   guarantee(dmw.is_neutral(), &quot;invariant: header=&quot; INTPTR_FORMAT, dmw.value());
+1845 
+1846   if (mid-&gt;is_busy()) {
+1847     // Easy checks are first - the ObjectMonitor is busy so no deflation.
+1848     deflated = false;
+1849   } else {
+1850     // Deflate the monitor if it is no longer being used
+1851     // It&#39;s idle - scavenge and return to the global free list
+1852     // plain old deflation ...
+1853     if (log_is_enabled(Trace, monitorinflation)) {
+1854       ResourceMark rm;
+1855       log_trace(monitorinflation)(&quot;deflate_monitor: &quot;
+1856                                   &quot;object=&quot; INTPTR_FORMAT &quot;, mark=&quot;
+1857                                   INTPTR_FORMAT &quot;, type=&#39;%s&#39;&quot;, p2i(obj),
+1858                                   mark.value(), obj-&gt;klass()-&gt;external_name());
+1859     }
+1860 
+1861     // Restore the header back to obj
+1862     obj-&gt;release_set_mark(dmw);
+1863     mid-&gt;clear();
+1864 
+1865     assert(mid-&gt;object() == NULL, &quot;invariant: object=&quot; INTPTR_FORMAT,
+1866            p2i(mid-&gt;object()));
+1867 
+1868     // Move the deflated ObjectMonitor to the working free list
+1869     // defined by free_head_p and free_tail_p.
+1870     if (*free_head_p == NULL) *free_head_p = mid;
+1871     if (*free_tail_p != NULL) {
+1872       // We append to the list so the caller can use mid-&gt;_next_om
+1873       // to fix the linkages in its context.
+1874       ObjectMonitor* prevtail = *free_tail_p;
+1875       // Should have been cleaned up by the caller:
+1876       // Note: Should not have to lock prevtail here since we&#39;re at a
+1877       // safepoint and ObjectMonitors on the local free list should
+1878       // not be accessed in parallel.
+1879 #ifdef ASSERT
+1880       ObjectMonitor* l_next_om = prevtail-&gt;next_om();
+1881 #endif
+1882       assert(l_next_om == NULL, &quot;must be NULL: _next_om=&quot; INTPTR_FORMAT, p2i(l_next_om));
+1883       prevtail-&gt;set_next_om(mid);
+1884     }
+1885     *free_tail_p = mid;
+1886     // At this point, mid-&gt;_next_om still refers to its current
+1887     // value and another ObjectMonitor&#39;s _next_om field still
+1888     // refers to this ObjectMonitor. Those linkages have to be
+1889     // cleaned up by the caller who has the complete context.
+1890     deflated = true;
+1891   }
+1892   return deflated;
+1893 }
+1894 
+1895 // Walk a given monitor list, and deflate idle monitors.
+1896 // The given list could be a per-thread list or a global list.
+1897 //
+1898 // In the case of parallel processing of thread local monitor lists,
+1899 // work is done by Threads::parallel_threads_do() which ensures that
+1900 // each Java thread is processed by exactly one worker thread, and
+1901 // thus avoid conflicts that would arise when worker threads would
+1902 // process the same monitor lists concurrently.
+1903 //
+1904 // See also ParallelSPCleanupTask and
+1905 // SafepointSynchronize::do_cleanup_tasks() in safepoint.cpp and
+1906 // Threads::parallel_java_threads_do() in thread.cpp.
+1907 int ObjectSynchronizer::deflate_monitor_list(ObjectMonitor** list_p,
+1908                                              int* count_p,
+1909                                              ObjectMonitor** free_head_p,
+1910                                              ObjectMonitor** free_tail_p) {
+1911   ObjectMonitor* cur_mid_in_use = NULL;
+1912   ObjectMonitor* mid = NULL;
+1913   ObjectMonitor* next = NULL;
+1914   int deflated_count = 0;
+1915 
+1916   // This list walk executes at a safepoint and does not race with any
+1917   // other list walkers.
+1918 
+1919   for (mid = Atomic::load(list_p); mid != NULL; mid = next) {
+1920     next = unmarked_next(mid);
+1921     oop obj = (oop) mid-&gt;object();
+1922     if (obj != NULL &amp;&amp; deflate_monitor(mid, obj, free_head_p, free_tail_p)) {
+1923       // Deflation succeeded and already updated free_head_p and
+1924       // free_tail_p as needed. Finish the move to the local free list
+1925       // by unlinking mid from the global or per-thread in-use list.
+1926       if (cur_mid_in_use == NULL) {
+1927         // mid is the list head so switch the list head to next:
+1928         Atomic::store(list_p, next);
+1929       } else {
+1930         // Switch cur_mid_in_use&#39;s next field to next:
+1931         cur_mid_in_use-&gt;set_next_om(next);
+1932       }
+1933       // At this point mid is disconnected from the in-use list.
+1934       deflated_count++;
+1935       Atomic::dec(count_p);
+1936       // mid is current tail in the free_head_p list so NULL terminate it:
+1937       mid-&gt;set_next_om(NULL);
+1938     } else {
+1939       cur_mid_in_use = mid;
+1940     }
+1941   }
+1942   return deflated_count;
+1943 }
+1944 
+1945 void ObjectSynchronizer::prepare_deflate_idle_monitors(DeflateMonitorCounters* counters) {
+1946   counters-&gt;n_in_use = 0;              // currently associated with objects
+1947   counters-&gt;n_in_circulation = 0;      // extant
+1948   counters-&gt;n_scavenged = 0;           // reclaimed (global and per-thread)
+1949   counters-&gt;per_thread_scavenged = 0;  // per-thread scavenge total
+1950   counters-&gt;per_thread_times = 0.0;    // per-thread scavenge times
+1951 }
+1952 
+1953 void ObjectSynchronizer::deflate_idle_monitors(DeflateMonitorCounters* counters) {
+1954   assert(SafepointSynchronize::is_at_safepoint(), &quot;must be at safepoint&quot;);
+1955   bool deflated = false;
+1956 
+1957   ObjectMonitor* free_head_p = NULL;  // Local SLL of scavenged monitors
+1958   ObjectMonitor* free_tail_p = NULL;
+1959   elapsedTimer timer;
+1960 
+1961   if (log_is_enabled(Info, monitorinflation)) {
+1962     timer.start();
+1963   }
+1964 
+1965   // Note: the thread-local monitors lists get deflated in
+1966   // a separate pass. See deflate_thread_local_monitors().
+1967 
+1968   // For moribund threads, scan om_list_globals._in_use_list
+1969   int deflated_count = 0;
+1970   if (Atomic::load(&amp;om_list_globals._in_use_list) != NULL) {
+1971     // Update n_in_circulation before om_list_globals._in_use_count is
+1972     // updated by deflation.
+1973     Atomic::add(&amp;counters-&gt;n_in_circulation,
+1974                 Atomic::load(&amp;om_list_globals._in_use_count));
+1975 
+1976     deflated_count = deflate_monitor_list(&amp;om_list_globals._in_use_list,
+1977                                           &amp;om_list_globals._in_use_count,
+1978                                           &amp;free_head_p, &amp;free_tail_p);
+1979     Atomic::add(&amp;counters-&gt;n_in_use, Atomic::load(&amp;om_list_globals._in_use_count));
+1980   }
+1981 
+1982   if (free_head_p != NULL) {
+1983     // Move the deflated ObjectMonitors back to the global free list.
+1984     guarantee(free_tail_p != NULL &amp;&amp; deflated_count &gt; 0, &quot;invariant&quot;);
+1985 #ifdef ASSERT
+1986     ObjectMonitor* l_next_om = free_tail_p-&gt;next_om();
+1987 #endif
+1988     assert(l_next_om == NULL, &quot;must be NULL: _next_om=&quot; INTPTR_FORMAT, p2i(l_next_om));
+1989     prepend_list_to_global_free_list(free_head_p, free_tail_p, deflated_count);
+1990     Atomic::add(&amp;counters-&gt;n_scavenged, deflated_count);
+1991   }
+1992   timer.stop();
+1993 
+1994   LogStreamHandle(Debug, monitorinflation) lsh_debug;
+1995   LogStreamHandle(Info, monitorinflation) lsh_info;
+1996   LogStream* ls = NULL;
+1997   if (log_is_enabled(Debug, monitorinflation)) {
+1998     ls = &amp;lsh_debug;
+1999   } else if (deflated_count != 0 &amp;&amp; log_is_enabled(Info, monitorinflation)) {
+2000     ls = &amp;lsh_info;
+2001   }
+2002   if (ls != NULL) {
+2003     ls-&gt;print_cr(&quot;deflating global idle monitors, %3.7f secs, %d monitors&quot;, timer.seconds(), deflated_count);
+2004   }
+2005 }
+2006 
+2007 void ObjectSynchronizer::finish_deflate_idle_monitors(DeflateMonitorCounters* counters) {
+2008   // Report the cumulative time for deflating each thread&#39;s idle
+2009   // monitors. Note: if the work is split among more than one
+2010   // worker thread, then the reported time will likely be more
+2011   // than a beginning to end measurement of the phase.
+2012   log_info(safepoint, cleanup)(&quot;deflating per-thread idle monitors, %3.7f secs, monitors=%d&quot;, counters-&gt;per_thread_times, counters-&gt;per_thread_scavenged);
+2013 
+2014   if (log_is_enabled(Debug, monitorinflation)) {
+2015     // exit_globals()&#39;s call to audit_and_print_stats() is done
+2016     // at the Info level and not at a safepoint.
+2017     ObjectSynchronizer::audit_and_print_stats(false /* on_exit */);
+2018   } else if (log_is_enabled(Info, monitorinflation)) {
+2019     log_info(monitorinflation)(&quot;global_population=%d, global_in_use_count=%d, &quot;
+2020                                &quot;global_free_count=%d&quot;,
+2021                                Atomic::load(&amp;om_list_globals._population),
+2022                                Atomic::load(&amp;om_list_globals._in_use_count),
+2023                                Atomic::load(&amp;om_list_globals._free_count));
+2024   }
+2025 
+2026   Atomic::store(&amp;_forceMonitorScavenge, 0);    // Reset
+2027 
+2028   OM_PERFDATA_OP(Deflations, inc(counters-&gt;n_scavenged));
+2029   OM_PERFDATA_OP(MonExtant, set_value(counters-&gt;n_in_circulation));
+2030 
+2031   GVars.stw_random = os::random();
+2032   GVars.stw_cycle++;
+2033 }
+2034 
+2035 void ObjectSynchronizer::deflate_thread_local_monitors(Thread* thread, DeflateMonitorCounters* counters) {
+2036   assert(SafepointSynchronize::is_at_safepoint(), &quot;must be at safepoint&quot;);
+2037 
+2038   ObjectMonitor* free_head_p = NULL;  // Local SLL of scavenged monitors
+2039   ObjectMonitor* free_tail_p = NULL;
+2040   elapsedTimer timer;
+2041 
+2042   if (log_is_enabled(Info, safepoint, cleanup) ||
+2043       log_is_enabled(Info, monitorinflation)) {
+2044     timer.start();
+2045   }
+2046 
+2047   // Update n_in_circulation before om_in_use_count is updated by deflation.
+2048   Atomic::add(&amp;counters-&gt;n_in_circulation, Atomic::load(&amp;thread-&gt;om_in_use_count));
+2049 
+2050   int deflated_count = deflate_monitor_list(&amp;thread-&gt;om_in_use_list, &amp;thread-&gt;om_in_use_count, &amp;free_head_p, &amp;free_tail_p);
+2051   Atomic::add(&amp;counters-&gt;n_in_use, Atomic::load(&amp;thread-&gt;om_in_use_count));
+2052 
+2053   if (free_head_p != NULL) {
+2054     // Move the deflated ObjectMonitors back to the global free list.
+2055     guarantee(free_tail_p != NULL &amp;&amp; deflated_count &gt; 0, &quot;invariant&quot;);
+2056 #ifdef ASSERT
+2057     ObjectMonitor* l_next_om = free_tail_p-&gt;next_om();
+2058 #endif
+2059     assert(l_next_om == NULL, &quot;must be NULL: _next_om=&quot; INTPTR_FORMAT, p2i(l_next_om));
+2060     prepend_list_to_global_free_list(free_head_p, free_tail_p, deflated_count);
+2061     Atomic::add(&amp;counters-&gt;n_scavenged, deflated_count);
+2062     Atomic::add(&amp;counters-&gt;per_thread_scavenged, deflated_count);
+2063   }
+2064 
+2065   timer.stop();
+2066   counters-&gt;per_thread_times += timer.seconds();
+2067 
+2068   LogStreamHandle(Debug, monitorinflation) lsh_debug;
+2069   LogStreamHandle(Info, monitorinflation) lsh_info;
+2070   LogStream* ls = NULL;
+2071   if (log_is_enabled(Debug, monitorinflation)) {
+2072     ls = &amp;lsh_debug;
+2073   } else if (deflated_count != 0 &amp;&amp; log_is_enabled(Info, monitorinflation)) {
+2074     ls = &amp;lsh_info;
+2075   }
+2076   if (ls != NULL) {
+2077     ls-&gt;print_cr(&quot;jt=&quot; INTPTR_FORMAT &quot;: deflating per-thread idle monitors, %3.7f secs, %d monitors&quot;, p2i(thread), timer.seconds(), deflated_count);
+2078   }
+2079 }
+2080 
+2081 // Monitor cleanup on JavaThread::exit
+2082 
+2083 // Iterate through monitor cache and attempt to release thread&#39;s monitors
+2084 // Gives up on a particular monitor if an exception occurs, but continues
+2085 // the overall iteration, swallowing the exception.
+2086 class ReleaseJavaMonitorsClosure: public MonitorClosure {
+2087  private:
+2088   TRAPS;
+2089 
+2090  public:
+2091   ReleaseJavaMonitorsClosure(Thread* thread) : THREAD(thread) {}
+2092   void do_monitor(ObjectMonitor* mid) {
+2093     if (mid-&gt;owner() == THREAD) {
+2094       (void)mid-&gt;complete_exit(CHECK);
+2095     }
+2096   }
+2097 };
+2098 
+2099 // Release all inflated monitors owned by THREAD.  Lightweight monitors are
+2100 // ignored.  This is meant to be called during JNI thread detach which assumes
+2101 // all remaining monitors are heavyweight.  All exceptions are swallowed.
+2102 // Scanning the extant monitor list can be time consuming.
+2103 // A simple optimization is to add a per-thread flag that indicates a thread
+2104 // called jni_monitorenter() during its lifetime.
+2105 //
+2106 // Instead of No_Savepoint_Verifier it might be cheaper to
+2107 // use an idiom of the form:
+2108 //   auto int tmp = SafepointSynchronize::_safepoint_counter ;
+2109 //   &lt;code that must not run at safepoint&gt;
+2110 //   guarantee (((tmp ^ _safepoint_counter) | (tmp &amp; 1)) == 0) ;
+2111 // Since the tests are extremely cheap we could leave them enabled
+2112 // for normal product builds.
+2113 
+2114 void ObjectSynchronizer::release_monitors_owned_by_thread(TRAPS) {
+2115   assert(THREAD == JavaThread::current(), &quot;must be current Java thread&quot;);
+2116   NoSafepointVerifier nsv;
+2117   ReleaseJavaMonitorsClosure rjmc(THREAD);
+2118   ObjectSynchronizer::monitors_iterate(&amp;rjmc);
+2119   THREAD-&gt;clear_pending_exception();
+2120 }
+2121 
+2122 const char* ObjectSynchronizer::inflate_cause_name(const InflateCause cause) {
+2123   switch (cause) {
+2124     case inflate_cause_vm_internal:    return &quot;VM Internal&quot;;
+2125     case inflate_cause_monitor_enter:  return &quot;Monitor Enter&quot;;
+2126     case inflate_cause_wait:           return &quot;Monitor Wait&quot;;
+2127     case inflate_cause_notify:         return &quot;Monitor Notify&quot;;
+2128     case inflate_cause_hash_code:      return &quot;Monitor Hash Code&quot;;
+2129     case inflate_cause_jni_enter:      return &quot;JNI Monitor Enter&quot;;
+2130     case inflate_cause_jni_exit:       return &quot;JNI Monitor Exit&quot;;
+2131     default:
+2132       ShouldNotReachHere();
+2133   }
+2134   return &quot;Unknown&quot;;
+2135 }
+2136 
+2137 //------------------------------------------------------------------------------
+2138 // Debugging code
+2139 
+2140 u_char* ObjectSynchronizer::get_gvars_addr() {
+2141   return (u_char*)&amp;GVars;
+2142 }
+2143 
+2144 u_char* ObjectSynchronizer::get_gvars_hc_sequence_addr() {
+2145   return (u_char*)&amp;GVars.hc_sequence;
+2146 }
+2147 
+2148 size_t ObjectSynchronizer::get_gvars_size() {
+2149   return sizeof(SharedGlobals);
+2150 }
+2151 
+2152 u_char* ObjectSynchronizer::get_gvars_stw_random_addr() {
+2153   return (u_char*)&amp;GVars.stw_random;
+2154 }
+2155 
+2156 // This function can be called at a safepoint or it can be called when
+2157 // we are trying to exit the VM. When we are trying to exit the VM, the
+2158 // list walker functions can run in parallel with the other list
+2159 // operations so spin-locking is used for safety.
+2160 //
+2161 // Calls to this function can be added in various places as a debugging
+2162 // aid; pass &#39;true&#39; for the &#39;on_exit&#39; parameter to have in-use monitor
+2163 // details logged at the Info level and &#39;false&#39; for the &#39;on_exit&#39;
+2164 // parameter to have in-use monitor details logged at the Trace level.
+2165 // deflate_monitor_list() no longer uses spin-locking so be careful
+2166 // when adding audit_and_print_stats() calls at a safepoint.
+2167 //
+2168 void ObjectSynchronizer::audit_and_print_stats(bool on_exit) {
+2169   assert(on_exit || SafepointSynchronize::is_at_safepoint(), &quot;invariant&quot;);
+2170 
+2171   LogStreamHandle(Debug, monitorinflation) lsh_debug;
+2172   LogStreamHandle(Info, monitorinflation) lsh_info;
+2173   LogStreamHandle(Trace, monitorinflation) lsh_trace;
+2174   LogStream* ls = NULL;
+2175   if (log_is_enabled(Trace, monitorinflation)) {
+2176     ls = &amp;lsh_trace;
+2177   } else if (log_is_enabled(Debug, monitorinflation)) {
+2178     ls = &amp;lsh_debug;
+2179   } else if (log_is_enabled(Info, monitorinflation)) {
+2180     ls = &amp;lsh_info;
+2181   }
+2182   assert(ls != NULL, &quot;sanity check&quot;);
+2183 
+2184   // Log counts for the global and per-thread monitor lists:
+2185   int chk_om_population = log_monitor_list_counts(ls);
+2186   int error_cnt = 0;
+2187 
+2188   ls-&gt;print_cr(&quot;Checking global lists:&quot;);
+2189 
+2190   // Check om_list_globals._population:
+2191   if (Atomic::load(&amp;om_list_globals._population) == chk_om_population) {
+2192     ls-&gt;print_cr(&quot;global_population=%d equals chk_om_population=%d&quot;,
+2193                  Atomic::load(&amp;om_list_globals._population), chk_om_population);
+2194   } else {
+2195     // With fine grained locks on the monitor lists, it is possible for
+2196     // log_monitor_list_counts() to return a value that doesn&#39;t match
+2197     // om_list_globals._population. So far a higher value has been
+2198     // seen in testing so something is being double counted by
+2199     // log_monitor_list_counts().
+2200     ls-&gt;print_cr(&quot;WARNING: global_population=%d is not equal to &quot;
+2201                  &quot;chk_om_population=%d&quot;,
+2202                  Atomic::load(&amp;om_list_globals._population), chk_om_population);
+2203   }
+2204 
+2205   // Check om_list_globals._in_use_list and om_list_globals._in_use_count:
+2206   chk_global_in_use_list_and_count(ls, &amp;error_cnt);
+2207 
+2208   // Check om_list_globals._free_list and om_list_globals._free_count:
+2209   chk_global_free_list_and_count(ls, &amp;error_cnt);
+2210 
+2211   ls-&gt;print_cr(&quot;Checking per-thread lists:&quot;);
+2212 
+2213   for (JavaThreadIteratorWithHandle jtiwh; JavaThread *jt = jtiwh.next(); ) {
+2214     // Check om_in_use_list and om_in_use_count:
+2215     chk_per_thread_in_use_list_and_count(jt, ls, &amp;error_cnt);
+2216 
+2217     // Check om_free_list and om_free_count:
+2218     chk_per_thread_free_list_and_count(jt, ls, &amp;error_cnt);
+2219   }
+2220 
+2221   if (error_cnt == 0) {
+2222     ls-&gt;print_cr(&quot;No errors found in monitor list checks.&quot;);
+2223   } else {
+2224     log_error(monitorinflation)(&quot;found monitor list errors: error_cnt=%d&quot;, error_cnt);
+2225   }
+2226 
+2227   if ((on_exit &amp;&amp; log_is_enabled(Info, monitorinflation)) ||
+2228       (!on_exit &amp;&amp; log_is_enabled(Trace, monitorinflation))) {
+2229     // When exiting this log output is at the Info level. When called
+2230     // at a safepoint, this log output is at the Trace level since
+2231     // there can be a lot of it.
+2232     log_in_use_monitor_details(ls);
+2233   }
+2234 
+2235   ls-&gt;flush();
+2236 
+2237   guarantee(error_cnt == 0, &quot;ERROR: found monitor list errors: error_cnt=%d&quot;, error_cnt);
+2238 }
+2239 
+2240 // Check a free monitor entry; log any errors.
+2241 void ObjectSynchronizer::chk_free_entry(JavaThread* jt, ObjectMonitor* n,
+2242                                         outputStream * out, int *error_cnt_p) {
+2243   stringStream ss;
+2244   if (n-&gt;is_busy()) {
+2245     if (jt != NULL) {
+2246       out-&gt;print_cr(&quot;ERROR: jt=&quot; INTPTR_FORMAT &quot;, monitor=&quot; INTPTR_FORMAT
+2247                     &quot;: free per-thread monitor must not be busy: %s&quot;, p2i(jt),
+2248                     p2i(n), n-&gt;is_busy_to_string(&amp;ss));
+2249     } else {
+2250       out-&gt;print_cr(&quot;ERROR: monitor=&quot; INTPTR_FORMAT &quot;: free global monitor &quot;
+2251                     &quot;must not be busy: %s&quot;, p2i(n), n-&gt;is_busy_to_string(&amp;ss));
+2252     }
+2253     *error_cnt_p = *error_cnt_p + 1;
+2254   }
+2255   if (n-&gt;header().value() != 0) {
+2256     if (jt != NULL) {
+2257       out-&gt;print_cr(&quot;ERROR: jt=&quot; INTPTR_FORMAT &quot;, monitor=&quot; INTPTR_FORMAT
+2258                     &quot;: free per-thread monitor must have NULL _header &quot;
+2259                     &quot;field: _header=&quot; INTPTR_FORMAT, p2i(jt), p2i(n),
+2260                     n-&gt;header().value());
+2261     } else {
+2262       out-&gt;print_cr(&quot;ERROR: monitor=&quot; INTPTR_FORMAT &quot;: free global monitor &quot;
+2263                     &quot;must have NULL _header field: _header=&quot; INTPTR_FORMAT,
+2264                     p2i(n), n-&gt;header().value());
+2265     }
+2266     *error_cnt_p = *error_cnt_p + 1;
+2267   }
+2268   if (n-&gt;object() != NULL) {
+2269     if (jt != NULL) {
+2270       out-&gt;print_cr(&quot;ERROR: jt=&quot; INTPTR_FORMAT &quot;, monitor=&quot; INTPTR_FORMAT
+2271                     &quot;: free per-thread monitor must have NULL _object &quot;
+2272                     &quot;field: _object=&quot; INTPTR_FORMAT, p2i(jt), p2i(n),
+2273                     p2i(n-&gt;object()));
+2274     } else {
+2275       out-&gt;print_cr(&quot;ERROR: monitor=&quot; INTPTR_FORMAT &quot;: free global monitor &quot;
+2276                     &quot;must have NULL _object field: _object=&quot; INTPTR_FORMAT,
+2277                     p2i(n), p2i(n-&gt;object()));
+2278     }
+2279     *error_cnt_p = *error_cnt_p + 1;
+2280   }
+2281 }
+2282 
+2283 // Lock the next ObjectMonitor for traversal and unlock the current
+2284 // ObjectMonitor. Returns the next ObjectMonitor if there is one.
+2285 // Otherwise returns NULL (after unlocking the current ObjectMonitor).
+2286 // This function is used by the various list walker functions to
+2287 // safely walk a list without allowing an ObjectMonitor to be moved
+2288 // to another list in the middle of a walk.
+2289 static ObjectMonitor* lock_next_for_traversal(ObjectMonitor* cur) {
+2290   assert(is_locked(cur), &quot;cur=&quot; INTPTR_FORMAT &quot; must be locked&quot;, p2i(cur));
+2291   ObjectMonitor* next = unmarked_next(cur);
+2292   if (next == NULL) {  // Reached the end of the list.
+2293     om_unlock(cur);
+2294     return NULL;
+2295   }
+2296   om_lock(next);   // Lock next before unlocking current to keep
+2297   om_unlock(cur);  // from being by-passed by another thread.
+2298   return next;
+2299 }
+2300 
+2301 // Check the global free list and count; log the results of the checks.
+2302 void ObjectSynchronizer::chk_global_free_list_and_count(outputStream * out,
+2303                                                         int *error_cnt_p) {
+2304   int chk_om_free_count = 0;
+2305   ObjectMonitor* cur = NULL;
+2306   if ((cur = get_list_head_locked(&amp;om_list_globals._free_list)) != NULL) {
+2307     // Marked the global free list head so process the list.
+2308     while (true) {
+2309       chk_free_entry(NULL /* jt */, cur, out, error_cnt_p);
+2310       chk_om_free_count++;
+2311 
+2312       cur = lock_next_for_traversal(cur);
+2313       if (cur == NULL) {
+2314         break;
+2315       }
+2316     }
+2317   }
+2318   int l_free_count = Atomic::load(&amp;om_list_globals._free_count);
+2319   if (l_free_count == chk_om_free_count) {
+2320     out-&gt;print_cr(&quot;global_free_count=%d equals chk_om_free_count=%d&quot;,
+2321                   l_free_count, chk_om_free_count);
+2322   } else {
+2323     // With fine grained locks on om_list_globals._free_list, it
+2324     // is possible for an ObjectMonitor to be prepended to
+2325     // om_list_globals._free_list after we started calculating
+2326     // chk_om_free_count so om_list_globals._free_count may not
+2327     // match anymore.
+2328     out-&gt;print_cr(&quot;WARNING: global_free_count=%d is not equal to &quot;
+2329                   &quot;chk_om_free_count=%d&quot;, l_free_count, chk_om_free_count);
+2330   }
+2331 }
+2332 
+2333 // Check the global in-use list and count; log the results of the checks.
+2334 void ObjectSynchronizer::chk_global_in_use_list_and_count(outputStream * out,
+2335                                                           int *error_cnt_p) {
+2336   int chk_om_in_use_count = 0;
+2337   ObjectMonitor* cur = NULL;
+2338   if ((cur = get_list_head_locked(&amp;om_list_globals._in_use_list)) != NULL) {
+2339     // Marked the global in-use list head so process the list.
+2340     while (true) {
+2341       chk_in_use_entry(NULL /* jt */, cur, out, error_cnt_p);
+2342       chk_om_in_use_count++;
+2343 
+2344       cur = lock_next_for_traversal(cur);
+2345       if (cur == NULL) {
+2346         break;
+2347       }
+2348     }
+2349   }
+2350   int l_in_use_count = Atomic::load(&amp;om_list_globals._in_use_count);
+2351   if (l_in_use_count == chk_om_in_use_count) {
+2352     out-&gt;print_cr(&quot;global_in_use_count=%d equals chk_om_in_use_count=%d&quot;,
+2353                   l_in_use_count, chk_om_in_use_count);
+2354   } else {
+2355     // With fine grained locks on the monitor lists, it is possible for
+2356     // an exiting JavaThread to put its in-use ObjectMonitors on the
+2357     // global in-use list after chk_om_in_use_count is calculated above.
+2358     out-&gt;print_cr(&quot;WARNING: global_in_use_count=%d is not equal to chk_om_in_use_count=%d&quot;,
+2359                   l_in_use_count, chk_om_in_use_count);
+2360   }
+2361 }
+2362 
+2363 // Check an in-use monitor entry; log any errors.
+2364 void ObjectSynchronizer::chk_in_use_entry(JavaThread* jt, ObjectMonitor* n,
+2365                                           outputStream * out, int *error_cnt_p) {
+2366   if (n-&gt;header().value() == 0) {
+2367     if (jt != NULL) {
+2368       out-&gt;print_cr(&quot;ERROR: jt=&quot; INTPTR_FORMAT &quot;, monitor=&quot; INTPTR_FORMAT
+2369                     &quot;: in-use per-thread monitor must have non-NULL _header &quot;
+2370                     &quot;field.&quot;, p2i(jt), p2i(n));
+2371     } else {
+2372       out-&gt;print_cr(&quot;ERROR: monitor=&quot; INTPTR_FORMAT &quot;: in-use global monitor &quot;
+2373                     &quot;must have non-NULL _header field.&quot;, p2i(n));
+2374     }
+2375     *error_cnt_p = *error_cnt_p + 1;
+2376   }
+2377   if (n-&gt;object() == NULL) {
+2378     if (jt != NULL) {
+2379       out-&gt;print_cr(&quot;ERROR: jt=&quot; INTPTR_FORMAT &quot;, monitor=&quot; INTPTR_FORMAT
+2380                     &quot;: in-use per-thread monitor must have non-NULL _object &quot;
+2381                     &quot;field.&quot;, p2i(jt), p2i(n));
+2382     } else {
+2383       out-&gt;print_cr(&quot;ERROR: monitor=&quot; INTPTR_FORMAT &quot;: in-use global monitor &quot;
+2384                     &quot;must have non-NULL _object field.&quot;, p2i(n));
+2385     }
+2386     *error_cnt_p = *error_cnt_p + 1;
+2387   }
+2388   const oop obj = (oop)n-&gt;object();
+2389   const markWord mark = obj-&gt;mark();
+2390   if (!mark.has_monitor()) {
+2391     if (jt != NULL) {
+2392       out-&gt;print_cr(&quot;ERROR: jt=&quot; INTPTR_FORMAT &quot;, monitor=&quot; INTPTR_FORMAT
+2393                     &quot;: in-use per-thread monitor&#39;s object does not think &quot;
+2394                     &quot;it has a monitor: obj=&quot; INTPTR_FORMAT &quot;, mark=&quot;
+2395                     INTPTR_FORMAT,  p2i(jt), p2i(n), p2i(obj), mark.value());
+2396     } else {
+2397       out-&gt;print_cr(&quot;ERROR: monitor=&quot; INTPTR_FORMAT &quot;: in-use global &quot;
+2398                     &quot;monitor&#39;s object does not think it has a monitor: obj=&quot;
+2399                     INTPTR_FORMAT &quot;, mark=&quot; INTPTR_FORMAT, p2i(n),
+2400                     p2i(obj), mark.value());
+2401     }
+2402     *error_cnt_p = *error_cnt_p + 1;
+2403   }
+2404   ObjectMonitor* const obj_mon = mark.monitor();
+2405   if (n != obj_mon) {
+2406     if (jt != NULL) {
+2407       out-&gt;print_cr(&quot;ERROR: jt=&quot; INTPTR_FORMAT &quot;, monitor=&quot; INTPTR_FORMAT
+2408                     &quot;: in-use per-thread monitor&#39;s object does not refer &quot;
+2409                     &quot;to the same monitor: obj=&quot; INTPTR_FORMAT &quot;, mark=&quot;
+2410                     INTPTR_FORMAT &quot;, obj_mon=&quot; INTPTR_FORMAT, p2i(jt),
+2411                     p2i(n), p2i(obj), mark.value(), p2i(obj_mon));
+2412     } else {
+2413       out-&gt;print_cr(&quot;ERROR: monitor=&quot; INTPTR_FORMAT &quot;: in-use global &quot;
+2414                     &quot;monitor&#39;s object does not refer to the same monitor: obj=&quot;
+2415                     INTPTR_FORMAT &quot;, mark=&quot; INTPTR_FORMAT &quot;, obj_mon=&quot;
+2416                     INTPTR_FORMAT, p2i(n), p2i(obj), mark.value(), p2i(obj_mon));
+2417     }
+2418     *error_cnt_p = *error_cnt_p + 1;
+2419   }
+2420 }
+2421 
+2422 // Check the thread&#39;s free list and count; log the results of the checks.
+2423 void ObjectSynchronizer::chk_per_thread_free_list_and_count(JavaThread *jt,
+2424                                                             outputStream * out,
+2425                                                             int *error_cnt_p) {
+2426   int chk_om_free_count = 0;
+2427   ObjectMonitor* cur = NULL;
+2428   if ((cur = get_list_head_locked(&amp;jt-&gt;om_free_list)) != NULL) {
+2429     // Marked the per-thread free list head so process the list.
+2430     while (true) {
+2431       chk_free_entry(jt, cur, out, error_cnt_p);
+2432       chk_om_free_count++;
+2433 
+2434       cur = lock_next_for_traversal(cur);
+2435       if (cur == NULL) {
+2436         break;
+2437       }
+2438     }
+2439   }
+2440   int l_om_free_count = Atomic::load(&amp;jt-&gt;om_free_count);
+2441   if (l_om_free_count == chk_om_free_count) {
+2442     out-&gt;print_cr(&quot;jt=&quot; INTPTR_FORMAT &quot;: om_free_count=%d equals &quot;
+2443                   &quot;chk_om_free_count=%d&quot;, p2i(jt), l_om_free_count, chk_om_free_count);
+2444   } else {
+2445     out-&gt;print_cr(&quot;ERROR: jt=&quot; INTPTR_FORMAT &quot;: om_free_count=%d is not &quot;
+2446                   &quot;equal to chk_om_free_count=%d&quot;, p2i(jt), l_om_free_count,
+2447                   chk_om_free_count);
+2448     *error_cnt_p = *error_cnt_p + 1;
+2449   }
+2450 }
+2451 
+2452 // Check the thread&#39;s in-use list and count; log the results of the checks.
+2453 void ObjectSynchronizer::chk_per_thread_in_use_list_and_count(JavaThread *jt,
+2454                                                               outputStream * out,
+2455                                                               int *error_cnt_p) {
+2456   int chk_om_in_use_count = 0;
+2457   ObjectMonitor* cur = NULL;
+2458   if ((cur = get_list_head_locked(&amp;jt-&gt;om_in_use_list)) != NULL) {
+2459     // Marked the per-thread in-use list head so process the list.
+2460     while (true) {
+2461       chk_in_use_entry(jt, cur, out, error_cnt_p);
+2462       chk_om_in_use_count++;
+2463 
+2464       cur = lock_next_for_traversal(cur);
+2465       if (cur == NULL) {
+2466         break;
+2467       }
+2468     }
+2469   }
+2470   int l_om_in_use_count = Atomic::load(&amp;jt-&gt;om_in_use_count);
+2471   if (l_om_in_use_count == chk_om_in_use_count) {
+2472     out-&gt;print_cr(&quot;jt=&quot; INTPTR_FORMAT &quot;: om_in_use_count=%d equals &quot;
+2473                   &quot;chk_om_in_use_count=%d&quot;, p2i(jt), l_om_in_use_count,
+2474                   chk_om_in_use_count);
+2475   } else {
+2476     out-&gt;print_cr(&quot;ERROR: jt=&quot; INTPTR_FORMAT &quot;: om_in_use_count=%d is not &quot;
+2477                   &quot;equal to chk_om_in_use_count=%d&quot;, p2i(jt), l_om_in_use_count,
+2478                   chk_om_in_use_count);
+2479     *error_cnt_p = *error_cnt_p + 1;
+2480   }
+2481 }
+2482 
+2483 // Log details about ObjectMonitors on the in-use lists. The &#39;BHL&#39;
+2484 // flags indicate why the entry is in-use, &#39;object&#39; and &#39;object type&#39;
+2485 // indicate the associated object and its type.
+2486 void ObjectSynchronizer::log_in_use_monitor_details(outputStream * out) {
+2487   stringStream ss;
+2488   if (Atomic::load(&amp;om_list_globals._in_use_count) &gt; 0) {
+2489     out-&gt;print_cr(&quot;In-use global monitor info:&quot;);
+2490     out-&gt;print_cr(&quot;(B -&gt; is_busy, H -&gt; has hash code, L -&gt; lock status)&quot;);
+2491     out-&gt;print_cr(&quot;%18s  %s  %18s  %18s&quot;,
+2492                   &quot;monitor&quot;, &quot;BHL&quot;, &quot;object&quot;, &quot;object type&quot;);
+2493     out-&gt;print_cr(&quot;==================  ===  ==================  ==================&quot;);
+2494     ObjectMonitor* cur = NULL;
+2495     if ((cur = get_list_head_locked(&amp;om_list_globals._in_use_list)) != NULL) {
+2496       // Marked the global in-use list head so process the list.
+2497       while (true) {
+2498         const oop obj = (oop) cur-&gt;object();
+2499         const markWord mark = cur-&gt;header();
+2500         ResourceMark rm;
+2501         out-&gt;print(INTPTR_FORMAT &quot;  %d%d%d  &quot; INTPTR_FORMAT &quot;  %s&quot;, p2i(cur),
+2502                    cur-&gt;is_busy() != 0, mark.hash() != 0, cur-&gt;owner() != NULL,
+2503                    p2i(obj), obj-&gt;klass()-&gt;external_name());
+2504         if (cur-&gt;is_busy() != 0) {
+2505           out-&gt;print(&quot; (%s)&quot;, cur-&gt;is_busy_to_string(&amp;ss));
+2506           ss.reset();
+2507         }
+2508         out-&gt;cr();
+2509 
+2510         cur = lock_next_for_traversal(cur);
+2511         if (cur == NULL) {
+2512           break;
+2513         }
+2514       }
+2515     }
+2516   }
+2517 
+2518   out-&gt;print_cr(&quot;In-use per-thread monitor info:&quot;);
+2519   out-&gt;print_cr(&quot;(B -&gt; is_busy, H -&gt; has hash code, L -&gt; lock status)&quot;);
+2520   out-&gt;print_cr(&quot;%18s  %18s  %s  %18s  %18s&quot;,
+2521                 &quot;jt&quot;, &quot;monitor&quot;, &quot;BHL&quot;, &quot;object&quot;, &quot;object type&quot;);
+2522   out-&gt;print_cr(&quot;==================  ==================  ===  ==================  ==================&quot;);
+2523   for (JavaThreadIteratorWithHandle jtiwh; JavaThread *jt = jtiwh.next(); ) {
+2524     ObjectMonitor* cur = NULL;
+2525     if ((cur = get_list_head_locked(&amp;jt-&gt;om_in_use_list)) != NULL) {
+2526       // Marked the global in-use list head so process the list.
+2527       while (true) {
+2528         const oop obj = (oop) cur-&gt;object();
+2529         const markWord mark = cur-&gt;header();
+2530         ResourceMark rm;
+2531         out-&gt;print(INTPTR_FORMAT &quot;  &quot; INTPTR_FORMAT &quot;  %d%d%d  &quot; INTPTR_FORMAT
+2532                    &quot;  %s&quot;, p2i(jt), p2i(cur), cur-&gt;is_busy() != 0,
+2533                    mark.hash() != 0, cur-&gt;owner() != NULL, p2i(obj),
+2534                    obj-&gt;klass()-&gt;external_name());
+2535         if (cur-&gt;is_busy() != 0) {
+2536           out-&gt;print(&quot; (%s)&quot;, cur-&gt;is_busy_to_string(&amp;ss));
+2537           ss.reset();
+2538         }
+2539         out-&gt;cr();
+2540 
+2541         cur = lock_next_for_traversal(cur);
+2542         if (cur == NULL) {
+2543           break;
+2544         }
+2545       }
+2546     }
+2547   }
+2548 
+2549   out-&gt;flush();
+2550 }
+2551 
+2552 // Log counts for the global and per-thread monitor lists and return
+2553 // the population count.
+2554 int ObjectSynchronizer::log_monitor_list_counts(outputStream * out) {
+2555   int pop_count = 0;
+2556   out-&gt;print_cr(&quot;%18s  %10s  %10s  %10s&quot;,
+2557                 &quot;Global Lists:&quot;, &quot;InUse&quot;, &quot;Free&quot;, &quot;Total&quot;);
+2558   out-&gt;print_cr(&quot;==================  ==========  ==========  ==========&quot;);
+2559   int l_in_use_count = Atomic::load(&amp;om_list_globals._in_use_count);
+2560   int l_free_count = Atomic::load(&amp;om_list_globals._free_count);
+2561   out-&gt;print_cr(&quot;%18s  %10d  %10d  %10d&quot;, &quot;&quot;, l_in_use_count,
+2562                 l_free_count, Atomic::load(&amp;om_list_globals._population));
+2563   pop_count += l_in_use_count + l_free_count;
+2564 
+2565   out-&gt;print_cr(&quot;%18s  %10s  %10s  %10s&quot;,
+2566                 &quot;Per-Thread Lists:&quot;, &quot;InUse&quot;, &quot;Free&quot;, &quot;Provision&quot;);
+2567   out-&gt;print_cr(&quot;==================  ==========  ==========  ==========&quot;);
+2568 
+2569   for (JavaThreadIteratorWithHandle jtiwh; JavaThread *jt = jtiwh.next(); ) {
+2570     int l_om_in_use_count = Atomic::load(&amp;jt-&gt;om_in_use_count);
+2571     int l_om_free_count = Atomic::load(&amp;jt-&gt;om_free_count);
+2572     out-&gt;print_cr(INTPTR_FORMAT &quot;  %10d  %10d  %10d&quot;, p2i(jt),
+2573                   l_om_in_use_count, l_om_free_count, jt-&gt;om_free_provision);
+2574     pop_count += l_om_in_use_count + l_om_free_count;
+2575   }
+2576   return pop_count;
+2577 }
+2578 
+2579 #ifndef PRODUCT
+2580 
+2581 // Check if monitor belongs to the monitor cache
+2582 // The list is grow-only so it&#39;s *relatively* safe to traverse
+2583 // the list of extant blocks without taking a lock.
+2584 
+2585 int ObjectSynchronizer::verify_objmon_isinpool(ObjectMonitor *monitor) {
+2586   PaddedObjectMonitor* block = Atomic::load(&amp;g_block_list);
+2587   while (block != NULL) {
+2588     assert(block-&gt;object() == CHAINMARKER, &quot;must be a block header&quot;);
+2589     if (monitor &gt; &amp;block[0] &amp;&amp; monitor &lt; &amp;block[_BLOCKSIZE]) {
+2590       address mon = (address)monitor;
+2591       address blk = (address)block;
+2592       size_t diff = mon - blk;
+2593       assert((diff % sizeof(PaddedObjectMonitor)) == 0, &quot;must be aligned&quot;);
+2594       return 1;
+2595     }
+2596     // unmarked_next() is not needed with g_block_list (no locking
+2597     // used with block linkage _next_om fields).
+2598     block = (PaddedObjectMonitor*)block-&gt;next_om();
+2599   }
+2600   return 0;
+2601 }
+2602 
+2603 #endif
+    </pre>
+  </body>
+</html>
