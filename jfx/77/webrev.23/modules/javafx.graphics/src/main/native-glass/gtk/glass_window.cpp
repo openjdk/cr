@@ -516,7 +516,7 @@ void WindowContext::process_mouse_button(GdkEventButton *event) {
     // and no exit/enter event should be reported during this drag.
     // We can grab mouse pointer for these needs.
     if (press) {
-        grab_mouse_drag_focus(NULL, true);
+        grab_mouse_drag_focus(gdk_window, NULL, true);
     } else {
         if ((event->state & MOUSE_BUTTONS_MASK)
             && !(state & MOUSE_BUTTONS_MASK)) { // all buttons released
@@ -908,9 +908,9 @@ void WindowContext::set_visible(bool visible) {
 void WindowContext::set_cursor(GdkCursor *cursor) {
     if (!is_in_drag()) {
         if (WindowContext::sm_mouse_drag_window) {
-            grab_mouse_drag_focus(cursor, false);
+            grab_mouse_drag_focus(WindowContext::sm_mouse_drag_window->get_gdk_window(), cursor, false);
         } else if (WindowContext::sm_grab_window) {
-            grab_mouse_drag_focus(cursor, true);
+            grab_mouse_drag_focus(WindowContext::sm_grab_window->get_gdk_window(), cursor, true);
         }
     }
 
@@ -1124,7 +1124,7 @@ bool WindowContext::is_dead() {
 
 bool WindowContext::grab_focus() {
     if (WindowContext::sm_mouse_drag_window
-            || grab_mouse_drag_focus(NULL, true)) {
+            || grab_mouse_drag_focus(gdk_window, NULL, true)) {
         WindowContext::sm_grab_window = this;
         return true;
     } else {
@@ -1419,7 +1419,7 @@ GdkDevice * WindowContext::get_pointer_device() {
     return device;
 }
 
-bool WindowContext::grab_mouse_drag_focus(GdkCursor *cursor, bool owner_events) {
+bool WindowContext::grab_mouse_drag_focus(GdkWindow * gdk_w, GdkCursor * cursor, bool owner_events) {
     if (is_grab_disabled()) {
         return true;
     }
@@ -1429,10 +1429,10 @@ bool WindowContext::grab_mouse_drag_focus(GdkCursor *cursor, bool owner_events) 
     pointer_device = get_pointer_device();
 #ifdef GLASS_GTK3
 #if GTK_CHECK_VERSION(3, 20, 0)
-    GdkGrabStatus status = gdk_seat_grab(gdk_device_get_seat(pointer_device), gdk_window,
+    GdkGrabStatus status = gdk_seat_grab(gdk_device_get_seat(pointer_device), gdk_w,
                                           GDK_SEAT_CAPABILITY_ALL_POINTING, owner_events, cursor, NULL, NULL, NULL);
 #else
-    GdkGrabStatus status = gdk_device_grab(pointer_device, gdk_window, GDK_OWNERSHIP_WINDOW, owner_events,
+    GdkGrabStatus status = gdk_device_grab(pointer_device, gdk_w, GDK_OWNERSHIP_WINDOW, owner_events,
                                                 (GdkEventMask)
                                                       (GDK_POINTER_MOTION_MASK
                                                           | GDK_POINTER_MOTION_HINT_MASK
@@ -1444,7 +1444,7 @@ bool WindowContext::grab_mouse_drag_focus(GdkCursor *cursor, bool owner_events) 
                                                           | GDK_BUTTON_RELEASE_MASK), cursor, GDK_CURRENT_TIME);
 #endif
 #else
-    GdkGrabStatus status = gdk_pointer_grab(gdk_window, owner_events,
+    GdkGrabStatus status = gdk_pointer_grab(gdk_w, owner_events,
                                                 (GdkEventMask)
                                                       (GDK_POINTER_MOTION_MASK
                                                           | GDK_POINTER_MOTION_HINT_MASK

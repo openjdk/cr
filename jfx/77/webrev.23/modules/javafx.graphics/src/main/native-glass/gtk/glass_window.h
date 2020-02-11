@@ -261,7 +261,7 @@ private:
     bool on_top_inherited();
     bool effective_on_top();
     GdkDevice * get_pointer_device();
-    bool grab_mouse_drag_focus(GdkCursor *cursor, bool owner_events);
+    bool grab_mouse_drag_focus(GdkWindow *, GdkCursor *, bool);
     void ungrab_mouse_drag_focus();
 };
 
