@@ -1,0 +1,642 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Frames src/jdk.incubator.foreign/share/classes/jdk/internal/foreign/abi/aarch64/CallArranger.java</title>
+    <link rel="stylesheet" href="../../../../../../../../../style.css" />
+    <script type="text/javascript" src="../../../../../../../../../navigation.js"></script>
+  </head>
+<body onkeypress="keypress(event);">
+<a name="0"></a>
+<hr />
+<pre>  1 /*
+  2  * Copyright (c) 2019, 2020, Oracle and/or its affiliates. All rights reserved.
+  3  * Copyright (c) 2019, Arm Limited. All rights reserved.
+  4  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  5  *
+  6  * This code is free software; you can redistribute it and/or modify it
+  7  * under the terms of the GNU General Public License version 2 only, as
+  8  * published by the Free Software Foundation.
+  9  *
+ 10  * This code is distributed in the hope that it will be useful, but WITHOUT
+ 11  * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ 12  * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ 13  * version 2 for more details (a copy is included in the LICENSE file that
+ 14  * accompanied this code).
+ 15  *
+ 16  * You should have received a copy of the GNU General Public License version
+ 17  * 2 along with this work; if not, write to the Free Software Foundation,
+ 18  * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ 19  *
+ 20  * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ 21  * or visit www.oracle.com if you need additional information or have any
+ 22  * questions.
+ 23  */
+ 24 package jdk.internal.foreign.abi.aarch64;
+ 25 
+ 26 import jdk.incubator.foreign.FunctionDescriptor;
+ 27 import jdk.incubator.foreign.GroupLayout;
+ 28 import jdk.incubator.foreign.MemoryAddress;
+ 29 import jdk.incubator.foreign.MemoryLayout;
+ 30 import jdk.incubator.foreign.MemoryLayouts;
+ 31 import jdk.incubator.foreign.MemorySegment;
+ 32 import jdk.incubator.foreign.SequenceLayout;
+ 33 import jdk.incubator.foreign.ValueLayout;
+ 34 import jdk.internal.foreign.Utils;
+ 35 import jdk.internal.foreign.abi.CallingSequenceBuilder;
+ 36 import jdk.internal.foreign.abi.UpcallHandler;
+ 37 import jdk.internal.foreign.abi.ABIDescriptor;
+ 38 import jdk.internal.foreign.abi.Binding;
+ 39 import jdk.internal.foreign.abi.CallingSequence;
+ 40 import jdk.internal.foreign.abi.ProgrammableInvoker;
+ 41 import jdk.internal.foreign.abi.ProgrammableUpcallHandler;
+ 42 import jdk.internal.foreign.abi.VMStorage;
+ 43 import jdk.internal.foreign.abi.SharedUtils;
+ 44 
+ 45 import java.lang.invoke.MethodHandle;
+ 46 import java.lang.invoke.MethodType;
+ 47 import java.util.List;
+ 48 import java.util.Optional;
+ 49 
+ 50 import static jdk.internal.foreign.abi.aarch64.AArch64Architecture.*;
+ 51 
+ 52 /**
+ 53  * For the AArch64 C ABI specifically, this class uses the ProgrammableInvoker API, namely CallingSequenceBuilder2
+ 54  * to translate a C FunctionDescriptor into a CallingSequence2, which can then be turned into a MethodHandle.
+ 55  *
+ 56  * This includes taking care of synthetic arguments like pointers to return buffers for &#39;in-memory&#39; returns.
+ 57  */
+ 58 public class CallArranger {
+ 59     private static final int STACK_SLOT_SIZE = 8;
+ 60     private static final int MAX_AGGREGATE_REGS_SIZE = 2;
+ 61     public static final int MAX_REGISTER_ARGUMENTS = 8;
+ 62 
+ 63     private static final VMStorage INDIRECT_RESULT = r8;
+ 64 
+ 65     // This is derived from the AAPCS64 spec, restricted to what&#39;s
+ 66     // possible when calling to/from C code.
+ 67     //
+ 68     // The indirect result register, r8, is used to return a large
+ 69     // struct by value. It&#39;s treated as an input here as the caller is
+ 70     // responsible for allocating storage and passing this into the
+ 71     // function.
+ 72     //
+ 73     // Although the AAPCS64 says r0-7 and v0-7 are all valid return
+ 74     // registers, it&#39;s not possible to generate a C function that uses
+ 75     // r2-7 and v4-7 so they are omitted here.
+ 76     private static final ABIDescriptor C = AArch64Architecture.abiFor(
+ 77         new VMStorage[] { r0, r1, r2, r3, r4, r5, r6, r7, INDIRECT_RESULT},
+ 78         new VMStorage[] { v0, v1, v2, v3, v4, v5, v6, v7 },
+ 79         new VMStorage[] { r0, r1 },
+ 80         new VMStorage[] { v0, v1, v2, v3 },
+ 81         new VMStorage[] { r9, r10, r11, r12, r13, r14, r15 },
+ 82         new VMStorage[] { v16, v17, v18, v19, v20, v21, v22, v23, v25,
+ 83                           v26, v27, v28, v29, v30, v31 },
+ 84         16,  // Stack is always 16 byte aligned on AArch64
+ 85         0    // No shadow space
+ 86     );
+ 87 
+ 88     // record
+ 89     public static class Bindings {
+ 90         public final CallingSequence callingSequence;
+ 91         public final boolean isInMemoryReturn;
+ 92 
+ 93         Bindings(CallingSequence callingSequence, boolean isInMemoryReturn) {
+ 94             this.callingSequence = callingSequence;
+ 95             this.isInMemoryReturn = isInMemoryReturn;
+ 96         }
+ 97     }
+ 98 
+ 99     public static Bindings getBindings(MethodType mt, FunctionDescriptor cDesc, boolean forUpcall) {
+100         SharedUtils.checkFunctionTypes(mt, cDesc);
+101 
+102         CallingSequenceBuilder csb = new CallingSequenceBuilder(forUpcall);
+103 
+104         BindingCalculator argCalc = forUpcall ? new BoxBindingCalculator(true) : new UnboxBindingCalculator(true);
+105         BindingCalculator retCalc = forUpcall ? new UnboxBindingCalculator(false) : new BoxBindingCalculator(false);
+106 
+107         boolean returnInMemory = isInMemoryReturn(cDesc.returnLayout());
+108         if (returnInMemory) {
+109             csb.addArgumentBindings(MemoryAddress.class, MemoryLayouts.AArch64ABI.C_POINTER,
+110                     argCalc.getIndirectBindings());
+111         } else if (cDesc.returnLayout().isPresent()) {
+112             Class&lt;?&gt; carrier = mt.returnType();
+113             MemoryLayout layout = cDesc.returnLayout().get();
+114             csb.setReturnBindings(carrier, layout, retCalc.getBindings(carrier, layout));
+115         }
+116 
+117         for (int i = 0; i &lt; mt.parameterCount(); i++) {
+118             Class&lt;?&gt; carrier = mt.parameterType(i);
+119             MemoryLayout layout = cDesc.argumentLayouts().get(i);
+120             csb.addArgumentBindings(carrier, layout, argCalc.getBindings(carrier, layout));
+121         }
+122 
+123         return new Bindings(csb.build(), returnInMemory);
+124     }
+125 
+126     public static MethodHandle arrangeDowncall(long addr, MethodType mt, FunctionDescriptor cDesc) {
+127         Bindings bindings = getBindings(mt, cDesc, false);
+128 
+129         MethodHandle handle = new ProgrammableInvoker(C, addr, bindings.callingSequence).getBoundMethodHandle();
+130 
+131         if (bindings.isInMemoryReturn) {
+132             handle = SharedUtils.adaptDowncallForIMR(handle, cDesc);
+133         }
+134 
+135         return handle;
+136     }
+137 
+138     public static UpcallHandler arrangeUpcall(MethodHandle target, MethodType mt, FunctionDescriptor cDesc) {
+139         Bindings bindings = getBindings(mt, cDesc, true);
+140 
+141         if (bindings.isInMemoryReturn) {
+142             target = SharedUtils.adaptUpcallForIMR(target);
+143         }
+144 
+145         return new ProgrammableUpcallHandler(C, target, bindings.callingSequence);
+146     }
+147 
+148     private static boolean isInMemoryReturn(Optional&lt;MemoryLayout&gt; returnLayout) {
+149         return returnLayout
+150             .filter(GroupLayout.class::isInstance)
+151             .filter(g -&gt; !isRegisterAggregate(g) &amp;&amp; !isHomogeneousFloatAggregate(g))
+152             .isPresent();
+153     }
+154 
+155     private enum TypeClass {
+156         STRUCT_REGISTER,
+157         STRUCT_REFERENCE,
+158         STRUCT_HFA,
+159         POINTER,
+160         INTEGER,
+161         FLOAT,
+162     }
+163 
+164     private static TypeClass classifyValueType(ValueLayout type) {
+165         ArgumentClassImpl clazz = (ArgumentClassImpl)Utils.getAnnotation(type, ArgumentClassImpl.ABI_CLASS);
+166         if (clazz == null) {
+167             //padding not allowed here
+168             throw new IllegalStateException(&quot;Unexpected value layout: could not determine ABI class&quot;);
+169         }
+170 
+171         if (clazz == ArgumentClassImpl.INTEGER) {
+172             return TypeClass.INTEGER;
+173         } else if(clazz == ArgumentClassImpl.POINTER) {
+174             return TypeClass.POINTER;
+175         } else if (clazz == ArgumentClassImpl.VECTOR) {
+176             return TypeClass.FLOAT;
+177         }
+178         throw new IllegalArgumentException(&quot;Unknown ABI class: &quot; + clazz);
+179     }
+180 
+181     static boolean isRegisterAggregate(MemoryLayout type) {
+182         return type.bitSize() &lt;= MAX_AGGREGATE_REGS_SIZE * 64;
+183     }
+184 
+185     static boolean isHomogeneousFloatAggregate(MemoryLayout type) {
+186         if (!(type instanceof GroupLayout))
+187             return false;
+188 
+189         GroupLayout groupLayout = (GroupLayout)type;
+190 
+191         final int numElements = groupLayout.memberLayouts().size();
+192         if (numElements &gt; 4 || numElements == 0)
+193             return false;
+194 
+195         MemoryLayout baseType = groupLayout.memberLayouts().get(0);
+196 
+197         if (!(baseType instanceof ValueLayout))
+198             return false;
+199 
+200         ArgumentClassImpl baseArgClass =
+201             (ArgumentClassImpl)Utils.getAnnotation(baseType, ArgumentClassImpl.ABI_CLASS);
+202         if (baseArgClass != ArgumentClassImpl.VECTOR)
+203            return false;
+204 
+205         for (MemoryLayout elem : groupLayout.memberLayouts()) {
+206             ArgumentClassImpl argClass =
+207                 (ArgumentClassImpl)Utils.getAnnotation(elem, ArgumentClassImpl.ABI_CLASS);
+208             if (!(elem instanceof ValueLayout) ||
+209                     elem.bitSize() != baseType.bitSize() ||
+210                     elem.bitAlignment() != baseType.bitAlignment() ||
+211                     baseArgClass != argClass) {
+212                 return false;
+213             }
+214         }
+215 
+216         return true;
+217     }
+218 
+219     private static TypeClass classifyStructType(MemoryLayout layout) {
+220         if (isHomogeneousFloatAggregate(layout)) {
+221             return TypeClass.STRUCT_HFA;
+222         } else if (isRegisterAggregate(layout)) {
+223             return TypeClass.STRUCT_REGISTER;
+224         }
+225         return TypeClass.STRUCT_REFERENCE;
+226     }
+227 
+228     private static TypeClass classifyType(MemoryLayout type) {
+229         if (type instanceof ValueLayout) {
+230             return classifyValueType((ValueLayout) type);
+231         } else if (type instanceof  GroupLayout) {
+232             return classifyStructType(type);
+233         } else if (type instanceof SequenceLayout) {
+234             return TypeClass.INTEGER;
+235         } else {
+236             throw new IllegalArgumentException(&quot;Unhandled type &quot; + type);
+237         }
+238     }
+239 
+240     static class StorageCalculator {
+241         private final boolean forArguments;
+242 
+243         private int nRegs[] = new int[] { 0, 0 };
+244         private long stackOffset = 0;
+245 
+246         public StorageCalculator(boolean forArguments) {
+247             this.forArguments = forArguments;
+248         }
+249 
+250         VMStorage stackAlloc(long size, long alignment) {
+251             assert forArguments : &quot;no stack returns&quot;;
+252             alignment = Math.max(alignment, STACK_SLOT_SIZE);
+253             stackOffset = Utils.alignUp(stackOffset, alignment);
+254 
+255             VMStorage storage =
+256                 AArch64Architecture.stackStorage((int)(stackOffset / STACK_SLOT_SIZE));
+257             stackOffset += size;
+258             return storage;
+259         }
+260 
+261         VMStorage stackAlloc(MemoryLayout layout) {
+262             return stackAlloc(layout.byteSize(), SharedUtils.alignment(layout, true));
+263         }
+264 
+265         VMStorage[] regAlloc(int type, int count) {
+266             if (nRegs[type] + count &lt;= MAX_REGISTER_ARGUMENTS) {
+267                 VMStorage[] source =
+268                     (forArguments ? C.inputStorage : C.outputStorage)[type];
+269                 VMStorage[] result = new VMStorage[count];
+270                 for (int i = 0; i &lt; count; i++) {
+271                     result[i] = source[nRegs[type]++];
+272                 }
+273                 return result;
+274             } else {
+275                 // Any further allocations for this register type must
+276                 // be from the stack.
+277                 nRegs[type] = MAX_REGISTER_ARGUMENTS;
+278                 return null;
+279             }
+280         }
+281 
+282         VMStorage[] regAlloc(int type, MemoryLayout layout) {
+283             return regAlloc(type, (int)Utils.alignUp(layout.byteSize(), 8) / 8);
+284         }
+285 
+286         VMStorage nextStorage(int type, MemoryLayout layout) {
+287             VMStorage[] storage = regAlloc(type, 1);
+288             if (storage == null) {
+289                 return stackAlloc(layout);
+290             }
+291 
+292             return storage[0];
+293         }
+294     }
+295 
+296     static abstract class BindingCalculator {
+297         protected final StorageCalculator storageCalculator;
+298 
+299         protected BindingCalculator(boolean forArguments) {
+300             this.storageCalculator = new StorageCalculator(forArguments);
+301         }
+302 
+303         protected void spillStructUnbox(Binding.Builder bindings, MemoryLayout layout) {
+304             // If a struct has been assigned register or HFA class but
+305             // there are not enough free registers to hold the entire
+306             // struct, it must be passed on the stack. I.e. not split
+307             // between registers and stack.
+308 
+309             long offset = 0;
+310             while (offset &lt; layout.byteSize()) {
+311                 long copy = Math.min(layout.byteSize() - offset, STACK_SLOT_SIZE);
+312                 VMStorage storage =
+313                     storageCalculator.stackAlloc(copy, STACK_SLOT_SIZE);
+314                 if (offset + STACK_SLOT_SIZE &lt; layout.byteSize()) {
+315                     bindings.dup();
+316                 }
+<a name="1" id="anc1"></a><span class="line-modified">317                 Class&lt;?&gt; type = SharedUtils.primitiveCarrierForSize(copy);</span>
+<span class="line-modified">318                 bindings.dereference(offset, type)</span>
+<span class="line-added">319                         .move(storage, type);</span>
+320                 offset += STACK_SLOT_SIZE;
+321             }
+322         }
+323 
+324         protected void spillStructBox(Binding.Builder bindings, MemoryLayout layout) {
+325             // If a struct has been assigned register or HFA class but
+326             // there are not enough free registers to hold the entire
+327             // struct, it must be passed on the stack. I.e. not split
+328             // between registers and stack.
+329 
+330             long offset = 0;
+331             while (offset &lt; layout.byteSize()) {
+332                 long copy = Math.min(layout.byteSize() - offset, STACK_SLOT_SIZE);
+333                 VMStorage storage =
+334                     storageCalculator.stackAlloc(copy, STACK_SLOT_SIZE);
+<a name="2" id="anc2"></a><span class="line-added">335                 Class&lt;?&gt; type = SharedUtils.primitiveCarrierForSize(copy);</span>
+336                 bindings.dup()
+<a name="3" id="anc3"></a><span class="line-modified">337                         .move(storage, type)</span>
+<span class="line-modified">338                         .dereference(offset, type);</span>
+339                 offset += STACK_SLOT_SIZE;
+340             }
+341         }
+342 
+343         abstract List&lt;Binding&gt; getBindings(Class&lt;?&gt; carrier, MemoryLayout layout);
+344 
+345         abstract List&lt;Binding&gt; getIndirectBindings();
+346     }
+347 
+348     static class UnboxBindingCalculator extends BindingCalculator {
+349         UnboxBindingCalculator(boolean forArguments) {
+350             super(forArguments);
+351         }
+352 
+353         @Override
+354         List&lt;Binding&gt; getIndirectBindings() {
+355             return Binding.builder()
+356                 .convertAddress()
+357                 .move(INDIRECT_RESULT, long.class)
+358                 .build();
+359         }
+360 
+361         @Override
+362         List&lt;Binding&gt; getBindings(Class&lt;?&gt; carrier, MemoryLayout layout) {
+363             TypeClass argumentClass = classifyType(layout);
+364             Binding.Builder bindings = Binding.builder();
+365             switch (argumentClass) {
+366                 case STRUCT_REGISTER: {
+367                     assert carrier == MemorySegment.class;
+368                     VMStorage[] regs = storageCalculator.regAlloc(
+369                         StorageClasses.INTEGER, layout);
+370                     if (regs != null) {
+371                         int regIndex = 0;
+372                         long offset = 0;
+373                         while (offset &lt; layout.byteSize()) {
+374                             final long copy = Math.min(layout.byteSize() - offset, 8);
+375                             VMStorage storage = regs[regIndex++];
+376                             Class&lt;?&gt; type = SharedUtils.primitiveCarrierForSize(copy);
+377                             if (offset + copy &lt; layout.byteSize()) {
+378                                 bindings.dup();
+379                             }
+380                             bindings.dereference(offset, type)
+381                                     .move(storage, type);
+382                             offset += copy;
+383                         }
+384                     } else {
+385                         spillStructUnbox(bindings, layout);
+386                     }
+387                     break;
+388                 }
+389                 case STRUCT_REFERENCE: {
+390                     assert carrier == MemorySegment.class;
+391                     bindings.copy(layout)
+392                             .baseAddress()
+393                             .convertAddress();
+394                     VMStorage storage = storageCalculator.nextStorage(
+395                         StorageClasses.INTEGER, layout);
+396                     bindings.move(storage, long.class);
+397                     break;
+398                 }
+399                 case STRUCT_HFA: {
+400                     assert carrier == MemorySegment.class;
+401                     GroupLayout group = (GroupLayout)layout;
+402                     VMStorage[] regs = storageCalculator.regAlloc(
+403                         StorageClasses.VECTOR, group.memberLayouts().size());
+404                     if (regs != null) {
+405                         long offset = 0;
+406                         for (int i = 0; i &lt; group.memberLayouts().size(); i++) {
+407                             VMStorage storage = regs[i];
+408                             final long size = group.memberLayouts().get(i).byteSize();
+409                             Class&lt;?&gt; type = SharedUtils.primitiveCarrierForSize(size);
+410                             if (i + 1 &lt; group.memberLayouts().size()) {
+411                                 bindings.dup();
+412                             }
+413                             bindings.dereference(offset, type)
+414                                     .move(storage, type);
+415                             offset += size;
+416                         }
+417                     } else {
+418                         spillStructUnbox(bindings, layout);
+419                     }
+420                     break;
+421                 }
+422                 case POINTER: {
+423                     bindings.convertAddress();
+424                     VMStorage storage =
+425                         storageCalculator.nextStorage(StorageClasses.INTEGER, layout);
+426                     bindings.move(storage, long.class);
+427                     break;
+428                 }
+429                 case INTEGER: {
+430                     VMStorage storage =
+431                         storageCalculator.nextStorage(StorageClasses.INTEGER, layout);
+432                     bindings.move(storage, carrier);
+433                     break;
+434                 }
+435                 case FLOAT: {
+436                     VMStorage storage =
+437                         storageCalculator.nextStorage(StorageClasses.VECTOR, layout);
+438                     bindings.move(storage, carrier);
+439                     break;
+440                 }
+441                 default:
+442                     throw new UnsupportedOperationException(&quot;Unhandled class &quot; + argumentClass);
+443             }
+444             return bindings.build();
+445         }
+446     }
+447 
+448     static class BoxBindingCalculator extends BindingCalculator{
+449         BoxBindingCalculator(boolean forArguments) {
+450             super(forArguments);
+451         }
+452 
+453         @Override
+454         List&lt;Binding&gt; getIndirectBindings() {
+455             return Binding.builder()
+456                 .move(INDIRECT_RESULT, long.class)
+457                 .convertAddress()
+458                 .build();
+459         }
+460 
+461         @SuppressWarnings(&quot;fallthrough&quot;)
+462         @Override
+463         List&lt;Binding&gt; getBindings(Class&lt;?&gt; carrier, MemoryLayout layout) {
+464             TypeClass argumentClass = classifyType(layout);
+465             Binding.Builder bindings = Binding.builder();
+466             switch (argumentClass) {
+467                 case STRUCT_REGISTER: {
+468                     assert carrier == MemorySegment.class;
+469                     bindings.allocate(layout);
+470                     VMStorage[] regs = storageCalculator.regAlloc(
+471                         StorageClasses.INTEGER, layout);
+472                     if (regs != null) {
+473                         int regIndex = 0;
+474                         long offset = 0;
+475                         while (offset &lt; layout.byteSize()) {
+476                             final long copy = Math.min(layout.byteSize() - offset, 8);
+477                             VMStorage storage = regs[regIndex++];
+478                             bindings.dup();
+479                             Class&lt;?&gt; type = SharedUtils.primitiveCarrierForSize(copy);
+480                             bindings.move(storage, type)
+481                                     .dereference(offset, type);
+482                             offset += copy;
+483                         }
+484                     } else {
+485                         spillStructBox(bindings, layout);
+486                     }
+487                     break;
+488                 }
+489                 case STRUCT_REFERENCE: {
+490                     assert carrier == MemorySegment.class;
+491                     VMStorage storage = storageCalculator.nextStorage(StorageClasses.INTEGER, layout);
+492                     bindings.move(storage, long.class)
+493                             .convertAddress();
+494                     // ASSERT SCOPE OF BOXED ADDRESS HERE
+495                     // caveat. buffer should instead go out of scope after call
+496                     bindings.copy(layout);
+497                     break;
+498                 }
+499                 case STRUCT_HFA: {
+500                     assert carrier == MemorySegment.class;
+501                     bindings.allocate(layout);
+502                     GroupLayout group = (GroupLayout)layout;
+503                     VMStorage[] regs = storageCalculator.regAlloc(
+504                         StorageClasses.VECTOR, group.memberLayouts().size());
+505                     if (regs != null) {
+506                         long offset = 0;
+507                         for (int i = 0; i &lt; group.memberLayouts().size(); i++) {
+508                             VMStorage storage = regs[i];
+509                             final long size = group.memberLayouts().get(i).byteSize();
+510                             Class&lt;?&gt; type = SharedUtils.primitiveCarrierForSize(size);
+511                             bindings.dup()
+512                                     .move(storage, type)
+513                                     .dereference(offset, type);
+514                             offset += size;
+515                         }
+516                     } else {
+517                         spillStructBox(bindings, layout);
+518                     }
+519                     break;
+520                 }
+521                 case POINTER: {
+522                     VMStorage storage =
+523                         storageCalculator.nextStorage(StorageClasses.INTEGER, layout);
+524                     bindings.move(storage, long.class)
+525                             .convertAddress();
+526                     break;
+527                 }
+528                 case INTEGER: {
+529                     VMStorage storage =
+530                         storageCalculator.nextStorage(StorageClasses.INTEGER, layout);
+531                     bindings.move(storage, carrier);
+532                     break;
+533                 }
+534                 case FLOAT: {
+535                     VMStorage storage =
+536                         storageCalculator.nextStorage(StorageClasses.VECTOR, layout);
+537                     bindings.move(storage, carrier);
+538                     break;
+539                 }
+540                 default:
+541                     throw new UnsupportedOperationException(&quot;Unhandled class &quot; + argumentClass);
+542             }
+543             return bindings.build();
+544         }
+545     }
+546 }
+<a name="4" id="anc4"></a><b style="font-size: large; color: red">--- EOF ---</b>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+</pre>
+<input id="eof" value="4" type="hidden" />
+</body>
+</html>
