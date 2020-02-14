@@ -1,0 +1,942 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Old src/java.base/share/classes/java/lang/Continuation.java</title>
+    <link rel="stylesheet" href="../../../../../../style.css" />
+  </head>
+  <body>
+    <pre>
+  1 /*
+  2  * Copyright (c) 2018, 2019, Oracle and/or its affiliates. All rights reserved.
+  3  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  4  *
+  5  * This code is free software; you can redistribute it and/or modify it
+  6  * under the terms of the GNU General Public License version 2 only, as
+  7  * published by the Free Software Foundation.  Oracle designates this
+  8  * particular file as subject to the &quot;Classpath&quot; exception as provided
+  9  * by Oracle in the LICENSE file that accompanied this code.
+ 10  *
+ 11  * This code is distributed in the hope that it will be useful, but WITHOUT
+ 12  * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ 13  * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ 14  * version 2 for more details (a copy is included in the LICENSE file that
+ 15  * accompanied this code).
+ 16  *
+ 17  * You should have received a copy of the GNU General Public License version
+ 18  * 2 along with this work; if not, write to the Free Software Foundation,
+ 19  * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ 20  *
+ 21  * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ 22  * or visit www.oracle.com if you need additional information or have any
+ 23  * questions.
+ 24  */
+ 25 
+ 26 package java.lang;
+ 27 
+ 28 import jdk.internal.HotSpotIntrinsicCandidate;
+ 29 import jdk.internal.vm.annotation.DontInline;
+ 30 import sun.security.action.GetPropertyAction;
+ 31 
+ 32 import java.lang.invoke.MethodHandles;
+ 33 import java.lang.invoke.VarHandle;
+ 34 import java.util.Arrays;
+ 35 import java.util.EnumSet;
+ 36 import java.util.Map;
+ 37 import java.util.Objects;
+ 38 import java.util.Set;
+ 39 import java.util.concurrent.ConcurrentHashMap;
+ 40 import java.util.function.Supplier;
+ 41 
+ 42 /**
+ 43  * TBD
+ 44  */
+ 45 public class Continuation {
+ 46     // private static final WhiteBox WB = sun.hotspot.WhiteBox.WhiteBox.getWhiteBox();
+ 47     private static final jdk.internal.misc.Unsafe unsafe = jdk.internal.misc.Unsafe.getUnsafe();
+ 48 
+ 49     private static final boolean TRACE = isEmptyOrTrue(&quot;java.lang.Continuation.trace&quot;);
+ 50     private static final boolean DEBUG = TRACE | isEmptyOrTrue(&quot;java.lang.Continuation.debug&quot;);
+ 51 
+ 52     private static final byte FLAG_LAST_FRAME_INTERPRETED = 1;
+ 53     private static final byte FLAG_SAFEPOINT_YIELD = 1 &lt;&lt; 1;
+ 54     private static final int WATERMARK_THRESHOLD = 10;
+ 55     private static final VarHandle MOUNTED;
+ 56 
+ 57     /** Reason for pinning */
+ 58     public enum Pinned { 
+ 59         /** Native frame on stack */ NATIVE,
+ 60         /** Monitor held */          MONITOR,
+ 61         /** In critical section */   CRITICAL_SECTION }
+ 62     /** Preemption attempt result */
+ 63     public enum PreemptStatus { 
+ 64         /** Success */                                                      SUCCESS(null), 
+ 65         /** Permanent failure */                                            PERM_FAIL_UNSUPPORTED(null), 
+ 66         /** Permanent failure: continuation alreay yielding */              PERM_FAIL_YIELDING(null), 
+ 67         /** Permanent failure: continuation not mounted on the thread */    PERM_FAIL_NOT_MOUNTED(null), 
+ 68         /** Transient failure: continuation pinned due to a held CS */      TRANSIENT_FAIL_PINNED_CRITICAL_SECTION(Pinned.CRITICAL_SECTION),
+ 69         /** Transient failure: continuation pinned due to native frame */   TRANSIENT_FAIL_PINNED_NATIVE(Pinned.NATIVE), 
+ 70         /** Transient failure: continuation pinned due to a held monitor */ TRANSIENT_FAIL_PINNED_MONITOR(Pinned.MONITOR);
+ 71 
+ 72         final Pinned pinned;
+ 73         private PreemptStatus(Pinned reason) { this.pinned = reason; }
+ 74         /** 
+ 75          * TBD
+ 76          * @return TBD
+ 77          **/
+ 78         public Pinned pinned() { return pinned; }
+ 79     }
+ 80 
+ 81     private static PreemptStatus preemptStatus(int status) {
+ 82         switch (status) {
+ 83             case -5: return PreemptStatus.PERM_FAIL_UNSUPPORTED;
+ 84             case  0: return PreemptStatus.SUCCESS;
+ 85             case -1: return PreemptStatus.PERM_FAIL_NOT_MOUNTED;
+ 86             case -2: return PreemptStatus.PERM_FAIL_YIELDING;
+ 87             case  1: return PreemptStatus.TRANSIENT_FAIL_PINNED_CRITICAL_SECTION;
+ 88             case  2: return PreemptStatus.TRANSIENT_FAIL_PINNED_NATIVE;
+ 89             case  3: return PreemptStatus.TRANSIENT_FAIL_PINNED_MONITOR;
+ 90             default: throw new AssertionError(&quot;Unknown status: &quot; + status);
+ 91         }
+ 92     }
+ 93 
+ 94     private static Pinned pinnedReason(int reason) {
+ 95         switch (reason) {
+ 96             case 1: return Pinned.CRITICAL_SECTION;
+ 97             case 2: return Pinned.NATIVE;
+ 98             case 3: return Pinned.MONITOR;
+ 99             default:
+100                 throw new AssertionError(&quot;Unknown pinned reason: &quot; + reason);
+101         }
+102     }
+103 
+104     private static Thread currentCarrierThread() {
+105         return Thread.currentCarrierThread();
+106     }
+107 
+108     static {
+109         try {
+110             registerNatives();
+111 
+112             MethodHandles.Lookup l = MethodHandles.lookup();
+113             MOUNTED = l.findVarHandle(Continuation.class, &quot;mounted&quot;, boolean.class);
+114         } catch (Exception e) {
+115             throw new InternalError(e);
+116         }
+117     }
+118 
+119     private Runnable target;
+120 
+121     /* While the native JVM code is aware that every continuation has a scope, it is, for the most part,
+122      * oblivious to the continuation hierarchy. The only time this hierarchy is traversed in native code
+123      * is when a hierarchy of continuations is mounted on the native stack.
+124      */
+125     private final ContinuationScope scope;
+126     private Continuation parent; // null for native stack
+127     private Continuation child; // non-null when we&#39;re yielded in a child continuation
+128 
+129     private jdk.internal.misc.StackChunk tail;
+130 
+131     // The content of the stack arrays is extremely security-sensitive. Writing can lead to arbitrary code execution, and reading can leak sensitive data
+132     private int[] stack = null; // grows down
+133     private Object[] refStack = null;
+134 
+135     private long fp = 0; // an index into the h-stack if the top frame is interpreted, otherwise, the value of rbp
+136     private int sp = -1; // index into the h-stack
+137     private long pc = 0;
+138     private int refSP;
+139     private int maxSize; // maximal stack size when unpacked
+140     private byte flags;
+141     private boolean done;
+142     private volatile boolean mounted = false;
+143     private Object yieldInfo;
+144 
+145     private short cs; // critical section semaphore
+146 
+147     private boolean reset = false; // perftest only
+148 
+149     // transient state
+150     // addresses into vstack. only valid when mounted
+151     private long entrySP = 0;
+152     private long entryFP = 0;
+153     private long entryPC = 0;
+154 
+155     // monitoring
+156     private short numFrames;
+157     private short numInterpretedFrames;
+158 
+159     private byte sizeCounter;
+160     private int stackWatermark;
+161     private int refStackWatermark;
+162 
+163     // private long[] nmethods = null; // grows up
+164     // private int numNmethods = 0;
+165 
+166     /**
+167      * TBD
+168      * @param scope TBD
+169      * @param target TBD
+170      */
+171     public Continuation(ContinuationScope scope, Runnable target) {
+172         this.scope = scope;
+173         this.target = target;
+174     }
+175 
+176     /**
+177      * TBD
+178      * @param scope TBD
+179      * @param target TBD
+180      * @param stackSize in bytes
+181      */
+182     public Continuation(ContinuationScope scope, int stackSize, Runnable target) {
+183         this(scope, target);
+184         getStacks(stackSize, stackSize, stackSize / 8);
+185     }
+186 
+187     @Override
+188     public String toString() {
+189         return super.toString() + &quot; scope: &quot; + scope;
+190     }
+191 
+192     ContinuationScope getScope() {
+193         return scope;
+194     }
+195 
+196     Continuation getParent() {
+197         return parent;
+198     }
+199 
+200     /**
+201      * TBD
+202      * @param scope TBD
+203      * @return TBD
+204      */
+205     public static Continuation getCurrentContinuation(ContinuationScope scope) {
+206         Continuation cont = currentCarrierThread().getContinuation();
+207         while (cont != null &amp;&amp; cont.scope != scope)
+208             cont = cont.parent;
+209         return cont;
+210     }
+211 
+212     /**
+213      * TBD
+214      * @return TBD
+215      */
+216     public StackWalker stackWalker() {
+217         return stackWalker(EnumSet.noneOf(StackWalker.Option.class));
+218     }
+219 
+220     /**
+221      * TBD
+222      * @param option TBD
+223      * @return TBD
+224      */
+225     public StackWalker stackWalker(StackWalker.Option option) {
+226         return stackWalker(EnumSet.of(Objects.requireNonNull(option)));
+227     }
+228 
+229     /**
+230      * TBD
+231      * @param options TBD
+232      * @return TBD
+233      */
+234     public StackWalker stackWalker(Set&lt;StackWalker.Option&gt; options) {
+235         return stackWalker(options, this.scope);
+236     }
+237 
+238     /**
+239      * TBD
+240      * @param options TBD
+241      * @param scope TBD
+242      * @return TBD
+243      */
+244     public StackWalker stackWalker(Set&lt;StackWalker.Option&gt; options, ContinuationScope scope) {
+245         // if (scope != null) {
+246         //     // verify the given scope exists in this continuation
+247         //     Continuation c;
+248         //     for (c = innermost(); c != null; c = c.parent) {
+249         //         if (c.scope == scope)
+250         //             break;
+251         //     }
+252         //     if (c.scope != scope)
+253         //         scope = this.scope; // throw new IllegalArgumentException(&quot;Continuation &quot; + this + &quot; not in scope &quot; + scope); -- don&#39;t throw exception to have the same behavior as no continuation
+254         // } else {
+255         //     scope = this.scope;
+256         // }
+257         return StackWalker.newInstance(options, null, scope, innermost());
+258     }
+259 
+260     /**
+261      * TBD
+262      * @return TBD
+263      * @throws IllegalStateException if the continuation is mounted
+264      */
+265     public StackTraceElement[] getStackTrace() {
+266         return stackWalker().walk(s -&gt; s.map(StackWalker.StackFrame::toStackTraceElement).toArray(StackTraceElement[]::new));
+267     }
+268 
+269     /// Support for StackWalker
+270     static &lt;R&gt; R wrapWalk(Continuation inner, ContinuationScope scope, Supplier&lt;R&gt; walk) {
+271         try {
+272             for (Continuation c = inner; c != null &amp;&amp; c.scope != scope; c = c.parent)
+273                 c.mount();
+274 
+275             // if (!inner.isStarted())
+276             //     throw new IllegalStateException(&quot;Continuation not started&quot;);
+277                 
+278             return walk.get();
+279         } finally {
+280             for (Continuation c = inner; c != null &amp;&amp; c.scope != scope; c = c.parent)
+281                 c.unmount();
+282         }
+283     }
+284 
+285     private Continuation innermost() {
+286         Continuation c = this;
+287         while (c.child != null)
+288             c = c.child;
+289         return c;
+290     }
+291 
+292     private void mount() {
+293         if (!compareAndSetMounted(false, true))
+294             throw new IllegalStateException(&quot;Mounted!!!!&quot;);
+295     }
+296 
+297     private void unmount() {
+298         setMounted(false);
+299     }
+300     
+301     /**
+302      * TBD
+303      */
+304     public final void run() {
+305         while (true) {
+306             if (TRACE) System.out.println(&quot;\n++++++++++++++++++++++++++++++&quot;);
+307 
+308             mount();
+309 
+310             if (done)
+311                 throw new IllegalStateException(&quot;Continuation terminated&quot;);
+312 
+313             Thread t = currentCarrierThread();
+314             if (parent != null) {
+315                 if (parent != t.getContinuation())
+316                     throw new IllegalStateException();
+317             } else
+318                 this.parent = t.getContinuation();
+319             t.setContinuation(this);
+320 
+321             int origRefSP = refSP;
+322 
+323             int origSP = sp, origMaxSize = maxSize; long origFP = fp, origPC = pc; // perftest only (used only if reset is true)
+324 
+325             try {
+326                 if (!isStarted()) { // is this the first run? (at this point we know !done)
+327                     if (TRACE) System.out.println(&quot;ENTERING &quot; + id());
+328                     this.entrySP = getSP(); // now getSP also resets fastpath; this is also done in thaw for the doContinue branch
+329                     enter(); // make this an invokevirtual rather than invokeinterface. Otherwise it freaks out the interpreter (currently solved by patching in native)
+330                 } else {
+331                     assert !isEmpty();
+332                     doContinue(); // intrinsic. Jumps into yield, as a return from doYield    
+333                 }
+334             } finally {
+335                 fence();
+336                 try {
+337                 if (TRACE) System.out.println(&quot;run (after) sp: &quot; + sp + &quot; refSP: &quot; + refSP + &quot; maxSize: &quot; + maxSize);
+338 
+339                 assert isEmpty() == done : &quot;empty: &quot; + isEmpty() + &quot; done: &quot; + done + &quot; cont: &quot; + Integer.toHexString(System.identityHashCode(this));
+340                 currentCarrierThread().setContinuation(this.parent);
+341                 if (parent != null)
+342                     parent.child = null;
+343 
+344                 if (reset) { maxSize = origMaxSize; sp = origSP; fp = origFP; pc = origPC; refSP = origRefSP; } // perftest only
+345                 postYieldCleanup(origRefSP);
+346 
+347                 if (TRACE) System.out.println(&quot;clearing entryPC&quot;);
+348                 this.entryPC = 0; // cannot be done in native code, as a safpoint on the transition back to Java may want to walk the stack (with the still-mounted continuation)
+349 
+350                 unmount();
+351                 } catch (Throwable e) { e.printStackTrace(); System.exit(1); }
+352                 assert !hasLeak() : &quot;hasLeak1 &quot; + &quot;refSP: &quot; + refSP + &quot; refStack: &quot; + Arrays.toString(refStack);
+353             }
+354             // we&#39;re now in the parent continuation
+355 
+356             assert yieldInfo == null || yieldInfo instanceof ContinuationScope;
+357             if (yieldInfo == null || yieldInfo == scope) {
+358                 this.parent = null;
+359                 this.yieldInfo = null;
+360                 return;
+361             } else {
+362                 parent.child = this;
+363                 parent.yield0((ContinuationScope)yieldInfo, this);
+364                 parent.child = null;
+365             }
+366         }
+367     }
+368 
+369     @DontInline
+370     @HotSpotIntrinsicCandidate
+371     private void enter() {
+372         // This method runs in the &quot;entry frame&quot;.
+373         // A yield jumps to this method&#39;s caller as if returning from this method.
+374         try {
+375             target.run();
+376         } finally {
+377             done = true;
+378             assert reset || fence() &amp;&amp; isStackEmpty() : &quot;sp: &quot; + sp + &quot; stack.length: &quot; + (stack != null ? stack.length : &quot;null&quot;);
+379             // assert doneX;
+380             // System.out.println(&quot;-- done!  &quot; + id());
+381             if (TRACE) System.out.println(&quot;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt; DONE &lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt; &quot; + id());
+382             assert isEmpty();
+383         }
+384     }
+385 
+386     private boolean isStarted() {
+387         return tail != null || (stack != null &amp;&amp; sp &lt; stack.length);
+388     }
+389 
+390     private boolean isEmpty() {
+391         if (pc != 0) return false;
+392         for (jdk.internal.misc.StackChunk c = tail; c != null; c = c.parent) {
+393             if (!isEmpty(c))
+394                 return false;
+395         }
+396         return true;
+397     }
+398 
+399     private boolean isEmpty(jdk.internal.misc.StackChunk c) {
+400         return c.sp &gt;= c.size;
+401     }
+402 
+403     /**
+404      * TBD
+405      * 
+406      * @param scope The {@link ContinuationScope} to yield
+407      * @return {@code true} for success; {@code false} for failure
+408      * @throws IllegalStateException if not currently in the given {@code scope},
+409      */
+410     // @DontInline
+411     public static boolean yield(ContinuationScope scope) {
+412         Continuation cont = currentCarrierThread().getContinuation();
+413         Continuation c;
+414         for (c = cont; c != null &amp;&amp; c.scope != scope; c = c.parent)
+415             ;
+416         if (c == null)
+417             throw new IllegalStateException(&quot;Not in scope &quot; + scope);
+418 
+419         return cont.yield0(scope, null);
+420     }
+421 
+422     private boolean yield0(ContinuationScope scope, Continuation child) {
+423         if (TRACE) System.out.println(this + &quot; yielding on scope &quot; + scope + &quot;. child: &quot; + child);
+424         if (scope != this.scope)
+425             this.yieldInfo = scope;
+426         int res = doYield(0);
+427         unsafe.storeFence(); // needed to prevent certain transformations by the compiler
+428         
+429         if (TRACE) System.out.println(this + &quot; awake on scope &quot; + scope + &quot; child: &quot; + child + &quot; res: &quot; + res + &quot; yieldInfo: &quot; + yieldInfo);
+430 
+431         try {
+432         assert scope != this.scope || yieldInfo == null : &quot;scope: &quot; + scope + &quot; this.scope: &quot; + this.scope + &quot; yieldInfo: &quot; + yieldInfo + &quot; res: &quot; + res;
+433         assert yieldInfo == null || scope == this.scope || yieldInfo instanceof Integer : &quot;scope: &quot; + scope + &quot; this.scope: &quot; + this.scope + &quot; yieldInfo: &quot; + yieldInfo + &quot; res: &quot; + res;
+434 
+435         if (child != null) { // TODO: ugly
+436             if (res != 0) {
+437                 child.yieldInfo = res;
+438             } else if (yieldInfo != null) {
+439                 assert yieldInfo instanceof Integer;
+440                 child.yieldInfo = yieldInfo;
+441             } else {
+442                 child.yieldInfo = res;
+443             }
+444             this.yieldInfo = null;
+445 
+446             if (TRACE) System.out.println(this + &quot; child.yieldInfo = &quot; + child.yieldInfo);
+447         } else {
+448             if (res == 0 &amp;&amp; yieldInfo != null) {
+449                 res = (Integer)yieldInfo;
+450             }
+451             this.yieldInfo = null;
+452 
+453             if (res == 0)
+454                 onContinue();
+455             else
+456                 onPinned0(res);
+457 
+458             if (TRACE) System.out.println(this + &quot; res: &quot; + res);
+459         }
+460         assert yieldInfo == null;
+461         assert reset || !hasLeak() : &quot;hasLeak2 &quot; + &quot;refSP: &quot; + refSP + &quot; refStack: &quot; + Arrays.toString(refStack);
+462 
+463         return res == 0;
+464         } catch (Throwable t) {
+465             t.printStackTrace();
+466             throw t;
+467         }
+468     }
+469 
+470     private void postYieldCleanup(int origRefSP) {
+471         if (done) {
+472             // TODO: The following are disabled just for some testing
+473             // this.stack = null;
+474             // this.sp = -1;
+475             // this.refStack = null;
+476             // this.refSP = -1;
+477             this.tail = null;
+478         } else {
+479             if (TRACE &amp;&amp; origRefSP &lt; refSP) System.out.println(&quot;Nulling refs &quot; + origRefSP + &quot; (inclusive) - &quot; + refSP + &quot; (exclusive)&quot;);
+480             maybeShrink();
+481         }
+482     }
+483 
+484     private void onPinned0(int reason) {
+485         if (TRACE) System.out.println(&quot;PINNED &quot; + this + &quot; reason: &quot; + reason);
+486         onPinned(pinnedReason(reason));
+487     }
+488 
+489     /**
+490      * TBD
+491      * @param reason TBD
+492      */
+493     protected void onPinned(Pinned reason) {
+494         if (DEBUG)
+495             System.out.println(&quot;PINNED! &quot; + reason);
+496         throw new IllegalStateException(&quot;Pinned: &quot; + reason);
+497     }
+498 
+499     /**
+500      * TBD
+501      */
+502     protected void onContinue() {
+503         if (TRACE)
+504             System.out.println(&quot;On continue&quot;);
+505     }
+506 
+507     /**
+508      * TBD
+509      * @return TBD
+510      */
+511     public boolean isDone() {
+512         return done;
+513     }
+514 
+515     /**
+516      * TBD
+517      * @return TBD
+518      */
+519     public boolean isPreempted() {
+520         return isFlag(FLAG_SAFEPOINT_YIELD);
+521     }
+522 
+523     private boolean isFlag(byte flag) {
+524         return (flags &amp; flag) != 0;
+525     }
+526 
+527     /**
+528      * Pins the current continuation (enters a critical section).
+529      * This increments an internal semaphore that, when greater than 0, pins the continuation.
+530      */
+531     public static void pin() {
+532         Continuation cont = currentCarrierThread().getContinuation();
+533         if (cont != null) {
+534             assert cont.cs &gt;= 0;
+535             if (cont.cs == Short.MAX_VALUE)
+536                 throw new IllegalStateException(&quot;Too many pins&quot;);
+537             cont.cs++;
+538         }
+539     }
+540 
+541     /**
+542      * Unpins the current continuation (exits a critical section).
+543      * This decrements an internal semaphore that, when equal 0, unpins the current continuation
+544      * if pinne with {@link #pin()}.
+545      */
+546     public static void unpin() {
+547         Continuation cont = currentCarrierThread().getContinuation();
+548         if (cont != null) {
+549             assert cont.cs &gt;= 0;
+550             if (cont.cs == 0)
+551                 throw new IllegalStateException(&quot;Not pinned&quot;);
+552             cont.cs--;
+553         }
+554     }
+555 
+556     /**
+557      * Tests whether the given scope is pinned. 
+558      * This method is slow.
+559      * 
+560      * @param scope the continuation scope
+561      * @return {@code} true if we&#39;re in the give scope and are pinned; {@code false otherwise}
+562      */
+563     public static boolean isPinned(ContinuationScope scope) {
+564         int res = isPinned0(scope);
+565         return res != 0;
+566     }
+567 
+568     static private native int isPinned0(ContinuationScope scope);
+569 
+570     private void clean() {
+571         // if (!isStackEmpty())
+572         //     clean0();
+573     }
+574 
+575     private boolean fence() {
+576         unsafe.storeFence(); // needed to prevent certain transformations by the compiler
+577         return true;
+578     }
+579 
+580     // /**
+581     //  * TBD
+582     //  */
+583     // public void doneX() {
+584     //     // System.out.println(&quot;DONEX&quot;);
+585     //     this.doneX = true;
+586     // }
+587 
+588     private long readLong(int[] array, int index) {
+589         return (long)array[index] &lt;&lt; 32 + array[index+1];
+590     }
+591 
+592     private void getStacks(int size, int oops, int frames) {
+593         try {
+594             boolean allocated = false;
+595             allocated |= getStack(size);
+596             allocated |= getRefStack(oops);
+597             assert allocated : &quot;getStacks called for no good reason&quot;;
+598         } catch (Throwable t) {
+599             t.printStackTrace();
+600             throw t;
+601         }
+602     }
+603 
+604     // size is the size in bytes needed for newly frozen frames
+605     private boolean getStack(int size) {
+606         size = size &gt;&gt; 2;
+607         if (DEBUG)
+608             System.out.println(&quot;-- getStack size: &quot; + size + &quot; cur: &quot; + (stack != null ? stack.length : 0) + &quot; sp: &quot; + sp);
+609 
+610         if (this.stack == null) {
+611             this.stack = new int[size];
+612             this.sp = stack.length;
+613             if (DEBUG)
+614                 System.out.println(&quot;-- getStack: allocated: &quot; + stack.length + &quot; sp: &quot; + sp );
+615         } else {
+616             int oldLength = stack.length;
+617             int offset = sp &gt;= 0 ? sp : oldLength;
+618             int minLength = (oldLength - offset) + size;
+619             if (minLength &gt; oldLength) {
+620                 int newLength = newCapacity(oldLength, minLength);
+621                 int[] newStack = new int[newLength];
+622                 int n = oldLength - offset;
+623                 if (n &gt; 0)
+624                     System.arraycopy(stack, offset, newStack, newLength - n, n);
+625                 this.stack = newStack;
+626                 // we need to preserve the same offset from the array&#39;s _end_
+627                 this.sp = fixDecreasingIndexAfterResize(sp, oldLength, newLength);
+628                 if (isFlag(FLAG_LAST_FRAME_INTERPRETED)) {
+629                     if (DEBUG) System.out.println(&quot;-- getStack CHANGING FP&quot;);
+630                     this.fp = fixDecreasingIndexAfterResize((int) fp, oldLength, newLength);
+631                 }
+632                 if (DEBUG)
+633                     System.out.println(&quot;-- getStack: allocated: &quot; + newLength + &quot; old: &quot; + oldLength + &quot; sp: &quot; + sp + &quot; fp: &quot; + fp);
+634             } else
+635                 return false;
+636         }
+637         if (TRACE) System.out.println(&quot;--- end of getStack sp: &quot; + sp);
+638 
+639         return true;
+640     }
+641 
+642     private boolean getRefStack(int size) {
+643         if (DEBUG)
+644             System.out.println(&quot;-- getRefStack: &quot; + size);
+645         if (refStack == null) {
+646             this.refStack = new Object[size]; // TODO: nearest power of 2
+647             this.refSP = refStack.length;
+648             if (DEBUG)
+649                 System.out.println(&quot;-- getRefStack: allocated: &quot; + refStack.length + &quot; refSP: &quot; + refSP);
+650         } else if (refSP &lt; size) {
+651             int oldLength = refStack.length;
+652             int newLength = newCapacity(oldLength, (oldLength - refSP) + size);
+653             Object[] newRefStack = new Object[newLength];
+654             int n = oldLength - refSP;
+655             System.arraycopy(refStack, refSP, newRefStack, newLength - n, n);
+656             this.refStack = newRefStack;
+657             this.refSP = fixDecreasingIndexAfterResize(refSP, oldLength, newLength);
+658             if (DEBUG)
+659                 System.out.println(&quot;-- getRefStack: allocated: &quot; + newLength + &quot; old: &quot; + oldLength + &quot; refSP: &quot; + refSP);
+660         } else
+661             return false;
+662         if (TRACE) System.out.println(&quot;--- end of getRefStack: &quot; + refStack.length + &quot; refSP: &quot; + refSP);
+663         
+664         return true;
+665     }
+666 
+667     void maybeShrink() {
+668         if (stack == null || refStack == null)
+669             return;
+670 
+671         int stackSize = stack.length - sp;
+672         int refStackSize = refStack.length - refSP;
+673         assert sp &gt;= 0;
+674         assert stackSize &gt;= 0;
+675 
+676         if (stackSize &gt; stackWatermark || refStackSize &gt; refStackWatermark) {
+677             this.stackWatermark    = Math.max(stackWatermark,    stackSize);
+678             this.refStackWatermark = Math.max(refStackWatermark, refStackSize);
+679             this.sizeCounter = 0;
+680             return;
+681         }
+682 
+683         sizeCounter++;
+684 
+685         if (sizeCounter &gt;= WATERMARK_THRESHOLD) {
+686             if (stackWatermark &lt; stack.length) resizeStack(stackWatermark);
+687             this.stackWatermark = 0;
+688 
+689             if (refStackWatermark &lt; refStack.length) resizeRefStack(refStackWatermark);
+690             this.refStackWatermark = 0;
+691         }
+692     }
+693 
+694     void resizeStack(int newLength) {
+695         int oldLength = stack.length;
+696         int offset = sp;
+697         int n = oldLength - offset;
+698         assert newLength &gt;= n;
+699         if (DEBUG)
+700             System.out.println(&quot;-- resizeStack0 length: &quot; + stack.length + &quot; sp: &quot; + sp + &quot; newLength: &quot; + newLength + &quot; used: &quot; + n);
+701         int[] newStack = new int[newLength];
+702         System.arraycopy(stack, offset, newStack, newLength - n, n);
+703         this.stack = newStack;
+704 
+705         this.sp = fixDecreasingIndexAfterResize(sp, oldLength, newLength);
+706         if (isFlag(FLAG_LAST_FRAME_INTERPRETED)) {
+707             if (DEBUG) System.out.println(&quot;-- resizeStack CHANGING FP&quot;);
+708             this.fp = fixDecreasingIndexAfterResize((int) fp, oldLength, newLength);
+709         }
+710         if (DEBUG)
+711             System.out.println(&quot;-- resizeStack1 length: &quot; + stack.length + &quot; sp: &quot; + sp + &quot; fp: &quot; + fp);
+712     }
+713 
+714     void resizeRefStack(int newLength) {
+715         if (DEBUG)
+716             System.out.println(&quot;-- resizeRefStack0 length: &quot; + refStack.length + &quot; refSP: &quot; + refSP + &quot; newLength: &quot; + newLength);
+717         int oldLength = refStack.length;
+718         int n = oldLength - refSP;
+719         assert newLength &gt;= n;
+720         Object[] newRefStack = new Object[newLength];
+721         System.arraycopy(refStack, refSP, newRefStack, newLength - n, n);
+722         this.refStack = newRefStack;
+723 
+724         this.refSP = fixDecreasingIndexAfterResize(refSP, oldLength, newLength);
+725         if (DEBUG)
+726             System.out.println(&quot;-- resizeRefStack1 length: &quot; + refStack.length + &quot; refSP: &quot; + refSP);
+727     }
+728 
+729     private int fixDecreasingIndexAfterResize(int index, int oldLength, int newLength) {
+730         return newLength - (oldLength - index);
+731     }
+732 
+733     private int newCapacity(int oldCapacity, int minCapacity) {
+734         // overflow-conscious code
+735         int newCapacity = oldCapacity + (oldCapacity &gt;&gt; 1);
+736         if (newCapacity - minCapacity &lt;= 0) {
+737             if (minCapacity &lt; 0) // overflow
+738                 throw new OutOfMemoryError();
+739             return minCapacity;
+740         }
+741         return newCapacity;
+742     }
+743 
+744     /**
+745      * temporary testing
+746      */
+747     public void something_something_1() {
+748         this.sp = stack.length;
+749         this.refSP = refStack.length;
+750         this.done = false;
+751         this.flags = 0;
+752 
+753         this.fp = 0;
+754         this.pc = 0;
+755         this.entrySP = 0;
+756         this.entryFP = 0;
+757         this.entryPC = 0;
+758 
+759         this.numFrames = 0;
+760         this.numInterpretedFrames = 0;
+761     
+762         this.sizeCounter = 0;
+763         this.stackWatermark = 0;
+764         this.refStackWatermark = 0;
+765 
+766         setMounted(false);
+767     }
+768 
+769     /**
+770      * temporary testing
+771      */
+772     public void something_something_2() {
+773         reset = true;
+774     }
+775 
+776     /**
+777      * temporary testing
+778      */
+779     public void something_something_3() {
+780         this.done = false;
+781     }
+782 
+783     // private void pushNmethod(long nmethod) {
+784     //     if (nmethods == null) {
+785     //         nmethods = new long[8];
+786     //     } else {
+787     //         if (numNmethods == nmethods.length) {
+788     //             long[] newNmethods = new long[nmethods.length * 2];
+789     //             System.arraycopy(nmethods, 0, newNmethods, 0, numNmethods);
+790     //             this.nmethods = newNmethods;
+791     //         }
+792     //     }
+793     //     nmethods[numNmethods++] = nmethod;
+794     // }
+795 
+796     // private void popNmethod() {
+797     //     numNmethods--;
+798     // }
+799 
+800     private static Map&lt;Long, Integer&gt; liveNmethods = new ConcurrentHashMap&lt;&gt;();
+801 
+802     private void processNmethods(int before, int after) {
+803 
+804     }
+805 
+806 
+807     @HotSpotIntrinsicCandidate
+808     private static long getSP() { throw new Error(&quot;Intrinsic not installed&quot;); };
+809 
+810     @HotSpotIntrinsicCandidate
+811     private static long getPC() { throw new Error(&quot;Intrinsic not installed&quot;); };
+812 
+813     @HotSpotIntrinsicCandidate
+814     private void doContinue() { throw new Error(&quot;Intrinsic not installed&quot;); };
+815 
+816     @HotSpotIntrinsicCandidate
+817     private static int doYield(int scopes) { throw new Error(&quot;Intrinsic not installed&quot;); };
+818 
+819     @HotSpotIntrinsicCandidate
+820     private static void jump(long sp, long fp, long pc) { throw new Error(&quot;Intrinsic not installed&quot;); };
+821 
+822     /**
+823      * TBD
+824      * @return TBD
+825      */
+826     public int getNumFrames() {
+827         return numFrames;
+828     }
+829 
+830     /**
+831      * TBD
+832      * @return TBD
+833      */
+834     public int getNumInterpretedFrames() {
+835         return numInterpretedFrames;
+836     }
+837 
+838     /**
+839      * TBD
+840      * @return TBD
+841      */
+842     public int getStackUsageInBytes() {
+843         return (stack != null ? stack.length - sp + 1 : 0) * 4;
+844     }
+845 
+846     /**
+847      * TBD
+848      * @return TBD
+849      */
+850     public int getNumRefs() {
+851         return (refStack != null ? refStack.length - refSP : 0);
+852     }
+853 
+854     /**
+855      * TBD
+856      * @return value
+857      */
+858     @HotSpotIntrinsicCandidate
+859     public static int runLevel() { return 0; }
+860 
+861     private boolean compareAndSetMounted(boolean expectedValue, boolean newValue) {
+862        boolean res = MOUNTED.compareAndSet(this, expectedValue, newValue);
+863     //    System.out.println(&quot;-- compareAndSetMounted:  ex: &quot; + expectedValue + &quot; -&gt; &quot; + newValue + &quot; &quot; + res + &quot; &quot; + id());
+864        return res;
+865      }
+866 
+867     private void setMounted(boolean newValue) {
+868         // System.out.println(&quot;-- setMounted:  &quot; + newValue + &quot; &quot; + id());
+869         mounted = newValue;
+870         // MOUNTED.setVolatile(this, newValue);
+871     }
+872 
+873     private String id() {
+874         return Integer.toHexString(System.identityHashCode(this)) + &quot; [&quot; + currentCarrierThread().getId() + &quot;]&quot;;
+875     }
+876 
+877     // private native void clean0();
+878 
+879     /**
+880      * TBD
+881      * Subclasses may throw an {@link UnsupportedOperationException}, but this does not prevent
+882      * the continuation from being preempted on a parent scope.
+883      * 
+884      * @param thread TBD
+885      * @return TBD
+886      * @throws UnsupportedOperationException if this continuation does not support preemption
+887      */
+888     public PreemptStatus tryPreempt(Thread thread) {
+889         PreemptStatus res = preemptStatus(tryForceYield0(thread));
+890         if (res == PreemptStatus.PERM_FAIL_UNSUPPORTED) {
+891             throw new UnsupportedOperationException(&quot;Thread-local handshakes disabled&quot;);
+892         }
+893         return res;
+894     }
+895 
+896     private native int tryForceYield0(Thread thread);
+897 
+898     // native methods
+899     private static native void registerNatives();
+900 
+901     private boolean hasLeak() {
+902         assert refStack != null || refSP &lt;= 0 : &quot;refSP: &quot; + refSP;
+903         for (int i = 0; i &lt; refSP; i++) {
+904             if (refStack[i] != null)
+905                 return true;
+906         }
+907         return false;
+908     }
+909 
+910     private boolean isStackEmpty() {
+911         return (stack == null) || (sp &lt; 0) || (sp &gt;= stack.length);
+912     }
+913 
+914     private void dump() {
+915         System.out.println(&quot;Continuation@&quot; + Long.toHexString(System.identityHashCode(this)));
+916         System.out.println(&quot;\tparent: &quot; + parent);
+917         System.out.println(&quot;\tstack.length: &quot; + stack.length);
+918         for (int i = 1; i &lt;= 10; i++) {
+919             int j = stack.length - i;
+920             System.out.println(&quot;\tarray[ &quot; + j + &quot;] = &quot; + stack[j]);
+921         }
+922     }
+923 
+924     private static boolean isEmptyOrTrue(String property) {
+925         String value = GetPropertyAction.privilegedGetProperty(property);
+926         if (value == null)
+927             return false;
+928         return value.isEmpty() || Boolean.parseBoolean(value);
+929     }
+930 }
+    </pre>
+  </body>
+</html>
