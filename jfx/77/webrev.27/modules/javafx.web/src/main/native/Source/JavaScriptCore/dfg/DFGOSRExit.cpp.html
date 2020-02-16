@@ -1,0 +1,1700 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>New modules/javafx.web/src/main/native/Source/JavaScriptCore/dfg/DFGOSRExit.cpp</title>
+    <link rel="stylesheet" href="../../../../../../../../style.css" />
+  </head>
+  <body>
+    <pre>
+   1 /*
+   2  * Copyright (C) 2011-2019 Apple Inc. All rights reserved.
+   3  *
+   4  * Redistribution and use in source and binary forms, with or without
+   5  * modification, are permitted provided that the following conditions
+   6  * are met:
+   7  * 1. Redistributions of source code must retain the above copyright
+   8  *    notice, this list of conditions and the following disclaimer.
+   9  * 2. Redistributions in binary form must reproduce the above copyright
+  10  *    notice, this list of conditions and the following disclaimer in the
+  11  *    documentation and/or other materials provided with the distribution.
+  12  *
+  13  * THIS SOFTWARE IS PROVIDED BY APPLE INC. ``AS IS&#39;&#39; AND ANY
+  14  * EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+  15  * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+  16  * PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL APPLE INC. OR
+  17  * CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+  18  * EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+  19  * PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
+  20  * PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY
+  21  * OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+  22  * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+  23  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+  24  */
+  25 
+  26 #include &quot;config.h&quot;
+  27 #include &quot;DFGOSRExit.h&quot;
+  28 
+  29 #if ENABLE(DFG_JIT)
+  30 
+  31 #include &quot;AssemblyHelpers.h&quot;
+  32 #include &quot;ClonedArguments.h&quot;
+  33 #include &quot;DFGGraph.h&quot;
+  34 #include &quot;DFGMayExit.h&quot;
+  35 #include &quot;DFGOSRExitCompilerCommon.h&quot;
+  36 #include &quot;DFGOSRExitPreparation.h&quot;
+  37 #include &quot;DFGOperations.h&quot;
+  38 #include &quot;DFGSpeculativeJIT.h&quot;
+  39 #include &quot;DirectArguments.h&quot;
+  40 #include &quot;FrameTracers.h&quot;
+  41 #include &quot;InlineCallFrame.h&quot;
+  42 #include &quot;JSCInlines.h&quot;
+  43 #include &quot;JSCJSValue.h&quot;
+  44 #include &quot;OperandsInlines.h&quot;
+  45 #include &quot;ProbeContext.h&quot;
+  46 #include &quot;ProbeFrame.h&quot;
+  47 
+  48 namespace JSC { namespace DFG {
+  49 
+  50 // Probe based OSR Exit.
+  51 
+  52 using CPUState = Probe::CPUState;
+  53 using Context = Probe::Context;
+  54 using Frame = Probe::Frame;
+  55 
+  56 static void reifyInlinedCallFrames(Probe::Context&amp;, CodeBlock* baselineCodeBlock, const OSRExitBase&amp;);
+  57 static void adjustAndJumpToTarget(Probe::Context&amp;, VM&amp;, CodeBlock*, CodeBlock* baselineCodeBlock, OSRExit&amp;);
+  58 static void printOSRExit(Context&amp;, uint32_t osrExitIndex, const OSRExit&amp;);
+  59 
+  60 static JSValue jsValueFor(CPUState&amp; cpu, JSValueSource source)
+  61 {
+  62     if (source.isAddress()) {
+  63         JSValue result;
+  64         std::memcpy(&amp;result, cpu.gpr&lt;uint8_t*&gt;(source.base()) + source.offset(), sizeof(JSValue));
+  65         return result;
+  66     }
+  67 #if USE(JSVALUE64)
+  68     return JSValue::decode(cpu.gpr&lt;EncodedJSValue&gt;(source.gpr()));
+  69 #else
+  70     if (source.hasKnownTag())
+  71         return JSValue(source.tag(), cpu.gpr&lt;int32_t&gt;(source.payloadGPR()));
+  72     return JSValue(cpu.gpr&lt;int32_t&gt;(source.tagGPR()), cpu.gpr&lt;int32_t&gt;(source.payloadGPR()));
+  73 #endif
+  74 }
+  75 
+  76 #if NUMBER_OF_CALLEE_SAVES_REGISTERS &gt; 0
+  77 
+  78 // Based on AssemblyHelpers::emitRestoreCalleeSavesFor().
+  79 static void restoreCalleeSavesFor(Context&amp; context, CodeBlock* codeBlock)
+  80 {
+  81     ASSERT(codeBlock);
+  82 
+  83     const RegisterAtOffsetList* calleeSaves = codeBlock-&gt;calleeSaveRegisters();
+  84     RegisterSet dontRestoreRegisters = RegisterSet(RegisterSet::stackRegisters(), RegisterSet::allFPRs());
+  85     unsigned registerCount = calleeSaves-&gt;size();
+  86 
+  87     UCPURegister* physicalStackFrame = context.fp&lt;UCPURegister*&gt;();
+  88     for (unsigned i = 0; i &lt; registerCount; i++) {
+  89         RegisterAtOffset entry = calleeSaves-&gt;at(i);
+  90         if (dontRestoreRegisters.get(entry.reg()))
+  91             continue;
+  92         // The callee saved values come from the original stack, not the recovered stack.
+  93         // Hence, we read the values directly from the physical stack memory instead of
+  94         // going through context.stack().
+  95         ASSERT(!(entry.offset() % sizeof(UCPURegister)));
+  96         context.gpr(entry.reg().gpr()) = physicalStackFrame[entry.offset() / sizeof(UCPURegister)];
+  97     }
+  98 }
+  99 
+ 100 // Based on AssemblyHelpers::emitSaveCalleeSavesFor().
+ 101 static void saveCalleeSavesFor(Context&amp; context, CodeBlock* codeBlock)
+ 102 {
+ 103     auto&amp; stack = context.stack();
+ 104     ASSERT(codeBlock);
+ 105 
+ 106     const RegisterAtOffsetList* calleeSaves = codeBlock-&gt;calleeSaveRegisters();
+ 107     RegisterSet dontSaveRegisters = RegisterSet(RegisterSet::stackRegisters(), RegisterSet::allFPRs());
+ 108     unsigned registerCount = calleeSaves-&gt;size();
+ 109 
+ 110     for (unsigned i = 0; i &lt; registerCount; i++) {
+ 111         RegisterAtOffset entry = calleeSaves-&gt;at(i);
+ 112         if (dontSaveRegisters.get(entry.reg()))
+ 113             continue;
+ 114         stack.set(context.fp(), entry.offset(), context.gpr&lt;UCPURegister&gt;(entry.reg().gpr()));
+ 115     }
+ 116 }
+ 117 
+ 118 // Based on AssemblyHelpers::restoreCalleeSavesFromVMEntryFrameCalleeSavesBuffer().
+ 119 static void restoreCalleeSavesFromVMEntryFrameCalleeSavesBuffer(Context&amp; context)
+ 120 {
+ 121     VM&amp; vm = *context.arg&lt;VM*&gt;();
+ 122 
+ 123     RegisterAtOffsetList* allCalleeSaves = RegisterSet::vmCalleeSaveRegisterOffsets();
+ 124     RegisterSet dontRestoreRegisters = RegisterSet::stackRegisters();
+ 125     unsigned registerCount = allCalleeSaves-&gt;size();
+ 126 
+ 127     VMEntryRecord* entryRecord = vmEntryRecord(vm.topEntryFrame);
+ 128     UCPURegister* calleeSaveBuffer = reinterpret_cast&lt;UCPURegister*&gt;(entryRecord-&gt;calleeSaveRegistersBuffer);
+ 129 
+ 130     // Restore all callee saves.
+ 131     for (unsigned i = 0; i &lt; registerCount; i++) {
+ 132         RegisterAtOffset entry = allCalleeSaves-&gt;at(i);
+ 133         if (dontRestoreRegisters.get(entry.reg()))
+ 134             continue;
+ 135         size_t uintptrOffset = entry.offset() / sizeof(UCPURegister);
+ 136         if (entry.reg().isGPR())
+ 137             context.gpr(entry.reg().gpr()) = calleeSaveBuffer[uintptrOffset];
+ 138         else {
+ 139 #if USE(JSVALUE64)
+ 140             context.fpr(entry.reg().fpr()) = bitwise_cast&lt;double&gt;(calleeSaveBuffer[uintptrOffset]);
+ 141 #else
+ 142             // FIXME: &lt;https://webkit.org/b/193275&gt; support callee-saved floating point registers on 32-bit architectures
+ 143             RELEASE_ASSERT_NOT_REACHED();
+ 144 #endif
+ 145         }
+ 146     }
+ 147 }
+ 148 
+ 149 // Based on AssemblyHelpers::copyCalleeSavesToVMEntryFrameCalleeSavesBuffer().
+ 150 static void copyCalleeSavesToVMEntryFrameCalleeSavesBuffer(Context&amp; context)
+ 151 {
+ 152     VM&amp; vm = *context.arg&lt;VM*&gt;();
+ 153     auto&amp; stack = context.stack();
+ 154 
+ 155     VMEntryRecord* entryRecord = vmEntryRecord(vm.topEntryFrame);
+ 156     void* calleeSaveBuffer = entryRecord-&gt;calleeSaveRegistersBuffer;
+ 157 
+ 158     RegisterAtOffsetList* allCalleeSaves = RegisterSet::vmCalleeSaveRegisterOffsets();
+ 159     RegisterSet dontCopyRegisters = RegisterSet::stackRegisters();
+ 160     unsigned registerCount = allCalleeSaves-&gt;size();
+ 161 
+ 162     for (unsigned i = 0; i &lt; registerCount; i++) {
+ 163         RegisterAtOffset entry = allCalleeSaves-&gt;at(i);
+ 164         if (dontCopyRegisters.get(entry.reg()))
+ 165             continue;
+ 166         if (entry.reg().isGPR())
+ 167             stack.set(calleeSaveBuffer, entry.offset(), context.gpr&lt;UCPURegister&gt;(entry.reg().gpr()));
+ 168         else {
+ 169 #if USE(JSVALUE64)
+ 170             stack.set(calleeSaveBuffer, entry.offset(), context.fpr&lt;UCPURegister&gt;(entry.reg().fpr()));
+ 171 #else
+ 172             // FIXME: &lt;https://webkit.org/b/193275&gt; support callee-saved floating point registers on 32-bit architectures
+ 173             RELEASE_ASSERT_NOT_REACHED();
+ 174 #endif
+ 175         }
+ 176     }
+ 177 }
+ 178 
+ 179 // Based on AssemblyHelpers::emitSaveOrCopyCalleeSavesFor().
+ 180 static void saveOrCopyCalleeSavesFor(Context&amp; context, CodeBlock* codeBlock, VirtualRegister offsetVirtualRegister, bool wasCalledViaTailCall)
+ 181 {
+ 182     Frame frame(context.fp(), context.stack());
+ 183     ASSERT(codeBlock);
+ 184 
+ 185     const RegisterAtOffsetList* calleeSaves = codeBlock-&gt;calleeSaveRegisters();
+ 186     RegisterSet dontSaveRegisters = RegisterSet(RegisterSet::stackRegisters(), RegisterSet::allFPRs());
+ 187     unsigned registerCount = calleeSaves-&gt;size();
+ 188 
+ 189     RegisterSet baselineCalleeSaves = RegisterSet::llintBaselineCalleeSaveRegisters();
+ 190 
+ 191     for (unsigned i = 0; i &lt; registerCount; i++) {
+ 192         RegisterAtOffset entry = calleeSaves-&gt;at(i);
+ 193         if (dontSaveRegisters.get(entry.reg()))
+ 194             continue;
+ 195 
+ 196         uintptr_t savedRegisterValue;
+ 197 
+ 198         if (wasCalledViaTailCall &amp;&amp; baselineCalleeSaves.get(entry.reg()))
+ 199             savedRegisterValue = frame.get&lt;uintptr_t&gt;(entry.offset());
+ 200         else
+ 201             savedRegisterValue = context.gpr(entry.reg().gpr());
+ 202 
+ 203         frame.set(offsetVirtualRegister.offsetInBytes() + entry.offset(), savedRegisterValue);
+ 204     }
+ 205 }
+ 206 #else // not NUMBER_OF_CALLEE_SAVES_REGISTERS &gt; 0
+ 207 
+ 208 static void restoreCalleeSavesFor(Context&amp;, CodeBlock*) { }
+ 209 static void saveCalleeSavesFor(Context&amp;, CodeBlock*) { }
+ 210 static void restoreCalleeSavesFromVMEntryFrameCalleeSavesBuffer(Context&amp;) { }
+ 211 static void copyCalleeSavesToVMEntryFrameCalleeSavesBuffer(Context&amp;) { }
+ 212 static void saveOrCopyCalleeSavesFor(Context&amp;, CodeBlock*, VirtualRegister, bool) { }
+ 213 
+ 214 #endif // NUMBER_OF_CALLEE_SAVES_REGISTERS &gt; 0
+ 215 
+ 216 static JSCell* createDirectArgumentsDuringExit(Context&amp; context, CodeBlock* codeBlock, InlineCallFrame* inlineCallFrame, JSFunction* callee, int32_t argumentCount)
+ 217 {
+ 218     VM&amp; vm = *context.arg&lt;VM*&gt;();
+ 219 
+ 220     ASSERT(vm.heap.isDeferred());
+ 221 
+ 222     if (inlineCallFrame)
+ 223         codeBlock = baselineCodeBlockForInlineCallFrame(inlineCallFrame);
+ 224 
+ 225     unsigned length = argumentCount - 1;
+ 226     unsigned capacity = std::max(length, static_cast&lt;unsigned&gt;(codeBlock-&gt;numParameters() - 1));
+ 227     DirectArguments* result = DirectArguments::create(
+ 228         vm, codeBlock-&gt;globalObject()-&gt;directArgumentsStructure(), length, capacity);
+ 229 
+ 230     result-&gt;setCallee(vm, callee);
+ 231 
+ 232     void* frameBase = context.fp&lt;Register*&gt;() + (inlineCallFrame ? inlineCallFrame-&gt;stackOffset : 0);
+ 233     Frame frame(frameBase, context.stack());
+ 234     for (unsigned i = length; i--;)
+ 235         result-&gt;setIndexQuickly(vm, i, frame.argument(i));
+ 236 
+ 237     return result;
+ 238 }
+ 239 
+ 240 static JSCell* createClonedArgumentsDuringExit(Context&amp; context, CodeBlock* codeBlock, InlineCallFrame* inlineCallFrame, JSFunction* callee, int32_t argumentCount)
+ 241 {
+ 242     VM&amp; vm = *context.arg&lt;VM*&gt;();
+ 243     ExecState* exec = context.fp&lt;ExecState*&gt;();
+ 244 
+ 245     ASSERT(vm.heap.isDeferred());
+ 246 
+ 247     if (inlineCallFrame)
+ 248         codeBlock = baselineCodeBlockForInlineCallFrame(inlineCallFrame);
+ 249 
+ 250     unsigned length = argumentCount - 1;
+ 251     ClonedArguments* result = ClonedArguments::createEmpty(
+ 252         vm, codeBlock-&gt;globalObject()-&gt;clonedArgumentsStructure(), callee, length);
+ 253 
+ 254     void* frameBase = context.fp&lt;Register*&gt;() + (inlineCallFrame ? inlineCallFrame-&gt;stackOffset : 0);
+ 255     Frame frame(frameBase, context.stack());
+ 256     for (unsigned i = length; i--;)
+ 257         result-&gt;putDirectIndex(exec, i, frame.argument(i));
+ 258     return result;
+ 259 }
+ 260 
+ 261 static void emitRestoreArguments(Context&amp; context, CodeBlock* codeBlock, DFG::JITCode* dfgJITCode, const Operands&lt;ValueRecovery&gt;&amp; operands)
+ 262 {
+ 263     Frame frame(context.fp(), context.stack());
+ 264 
+ 265     HashMap&lt;MinifiedID, int&gt; alreadyAllocatedArguments; // Maps phantom arguments node ID to operand.
+ 266     for (size_t index = 0; index &lt; operands.size(); ++index) {
+ 267         const ValueRecovery&amp; recovery = operands[index];
+ 268         int operand = operands.operandForIndex(index);
+ 269 
+ 270         if (recovery.technique() != DirectArgumentsThatWereNotCreated
+ 271             &amp;&amp; recovery.technique() != ClonedArgumentsThatWereNotCreated)
+ 272             continue;
+ 273 
+ 274         MinifiedID id = recovery.nodeID();
+ 275         auto iter = alreadyAllocatedArguments.find(id);
+ 276         if (iter != alreadyAllocatedArguments.end()) {
+ 277             frame.setOperand(operand, frame.operand(iter-&gt;value));
+ 278             continue;
+ 279         }
+ 280 
+ 281         InlineCallFrame* inlineCallFrame =
+ 282             dfgJITCode-&gt;minifiedDFG.at(id)-&gt;inlineCallFrame();
+ 283 
+ 284         int stackOffset;
+ 285         if (inlineCallFrame)
+ 286             stackOffset = inlineCallFrame-&gt;stackOffset;
+ 287         else
+ 288             stackOffset = 0;
+ 289 
+ 290         JSFunction* callee;
+ 291         if (!inlineCallFrame || inlineCallFrame-&gt;isClosureCall)
+ 292             callee = jsCast&lt;JSFunction*&gt;(frame.operand(stackOffset + CallFrameSlot::callee).asCell());
+ 293         else
+ 294             callee = jsCast&lt;JSFunction*&gt;(inlineCallFrame-&gt;calleeRecovery.constant().asCell());
+ 295 
+ 296         int32_t argumentCount;
+ 297         if (!inlineCallFrame || inlineCallFrame-&gt;isVarargs())
+ 298             argumentCount = frame.operand&lt;int32_t&gt;(stackOffset + CallFrameSlot::argumentCount, PayloadOffset);
+ 299         else
+ 300             argumentCount = inlineCallFrame-&gt;argumentCountIncludingThis;
+ 301 
+ 302         JSCell* argumentsObject;
+ 303         switch (recovery.technique()) {
+ 304         case DirectArgumentsThatWereNotCreated:
+ 305             argumentsObject = createDirectArgumentsDuringExit(context, codeBlock, inlineCallFrame, callee, argumentCount);
+ 306             break;
+ 307         case ClonedArgumentsThatWereNotCreated:
+ 308             argumentsObject = createClonedArgumentsDuringExit(context, codeBlock, inlineCallFrame, callee, argumentCount);
+ 309             break;
+ 310         default:
+ 311             RELEASE_ASSERT_NOT_REACHED();
+ 312             break;
+ 313         }
+ 314         frame.setOperand(operand, JSValue(argumentsObject));
+ 315 
+ 316         alreadyAllocatedArguments.add(id, operand);
+ 317     }
+ 318 }
+ 319 
+ 320 // The following is a list of extra initializations that need to be done in order
+ 321 // of most likely needed (lower enum value) to least likely needed (higher enum value).
+ 322 // Each level initialization includes the previous lower enum value (see use of the
+ 323 // extraInitializationLevel value below).
+ 324 enum class ExtraInitializationLevel {
+ 325     None,
+ 326     SpeculationRecovery,
+ 327     ValueProfileUpdate,
+ 328     ArrayProfileUpdate,
+ 329     Other
+ 330 };
+ 331 
+ 332 void OSRExit::executeOSRExit(Context&amp; context)
+ 333 {
+ 334     VM&amp; vm = *context.arg&lt;VM*&gt;();
+ 335     auto scope = DECLARE_THROW_SCOPE(vm);
+ 336 
+ 337     ExecState* exec = context.fp&lt;ExecState*&gt;();
+ 338     ASSERT(&amp;exec-&gt;vm() == &amp;vm);
+ 339     auto&amp; cpu = context.cpu;
+ 340 
+ 341     if (validateDFGDoesGC) {
+ 342         // We&#39;re about to exit optimized code. So, there&#39;s no longer any optimized
+ 343         // code running that expects no GC.
+ 344         vm.heap.setExpectDoesGC(true);
+ 345     }
+ 346 
+ 347     if (vm.callFrameForCatch) {
+ 348         exec = vm.callFrameForCatch;
+ 349         context.fp() = exec;
+ 350     }
+ 351 
+ 352     CodeBlock* codeBlock = exec-&gt;codeBlock();
+ 353     ASSERT(codeBlock);
+ 354     ASSERT(codeBlock-&gt;jitType() == JITType::DFGJIT);
+ 355 
+ 356     // It&#39;s sort of preferable that we don&#39;t GC while in here. Anyways, doing so wouldn&#39;t
+ 357     // really be profitable.
+ 358     DeferGCForAWhile deferGC(vm.heap);
+ 359 
+ 360     uint32_t exitIndex = vm.osrExitIndex;
+ 361     DFG::JITCode* dfgJITCode = codeBlock-&gt;jitCode()-&gt;dfg();
+ 362     OSRExit&amp; exit = dfgJITCode-&gt;osrExit[exitIndex];
+ 363 
+ 364     ASSERT(!vm.callFrameForCatch || exit.m_kind == GenericUnwind);
+ 365     EXCEPTION_ASSERT_UNUSED(scope, !!scope.exception() || !exit.isExceptionHandler());
+ 366 
+ 367     if (UNLIKELY(!exit.exitState)) {
+ 368         ExtraInitializationLevel extraInitializationLevel = ExtraInitializationLevel::None;
+ 369 
+ 370         // We only need to execute this block once for each OSRExit record. The computed
+ 371         // results will be cached in the OSRExitState record for use of the rest of the
+ 372         // exit ramp code.
+ 373 
+ 374         // Ensure we have baseline codeBlocks to OSR exit to.
+ 375         prepareCodeOriginForOSRExit(exec, exit.m_codeOrigin);
+ 376 
+ 377         CodeBlock* baselineCodeBlock = codeBlock-&gt;baselineAlternative();
+ 378         ASSERT(baselineCodeBlock-&gt;jitType() == JITType::BaselineJIT);
+ 379 
+ 380         SpeculationRecovery* recovery = nullptr;
+ 381         if (exit.m_recoveryIndex != UINT_MAX) {
+ 382             recovery = &amp;dfgJITCode-&gt;speculationRecovery[exit.m_recoveryIndex];
+ 383             extraInitializationLevel = std::max(extraInitializationLevel, ExtraInitializationLevel::SpeculationRecovery);
+ 384         }
+ 385 
+ 386         if (UNLIKELY(exit.m_kind == GenericUnwind))
+ 387             extraInitializationLevel = std::max(extraInitializationLevel, ExtraInitializationLevel::Other);
+ 388 
+ 389         ArrayProfile* arrayProfile = nullptr;
+ 390         if (!!exit.m_jsValueSource) {
+ 391             if (exit.m_valueProfile)
+ 392                 extraInitializationLevel = std::max(extraInitializationLevel, ExtraInitializationLevel::ValueProfileUpdate);
+ 393             if (exit.m_kind == BadCache || exit.m_kind == BadIndexingType) {
+ 394                 CodeOrigin codeOrigin = exit.m_codeOriginForExitProfile;
+ 395                 CodeBlock* profiledCodeBlock = baselineCodeBlockForOriginAndBaselineCodeBlock(codeOrigin, baselineCodeBlock);
+ 396                 arrayProfile = profiledCodeBlock-&gt;getArrayProfile(codeOrigin.bytecodeIndex());
+ 397                 if (arrayProfile)
+ 398                     extraInitializationLevel = std::max(extraInitializationLevel, ExtraInitializationLevel::ArrayProfileUpdate);
+ 399             }
+ 400         }
+ 401 
+ 402         int32_t activeThreshold = baselineCodeBlock-&gt;adjustedCounterValue(Options::thresholdForOptimizeAfterLongWarmUp());
+ 403         double adjustedThreshold = applyMemoryUsageHeuristicsAndConvertToInt(activeThreshold, baselineCodeBlock);
+ 404         ASSERT(adjustedThreshold &gt; 0);
+ 405         adjustedThreshold = BaselineExecutionCounter::clippedThreshold(codeBlock-&gt;globalObject(), adjustedThreshold);
+ 406 
+ 407         CodeBlock* codeBlockForExit = baselineCodeBlockForOriginAndBaselineCodeBlock(exit.m_codeOrigin, baselineCodeBlock);
+ 408         const JITCodeMap&amp; codeMap = codeBlockForExit-&gt;jitCodeMap();
+ 409         CodeLocationLabel&lt;JSEntryPtrTag&gt; codeLocation = codeMap.find(exit.m_codeOrigin.bytecodeIndex());
+ 410         ASSERT(codeLocation);
+ 411 
+ 412         void* jumpTarget = codeLocation.executableAddress();
+ 413 
+ 414         // Compute the value recoveries.
+ 415         Operands&lt;ValueRecovery&gt; operands;
+ 416         Vector&lt;UndefinedOperandSpan&gt; undefinedOperandSpans;
+ 417         dfgJITCode-&gt;variableEventStream.reconstruct(codeBlock, exit.m_codeOrigin, dfgJITCode-&gt;minifiedDFG, exit.m_streamIndex, operands, &amp;undefinedOperandSpans);
+ 418         ptrdiff_t stackPointerOffset = -static_cast&lt;ptrdiff_t&gt;(codeBlock-&gt;jitCode()-&gt;dfgCommon()-&gt;requiredRegisterCountForExit) * sizeof(Register);
+ 419 
+ 420         exit.exitState = adoptRef(new OSRExitState(exit, codeBlock, baselineCodeBlock, operands, WTFMove(undefinedOperandSpans), recovery, stackPointerOffset, activeThreshold, adjustedThreshold, jumpTarget, arrayProfile));
+ 421 
+ 422         if (UNLIKELY(vm.m_perBytecodeProfiler &amp;&amp; codeBlock-&gt;jitCode()-&gt;dfgCommon()-&gt;compilation)) {
+ 423             Profiler::Database&amp; database = *vm.m_perBytecodeProfiler;
+ 424             Profiler::Compilation* compilation = codeBlock-&gt;jitCode()-&gt;dfgCommon()-&gt;compilation.get();
+ 425 
+ 426             Profiler::OSRExit* profilerExit = compilation-&gt;addOSRExit(
+ 427                 exitIndex, Profiler::OriginStack(database, codeBlock, exit.m_codeOrigin),
+ 428                 exit.m_kind, exit.m_kind == UncountableInvalidation);
+ 429             exit.exitState-&gt;profilerExit = profilerExit;
+ 430             extraInitializationLevel = std::max(extraInitializationLevel, ExtraInitializationLevel::Other);
+ 431         }
+ 432 
+ 433         if (UNLIKELY(Options::printEachOSRExit()))
+ 434             extraInitializationLevel = std::max(extraInitializationLevel, ExtraInitializationLevel::Other);
+ 435 
+ 436         exit.exitState-&gt;extraInitializationLevel = extraInitializationLevel;
+ 437 
+ 438         if (UNLIKELY(Options::verboseOSR() || Options::verboseDFGOSRExit())) {
+ 439             dataLogF(&quot;DFG OSR exit #%u (%s, %s) from %s, with operands = %s\n&quot;,
+ 440                 exitIndex, toCString(exit.m_codeOrigin).data(),
+ 441                 exitKindToString(exit.m_kind), toCString(*codeBlock).data(),
+ 442                 toCString(ignoringContext&lt;DumpContext&gt;(operands)).data());
+ 443         }
+ 444     }
+ 445 
+ 446     OSRExitState&amp; exitState = *exit.exitState.get();
+ 447     CodeBlock* baselineCodeBlock = exitState.baselineCodeBlock;
+ 448     ASSERT(baselineCodeBlock-&gt;jitType() == JITType::BaselineJIT);
+ 449 
+ 450     Operands&lt;ValueRecovery&gt;&amp; operands = exitState.operands;
+ 451     Vector&lt;UndefinedOperandSpan&gt;&amp; undefinedOperandSpans = exitState.undefinedOperandSpans;
+ 452 
+ 453     context.sp() = context.fp&lt;uint8_t*&gt;() + exitState.stackPointerOffset;
+ 454 
+ 455     // The only reason for using this do while loop is so we can break out midway when appropriate.
+ 456     do {
+ 457         auto extraInitializationLevel = static_cast&lt;ExtraInitializationLevel&gt;(exitState.extraInitializationLevel);
+ 458 
+ 459         if (extraInitializationLevel == ExtraInitializationLevel::None)
+ 460             break;
+ 461 
+ 462         // Begin extra initilization level: SpeculationRecovery
+ 463 
+ 464         // We need to do speculation recovery first because array profiling and value profiling
+ 465         // may rely on a value that it recovers. However, that doesn&#39;t mean that it is likely
+ 466         // to have a recovery value. So, we&#39;ll decorate it as UNLIKELY.
+ 467         SpeculationRecovery* recovery = exitState.recovery;
+ 468         if (UNLIKELY(recovery)) {
+ 469             switch (recovery-&gt;type()) {
+ 470             case SpeculativeAdd:
+ 471                 cpu.gpr(recovery-&gt;dest()) = cpu.gpr&lt;uint32_t&gt;(recovery-&gt;dest()) - cpu.gpr&lt;uint32_t&gt;(recovery-&gt;src());
+ 472 #if USE(JSVALUE64)
+ 473                 ASSERT(!(cpu.gpr(recovery-&gt;dest()) &gt;&gt; 32));
+ 474                 cpu.gpr(recovery-&gt;dest()) |= TagTypeNumber;
+ 475 #endif
+ 476                 break;
+ 477 
+ 478             case SpeculativeAddSelf:
+ 479                 cpu.gpr(recovery-&gt;dest()) = static_cast&lt;uint32_t&gt;(cpu.gpr&lt;int32_t&gt;(recovery-&gt;dest()) &gt;&gt; 1) ^ 0x80000000U;
+ 480 #if USE(JSVALUE64)
+ 481                 ASSERT(!(cpu.gpr(recovery-&gt;dest()) &gt;&gt; 32));
+ 482                 cpu.gpr(recovery-&gt;dest()) |= TagTypeNumber;
+ 483 #endif
+ 484                 break;
+ 485 
+ 486             case SpeculativeAddImmediate:
+ 487                 cpu.gpr(recovery-&gt;dest()) = (cpu.gpr&lt;uint32_t&gt;(recovery-&gt;dest()) - recovery-&gt;immediate());
+ 488 #if USE(JSVALUE64)
+ 489                 ASSERT(!(cpu.gpr(recovery-&gt;dest()) &gt;&gt; 32));
+ 490                 cpu.gpr(recovery-&gt;dest()) |= TagTypeNumber;
+ 491 #endif
+ 492                 break;
+ 493 
+ 494             case BooleanSpeculationCheck:
+ 495 #if USE(JSVALUE64)
+ 496                 cpu.gpr(recovery-&gt;dest()) = cpu.gpr(recovery-&gt;dest()) ^ ValueFalse;
+ 497 #endif
+ 498                 break;
+ 499 
+ 500             default:
+ 501                 break;
+ 502             }
+ 503         }
+ 504         if (extraInitializationLevel &lt;= ExtraInitializationLevel::SpeculationRecovery)
+ 505             break;
+ 506 
+ 507         // Begin extra initilization level: ValueProfileUpdate
+ 508         JSValue profiledValue;
+ 509         if (!!exit.m_jsValueSource) {
+ 510             profiledValue = jsValueFor(cpu, exit.m_jsValueSource);
+ 511             if (MethodOfGettingAValueProfile profile = exit.m_valueProfile)
+ 512                 profile.reportValue(profiledValue);
+ 513         }
+ 514         if (extraInitializationLevel &lt;= ExtraInitializationLevel::ValueProfileUpdate)
+ 515             break;
+ 516 
+ 517         // Begin extra initilization level: ArrayProfileUpdate
+ 518         ArrayProfile* arrayProfile = exitState.arrayProfile;
+ 519         if (arrayProfile) {
+ 520             ASSERT(!!exit.m_jsValueSource);
+ 521             ASSERT(exit.m_kind == BadCache || exit.m_kind == BadIndexingType);
+ 522             Structure* structure = profiledValue.asCell()-&gt;structure(vm);
+ 523             arrayProfile-&gt;observeStructure(structure);
+ 524             arrayProfile-&gt;observeArrayMode(arrayModesFromStructure(structure));
+ 525         }
+ 526         if (extraInitializationLevel &lt;= ExtraInitializationLevel::ArrayProfileUpdate)
+ 527             break;
+ 528 
+ 529         // Begin Extra initilization level: Other
+ 530         if (UNLIKELY(exit.m_kind == GenericUnwind)) {
+ 531             // We are acting as a defacto op_catch because we arrive here from genericUnwind().
+ 532             // So, we must restore our call frame and stack pointer.
+ 533             restoreCalleeSavesFromVMEntryFrameCalleeSavesBuffer(context);
+ 534             ASSERT(context.fp() == vm.callFrameForCatch);
+ 535         }
+ 536 
+ 537         if (exitState.profilerExit)
+ 538             exitState.profilerExit-&gt;incCount();
+ 539 
+ 540         if (UNLIKELY(Options::printEachOSRExit()))
+ 541             printOSRExit(context, vm.osrExitIndex, exit);
+ 542 
+ 543     } while (false); // End extra initialization.
+ 544 
+ 545     Frame frame(cpu.fp(), context.stack());
+ 546     ASSERT(!(context.fp&lt;uintptr_t&gt;() &amp; 0x7));
+ 547 
+ 548 #if USE(JSVALUE64)
+ 549     ASSERT(cpu.gpr(GPRInfo::tagTypeNumberRegister) == TagTypeNumber);
+ 550     ASSERT(cpu.gpr(GPRInfo::tagMaskRegister) == TagMask);
+ 551 #endif
+ 552 
+ 553     // Do all data format conversions and store the results into the stack.
+ 554     // Note: we need to recover values before restoring callee save registers below
+ 555     // because the recovery may rely on values in some of callee save registers.
+ 556 
+ 557     int calleeSaveSpaceAsVirtualRegisters = static_cast&lt;int&gt;(baselineCodeBlock-&gt;calleeSaveSpaceAsVirtualRegisters());
+ 558     size_t numberOfOperands = operands.size();
+ 559     size_t numUndefinedOperandSpans = undefinedOperandSpans.size();
+ 560 
+ 561     size_t nextUndefinedSpanIndex = 0;
+ 562     size_t nextUndefinedOperandIndex = numberOfOperands;
+ 563     if (numUndefinedOperandSpans)
+ 564         nextUndefinedOperandIndex = undefinedOperandSpans[nextUndefinedSpanIndex].firstIndex;
+ 565 
+ 566     JSValue undefined = jsUndefined();
+ 567     for (size_t spanIndex = 0; spanIndex &lt; numUndefinedOperandSpans; ++spanIndex) {
+ 568         auto&amp; span = undefinedOperandSpans[spanIndex];
+ 569         int firstOffset = span.minOffset;
+ 570         int lastOffset = firstOffset + span.numberOfRegisters;
+ 571 
+ 572         for (int offset = firstOffset; offset &lt; lastOffset; ++offset)
+ 573             frame.setOperand(offset, undefined);
+ 574     }
+ 575 
+ 576     for (size_t index = 0; index &lt; numberOfOperands; ++index) {
+ 577         const ValueRecovery&amp; recovery = operands[index];
+ 578         VirtualRegister reg = operands.virtualRegisterForIndex(index);
+ 579 
+ 580         if (UNLIKELY(index == nextUndefinedOperandIndex)) {
+ 581             index += undefinedOperandSpans[nextUndefinedSpanIndex++].numberOfRegisters - 1;
+ 582             if (nextUndefinedSpanIndex &lt; numUndefinedOperandSpans)
+ 583                 nextUndefinedOperandIndex = undefinedOperandSpans[nextUndefinedSpanIndex].firstIndex;
+ 584             else
+ 585                 nextUndefinedOperandIndex = numberOfOperands;
+ 586             continue;
+ 587         }
+ 588 
+ 589         if (reg.isLocal() &amp;&amp; reg.toLocal() &lt; calleeSaveSpaceAsVirtualRegisters)
+ 590             continue;
+ 591 
+ 592         int operand = reg.offset();
+ 593 
+ 594         switch (recovery.technique()) {
+ 595         case DisplacedInJSStack:
+ 596             frame.setOperand(operand, exec-&gt;r(recovery.virtualRegister()).asanUnsafeJSValue());
+ 597             break;
+ 598 
+ 599         case InFPR:
+ 600             frame.setOperand(operand, cpu.fpr&lt;JSValue&gt;(recovery.fpr()));
+ 601             break;
+ 602 
+ 603 #if USE(JSVALUE64)
+ 604         case InGPR:
+ 605             frame.setOperand(operand, cpu.gpr&lt;JSValue&gt;(recovery.gpr()));
+ 606             break;
+ 607 #else
+ 608         case InPair:
+ 609             frame.setOperand(operand, JSValue(cpu.gpr&lt;int32_t&gt;(recovery.tagGPR()), cpu.gpr&lt;int32_t&gt;(recovery.payloadGPR())));
+ 610             break;
+ 611 #endif
+ 612 
+ 613         case UnboxedCellInGPR:
+ 614             frame.setOperand(operand, JSValue(cpu.gpr&lt;JSCell*&gt;(recovery.gpr())));
+ 615             break;
+ 616 
+ 617         case CellDisplacedInJSStack:
+ 618             frame.setOperand(operand, JSValue(exec-&gt;r(recovery.virtualRegister()).asanUnsafeUnboxedCell()));
+ 619             break;
+ 620 
+ 621 #if USE(JSVALUE32_64)
+ 622         case UnboxedBooleanInGPR:
+ 623             frame.setOperand(operand, jsBoolean(cpu.gpr&lt;bool&gt;(recovery.gpr())));
+ 624             break;
+ 625 #endif
+ 626 
+ 627         case BooleanDisplacedInJSStack:
+ 628 #if USE(JSVALUE64)
+ 629             frame.setOperand(operand, exec-&gt;r(recovery.virtualRegister()).asanUnsafeJSValue());
+ 630 #else
+ 631             frame.setOperand(operand, jsBoolean(exec-&gt;r(recovery.virtualRegister()).asanUnsafeJSValue().payload()));
+ 632 #endif
+ 633             break;
+ 634 
+ 635         case UnboxedInt32InGPR:
+ 636             frame.setOperand(operand, JSValue(cpu.gpr&lt;int32_t&gt;(recovery.gpr())));
+ 637             break;
+ 638 
+ 639         case Int32DisplacedInJSStack:
+ 640             frame.setOperand(operand, JSValue(exec-&gt;r(recovery.virtualRegister()).asanUnsafeUnboxedInt32()));
+ 641             break;
+ 642 
+ 643 #if USE(JSVALUE64)
+ 644         case UnboxedInt52InGPR:
+ 645             frame.setOperand(operand, JSValue(cpu.gpr&lt;int64_t&gt;(recovery.gpr()) &gt;&gt; JSValue::int52ShiftAmount));
+ 646             break;
+ 647 
+ 648         case Int52DisplacedInJSStack:
+ 649             frame.setOperand(operand, JSValue(exec-&gt;r(recovery.virtualRegister()).asanUnsafeUnboxedInt52()));
+ 650             break;
+ 651 
+ 652         case UnboxedStrictInt52InGPR:
+ 653             frame.setOperand(operand, JSValue(cpu.gpr&lt;int64_t&gt;(recovery.gpr())));
+ 654             break;
+ 655 
+ 656         case StrictInt52DisplacedInJSStack:
+ 657             frame.setOperand(operand, JSValue(exec-&gt;r(recovery.virtualRegister()).asanUnsafeUnboxedStrictInt52()));
+ 658             break;
+ 659 #endif
+ 660 
+ 661         case UnboxedDoubleInFPR:
+ 662             frame.setOperand(operand, JSValue(JSValue::EncodeAsDouble, purifyNaN(cpu.fpr(recovery.fpr()))));
+ 663             break;
+ 664 
+ 665         case DoubleDisplacedInJSStack:
+ 666             frame.setOperand(operand, JSValue(JSValue::EncodeAsDouble, purifyNaN(exec-&gt;r(recovery.virtualRegister()).asanUnsafeUnboxedDouble())));
+ 667             break;
+ 668 
+ 669         case Constant:
+ 670             frame.setOperand(operand, recovery.constant());
+ 671             break;
+ 672 
+ 673         case DirectArgumentsThatWereNotCreated:
+ 674         case ClonedArgumentsThatWereNotCreated:
+ 675             // Don&#39;t do this, yet.
+ 676             break;
+ 677 
+ 678         default:
+ 679             RELEASE_ASSERT_NOT_REACHED();
+ 680             break;
+ 681         }
+ 682     }
+ 683 
+ 684     // Restore the DFG callee saves and then save the ones the baseline JIT uses.
+ 685     restoreCalleeSavesFor(context, codeBlock);
+ 686     saveCalleeSavesFor(context, baselineCodeBlock);
+ 687 
+ 688 #if USE(JSVALUE64)
+ 689     cpu.gpr(GPRInfo::tagTypeNumberRegister) = static_cast&lt;uintptr_t&gt;(TagTypeNumber);
+ 690     cpu.gpr(GPRInfo::tagMaskRegister) = static_cast&lt;uintptr_t&gt;(TagTypeNumber | TagBitTypeOther);
+ 691 #endif
+ 692 
+ 693     if (exit.isExceptionHandler())
+ 694         copyCalleeSavesToVMEntryFrameCalleeSavesBuffer(context);
+ 695 
+ 696     // Now that things on the stack are recovered, do the arguments recovery. We assume that arguments
+ 697     // recoveries don&#39;t recursively refer to each other. But, we don&#39;t try to assume that they only
+ 698     // refer to certain ranges of locals. Hence why we need to do this here, once the stack is sensible.
+ 699     // Note that we also roughly assume that the arguments might still be materialized outside of its
+ 700     // inline call frame scope - but for now the DFG wouldn&#39;t do that.
+ 701 
+ 702     DFG::emitRestoreArguments(context, codeBlock, dfgJITCode, operands);
+ 703 
+ 704     // Adjust the old JIT&#39;s execute counter. Since we are exiting OSR, we know
+ 705     // that all new calls into this code will go to the new JIT, so the execute
+ 706     // counter only affects call frames that performed OSR exit and call frames
+ 707     // that were still executing the old JIT at the time of another call frame&#39;s
+ 708     // OSR exit. We want to ensure that the following is true:
+ 709     //
+ 710     // (a) Code the performs an OSR exit gets a chance to reenter optimized
+ 711     //     code eventually, since optimized code is faster. But we don&#39;t
+ 712     //     want to do such reentery too aggressively (see (c) below).
+ 713     //
+ 714     // (b) If there is code on the call stack that is still running the old
+ 715     //     JIT&#39;s code and has never OSR&#39;d, then it should get a chance to
+ 716     //     perform OSR entry despite the fact that we&#39;ve exited.
+ 717     //
+ 718     // (c) Code the performs an OSR exit should not immediately retry OSR
+ 719     //     entry, since both forms of OSR are expensive. OSR entry is
+ 720     //     particularly expensive.
+ 721     //
+ 722     // (d) Frequent OSR failures, even those that do not result in the code
+ 723     //     running in a hot loop, result in recompilation getting triggered.
+ 724     //
+ 725     // To ensure (c), we&#39;d like to set the execute counter to
+ 726     // counterValueForOptimizeAfterWarmUp(). This seems like it would endanger
+ 727     // (a) and (b), since then every OSR exit would delay the opportunity for
+ 728     // every call frame to perform OSR entry. Essentially, if OSR exit happens
+ 729     // frequently and the function has few loops, then the counter will never
+ 730     // become non-negative and OSR entry will never be triggered. OSR entry
+ 731     // will only happen if a loop gets hot in the old JIT, which does a pretty
+ 732     // good job of ensuring (a) and (b). But that doesn&#39;t take care of (d),
+ 733     // since each speculation failure would reset the execute counter.
+ 734     // So we check here if the number of speculation failures is significantly
+ 735     // larger than the number of successes (we want 90% success rate), and if
+ 736     // there have been a large enough number of failures. If so, we set the
+ 737     // counter to 0; otherwise we set the counter to
+ 738     // counterValueForOptimizeAfterWarmUp().
+ 739 
+ 740     if (UNLIKELY(codeBlock-&gt;updateOSRExitCounterAndCheckIfNeedToReoptimize(exitState) == CodeBlock::OptimizeAction::ReoptimizeNow))
+ 741         triggerReoptimizationNow(baselineCodeBlock, codeBlock, &amp;exit);
+ 742 
+ 743     reifyInlinedCallFrames(context, baselineCodeBlock, exit);
+ 744     adjustAndJumpToTarget(context, vm, codeBlock, baselineCodeBlock, exit);
+ 745 }
+ 746 
+ 747 static void reifyInlinedCallFrames(Context&amp; context, CodeBlock* outermostBaselineCodeBlock, const OSRExitBase&amp; exit)
+ 748 {
+ 749     auto&amp; cpu = context.cpu;
+ 750     Frame frame(cpu.fp(), context.stack());
+ 751 
+ 752     // FIXME: We shouldn&#39;t leave holes on the stack when performing an OSR exit
+ 753     // in presence of inlined tail calls.
+ 754     // https://bugs.webkit.org/show_bug.cgi?id=147511
+ 755     ASSERT(outermostBaselineCodeBlock-&gt;jitType() == JITType::BaselineJIT);
+ 756     frame.setOperand&lt;CodeBlock*&gt;(CallFrameSlot::codeBlock, outermostBaselineCodeBlock);
+ 757 
+ 758     const CodeOrigin* codeOrigin;
+ 759     for (codeOrigin = &amp;exit.m_codeOrigin; codeOrigin &amp;&amp; codeOrigin-&gt;inlineCallFrame(); codeOrigin = codeOrigin-&gt;inlineCallFrame()-&gt;getCallerSkippingTailCalls()) {
+ 760         InlineCallFrame* inlineCallFrame = codeOrigin-&gt;inlineCallFrame();
+ 761         CodeBlock* baselineCodeBlock = baselineCodeBlockForOriginAndBaselineCodeBlock(*codeOrigin, outermostBaselineCodeBlock);
+ 762         InlineCallFrame::Kind trueCallerCallKind;
+ 763         CodeOrigin* trueCaller = inlineCallFrame-&gt;getCallerSkippingTailCalls(&amp;trueCallerCallKind);
+ 764         void* callerFrame = cpu.fp();
+ 765 
+ 766         if (!trueCaller) {
+ 767             ASSERT(inlineCallFrame-&gt;isTail());
+ 768             void* returnPC = frame.get&lt;void*&gt;(CallFrame::returnPCOffset());
+ 769 #if CPU(ARM64E)
+ 770             void* oldEntrySP = cpu.fp&lt;uint8_t*&gt;() + sizeof(CallerFrameAndPC);
+ 771             void* newEntrySP = cpu.fp&lt;uint8_t*&gt;() + inlineCallFrame-&gt;returnPCOffset() + sizeof(void*);
+ 772             returnPC = retagCodePtr(returnPC, bitwise_cast&lt;PtrTag&gt;(oldEntrySP), bitwise_cast&lt;PtrTag&gt;(newEntrySP));
+ 773 #endif
+ 774             frame.set&lt;void*&gt;(inlineCallFrame-&gt;returnPCOffset(), returnPC);
+ 775             callerFrame = frame.get&lt;void*&gt;(CallFrame::callerFrameOffset());
+ 776         } else {
+ 777             CodeBlock* baselineCodeBlockForCaller = baselineCodeBlockForOriginAndBaselineCodeBlock(*trueCaller, outermostBaselineCodeBlock);
+ 778             unsigned callBytecodeIndex = trueCaller-&gt;bytecodeIndex();
+ 779             MacroAssemblerCodePtr&lt;JSInternalPtrTag&gt; jumpTarget;
+ 780 
+ 781             switch (trueCallerCallKind) {
+ 782             case InlineCallFrame::Call:
+ 783             case InlineCallFrame::Construct:
+ 784             case InlineCallFrame::CallVarargs:
+ 785             case InlineCallFrame::ConstructVarargs:
+ 786             case InlineCallFrame::TailCall:
+ 787             case InlineCallFrame::TailCallVarargs: {
+ 788                 CallLinkInfo* callLinkInfo =
+ 789                     baselineCodeBlockForCaller-&gt;getCallLinkInfoForBytecodeIndex(callBytecodeIndex);
+ 790                 RELEASE_ASSERT(callLinkInfo);
+ 791 
+ 792                 jumpTarget = callLinkInfo-&gt;callReturnLocation();
+ 793                 break;
+ 794             }
+ 795 
+ 796             case InlineCallFrame::GetterCall:
+ 797             case InlineCallFrame::SetterCall: {
+ 798                 StructureStubInfo* stubInfo =
+ 799                     baselineCodeBlockForCaller-&gt;findStubInfo(CodeOrigin(callBytecodeIndex));
+ 800                 RELEASE_ASSERT(stubInfo);
+ 801 
+ 802                 jumpTarget = stubInfo-&gt;doneLocation();
+ 803                 break;
+ 804             }
+ 805 
+ 806             default:
+ 807                 RELEASE_ASSERT_NOT_REACHED();
+ 808             }
+ 809 
+ 810             if (trueCaller-&gt;inlineCallFrame())
+ 811                 callerFrame = cpu.fp&lt;uint8_t*&gt;() + trueCaller-&gt;inlineCallFrame()-&gt;stackOffset * sizeof(EncodedJSValue);
+ 812 
+ 813             void* targetAddress = jumpTarget.executableAddress();
+ 814 #if CPU(ARM64E)
+ 815             void* newEntrySP = cpu.fp&lt;uint8_t*&gt;() + inlineCallFrame-&gt;returnPCOffset() + sizeof(void*);
+ 816             targetAddress = retagCodePtr(targetAddress, JSInternalPtrTag, bitwise_cast&lt;PtrTag&gt;(newEntrySP));
+ 817 #endif
+ 818             frame.set&lt;void*&gt;(inlineCallFrame-&gt;returnPCOffset(), targetAddress);
+ 819         }
+ 820 
+ 821         frame.setOperand&lt;void*&gt;(inlineCallFrame-&gt;stackOffset + CallFrameSlot::codeBlock, baselineCodeBlock);
+ 822 
+ 823         // Restore the inline call frame&#39;s callee save registers.
+ 824         // If this inlined frame is a tail call that will return back to the original caller, we need to
+ 825         // copy the prior contents of the tag registers already saved for the outer frame to this frame.
+ 826         saveOrCopyCalleeSavesFor(context, baselineCodeBlock, VirtualRegister(inlineCallFrame-&gt;stackOffset), !trueCaller);
+ 827 
+ 828         if (!inlineCallFrame-&gt;isVarargs())
+ 829             frame.setOperand&lt;uint32_t&gt;(inlineCallFrame-&gt;stackOffset + CallFrameSlot::argumentCount, PayloadOffset, inlineCallFrame-&gt;argumentCountIncludingThis);
+ 830         ASSERT(callerFrame);
+ 831         frame.set&lt;void*&gt;(inlineCallFrame-&gt;callerFrameOffset(), callerFrame);
+ 832 #if USE(JSVALUE64)
+ 833         uint32_t locationBits = CallSiteIndex(codeOrigin-&gt;bytecodeIndex()).bits();
+ 834         frame.setOperand&lt;uint32_t&gt;(inlineCallFrame-&gt;stackOffset + CallFrameSlot::argumentCount, TagOffset, locationBits);
+ 835         if (!inlineCallFrame-&gt;isClosureCall)
+ 836             frame.setOperand(inlineCallFrame-&gt;stackOffset + CallFrameSlot::callee, JSValue(inlineCallFrame-&gt;calleeConstant()));
+ 837 #else // USE(JSVALUE64) // so this is the 32-bit part
+ 838         const Instruction* instruction = baselineCodeBlock-&gt;instructions().at(codeOrigin-&gt;bytecodeIndex()).ptr();
+ 839         uint32_t locationBits = CallSiteIndex(instruction).bits();
+ 840         frame.setOperand&lt;uint32_t&gt;(inlineCallFrame-&gt;stackOffset + CallFrameSlot::argumentCount, TagOffset, locationBits);
+ 841         frame.setOperand&lt;uint32_t&gt;(inlineCallFrame-&gt;stackOffset + CallFrameSlot::callee, TagOffset, static_cast&lt;uint32_t&gt;(JSValue::CellTag));
+ 842         if (!inlineCallFrame-&gt;isClosureCall)
+ 843             frame.setOperand(inlineCallFrame-&gt;stackOffset + CallFrameSlot::callee, PayloadOffset, inlineCallFrame-&gt;calleeConstant());
+ 844 #endif // USE(JSVALUE64) // ending the #else part, so directly above is the 32-bit part
+ 845     }
+ 846 
+ 847     // Don&#39;t need to set the toplevel code origin if we only did inline tail calls
+ 848     if (codeOrigin) {
+ 849 #if USE(JSVALUE64)
+ 850         uint32_t locationBits = CallSiteIndex(codeOrigin-&gt;bytecodeIndex()).bits();
+ 851 #else
+ 852         const Instruction* instruction = outermostBaselineCodeBlock-&gt;instructions().at(codeOrigin-&gt;bytecodeIndex()).ptr();
+ 853         uint32_t locationBits = CallSiteIndex(instruction).bits();
+ 854 #endif
+ 855         frame.setOperand&lt;uint32_t&gt;(CallFrameSlot::argumentCount, TagOffset, locationBits);
+ 856     }
+ 857 }
+ 858 
+ 859 static void adjustAndJumpToTarget(Context&amp; context, VM&amp; vm, CodeBlock* codeBlock, CodeBlock* baselineCodeBlock, OSRExit&amp; exit)
+ 860 {
+ 861     OSRExitState* exitState = exit.exitState.get();
+ 862 
+ 863     WTF::storeLoadFence(); // The optimizing compiler expects that the OSR exit mechanism will execute this fence.
+ 864     vm.heap.writeBarrier(baselineCodeBlock);
+ 865 
+ 866     // We barrier all inlined frames -- and not just the current inline stack --
+ 867     // because we don&#39;t know which inlined function owns the value profile that
+ 868     // we&#39;ll update when we exit. In the case of &quot;f() { a(); b(); }&quot;, if both
+ 869     // a and b are inlined, we might exit inside b due to a bad value loaded
+ 870     // from a.
+ 871     // FIXME: MethodOfGettingAValueProfile should remember which CodeBlock owns
+ 872     // the value profile.
+ 873     InlineCallFrameSet* inlineCallFrames = codeBlock-&gt;jitCode()-&gt;dfgCommon()-&gt;inlineCallFrames.get();
+ 874     if (inlineCallFrames) {
+ 875         for (InlineCallFrame* inlineCallFrame : *inlineCallFrames)
+ 876             vm.heap.writeBarrier(inlineCallFrame-&gt;baselineCodeBlock.get());
+ 877     }
+ 878 
+ 879     auto* exitInlineCallFrame = exit.m_codeOrigin.inlineCallFrame();
+ 880     if (exitInlineCallFrame)
+ 881         context.fp() = context.fp&lt;uint8_t*&gt;() + exitInlineCallFrame-&gt;stackOffset * sizeof(EncodedJSValue);
+ 882 
+ 883     void* jumpTarget = exitState-&gt;jumpTarget;
+ 884     ASSERT(jumpTarget);
+ 885 
+ 886     if (exit.isExceptionHandler()) {
+ 887         // Since we&#39;re jumping to op_catch, we need to set callFrameForCatch.
+ 888         vm.callFrameForCatch = context.fp&lt;ExecState*&gt;();
+ 889     }
+ 890 
+ 891     vm.topCallFrame = context.fp&lt;ExecState*&gt;();
+ 892     context.pc() = untagCodePtr&lt;JSEntryPtrTag&gt;(jumpTarget);
+ 893 }
+ 894 
+ 895 static void printOSRExit(Context&amp; context, uint32_t osrExitIndex, const OSRExit&amp; exit)
+ 896 {
+ 897     ExecState* exec = context.fp&lt;ExecState*&gt;();
+ 898     CodeBlock* codeBlock = exec-&gt;codeBlock();
+ 899     CodeBlock* alternative = codeBlock-&gt;alternative();
+ 900     ExitKind kind = exit.m_kind;
+ 901     unsigned bytecodeOffset = exit.m_codeOrigin.bytecodeIndex();
+ 902 
+ 903     dataLog(&quot;Speculation failure in &quot;, *codeBlock);
+ 904     dataLog(&quot; @ exit #&quot;, osrExitIndex, &quot; (bc#&quot;, bytecodeOffset, &quot;, &quot;, exitKindToString(kind), &quot;) with &quot;);
+ 905     if (alternative) {
+ 906         dataLog(
+ 907             &quot;executeCounter = &quot;, alternative-&gt;jitExecuteCounter(),
+ 908             &quot;, reoptimizationRetryCounter = &quot;, alternative-&gt;reoptimizationRetryCounter(),
+ 909             &quot;, optimizationDelayCounter = &quot;, alternative-&gt;optimizationDelayCounter());
+ 910     } else
+ 911         dataLog(&quot;no alternative code block (i.e. we&#39;ve been jettisoned)&quot;);
+ 912     dataLog(&quot;, osrExitCounter = &quot;, codeBlock-&gt;osrExitCounter(), &quot;\n&quot;);
+ 913     dataLog(&quot;    GPRs at time of exit:&quot;);
+ 914     for (unsigned i = 0; i &lt; GPRInfo::numberOfRegisters; ++i) {
+ 915         GPRReg gpr = GPRInfo::toRegister(i);
+ 916         dataLog(&quot; &quot;, context.gprName(gpr), &quot;:&quot;, RawPointer(context.gpr&lt;void*&gt;(gpr)));
+ 917     }
+ 918     dataLog(&quot;\n&quot;);
+ 919     dataLog(&quot;    FPRs at time of exit:&quot;);
+ 920     for (unsigned i = 0; i &lt; FPRInfo::numberOfRegisters; ++i) {
+ 921         FPRReg fpr = FPRInfo::toRegister(i);
+ 922         dataLog(&quot; &quot;, context.fprName(fpr), &quot;:&quot;);
+ 923         uint64_t bits = context.fpr&lt;uint64_t&gt;(fpr);
+ 924         double value = context.fpr(fpr);
+ 925         dataLogF(&quot;%llx:%lf&quot;, static_cast&lt;long long&gt;(bits), value);
+ 926     }
+ 927     dataLog(&quot;\n&quot;);
+ 928 }
+ 929 
+ 930 // JIT based OSR Exit.
+ 931 
+ 932 OSRExit::OSRExit(ExitKind kind, JSValueSource jsValueSource, MethodOfGettingAValueProfile valueProfile, SpeculativeJIT* jit, unsigned streamIndex, unsigned recoveryIndex)
+ 933     : OSRExitBase(kind, jit-&gt;m_origin.forExit, jit-&gt;m_origin.semantic, jit-&gt;m_origin.wasHoisted)
+ 934     , m_jsValueSource(jsValueSource)
+ 935     , m_valueProfile(valueProfile)
+ 936     , m_recoveryIndex(recoveryIndex)
+ 937     , m_streamIndex(streamIndex)
+ 938 {
+ 939     bool canExit = jit-&gt;m_origin.exitOK;
+ 940     if (!canExit &amp;&amp; jit-&gt;m_currentNode) {
+ 941         ExitMode exitMode = mayExit(jit-&gt;m_jit.graph(), jit-&gt;m_currentNode);
+ 942         canExit = exitMode == ExitMode::Exits || exitMode == ExitMode::ExitsForExceptions;
+ 943     }
+ 944     DFG_ASSERT(jit-&gt;m_jit.graph(), jit-&gt;m_currentNode, canExit);
+ 945 }
+ 946 
+ 947 CodeLocationJump&lt;JSInternalPtrTag&gt; OSRExit::codeLocationForRepatch() const
+ 948 {
+ 949     return CodeLocationJump&lt;JSInternalPtrTag&gt;(m_patchableJumpLocation);
+ 950 }
+ 951 
+ 952 void OSRExit::emitRestoreArguments(CCallHelpers&amp; jit, const Operands&lt;ValueRecovery&gt;&amp; operands)
+ 953 {
+ 954     HashMap&lt;MinifiedID, int&gt; alreadyAllocatedArguments; // Maps phantom arguments node ID to operand.
+ 955     for (size_t index = 0; index &lt; operands.size(); ++index) {
+ 956         const ValueRecovery&amp; recovery = operands[index];
+ 957         int operand = operands.operandForIndex(index);
+ 958 
+ 959         if (recovery.technique() != DirectArgumentsThatWereNotCreated
+ 960             &amp;&amp; recovery.technique() != ClonedArgumentsThatWereNotCreated)
+ 961             continue;
+ 962 
+ 963         MinifiedID id = recovery.nodeID();
+ 964         auto iter = alreadyAllocatedArguments.find(id);
+ 965         if (iter != alreadyAllocatedArguments.end()) {
+ 966             JSValueRegs regs = JSValueRegs::withTwoAvailableRegs(GPRInfo::regT0, GPRInfo::regT1);
+ 967             jit.loadValue(CCallHelpers::addressFor(iter-&gt;value), regs);
+ 968             jit.storeValue(regs, CCallHelpers::addressFor(operand));
+ 969             continue;
+ 970         }
+ 971 
+ 972         InlineCallFrame* inlineCallFrame =
+ 973             jit.codeBlock()-&gt;jitCode()-&gt;dfg()-&gt;minifiedDFG.at(id)-&gt;inlineCallFrame();
+ 974 
+ 975         int stackOffset;
+ 976         if (inlineCallFrame)
+ 977             stackOffset = inlineCallFrame-&gt;stackOffset;
+ 978         else
+ 979             stackOffset = 0;
+ 980 
+ 981         if (!inlineCallFrame || inlineCallFrame-&gt;isClosureCall) {
+ 982             jit.loadPtr(
+ 983                 AssemblyHelpers::addressFor(stackOffset + CallFrameSlot::callee),
+ 984                 GPRInfo::regT0);
+ 985         } else {
+ 986             jit.move(
+ 987                 AssemblyHelpers::TrustedImmPtr(inlineCallFrame-&gt;calleeRecovery.constant().asCell()),
+ 988                 GPRInfo::regT0);
+ 989         }
+ 990 
+ 991         if (!inlineCallFrame || inlineCallFrame-&gt;isVarargs()) {
+ 992             jit.load32(
+ 993                 AssemblyHelpers::payloadFor(stackOffset + CallFrameSlot::argumentCount),
+ 994                 GPRInfo::regT1);
+ 995         } else {
+ 996             jit.move(
+ 997                 AssemblyHelpers::TrustedImm32(inlineCallFrame-&gt;argumentCountIncludingThis),
+ 998                 GPRInfo::regT1);
+ 999         }
+1000 
+1001         static_assert(std::is_same&lt;decltype(operationCreateDirectArgumentsDuringExit), decltype(operationCreateClonedArgumentsDuringExit)&gt;::value, &quot;We assume these functions have the same signature below.&quot;);
+1002         jit.setupArguments&lt;decltype(operationCreateDirectArgumentsDuringExit)&gt;(
+1003             AssemblyHelpers::TrustedImmPtr(inlineCallFrame), GPRInfo::regT0, GPRInfo::regT1);
+1004         switch (recovery.technique()) {
+1005         case DirectArgumentsThatWereNotCreated:
+1006             jit.move(AssemblyHelpers::TrustedImmPtr(tagCFunctionPtr&lt;OperationPtrTag&gt;(operationCreateDirectArgumentsDuringExit)), GPRInfo::nonArgGPR0);
+1007             break;
+1008         case ClonedArgumentsThatWereNotCreated:
+1009             jit.move(AssemblyHelpers::TrustedImmPtr(tagCFunctionPtr&lt;OperationPtrTag&gt;(operationCreateClonedArgumentsDuringExit)), GPRInfo::nonArgGPR0);
+1010             break;
+1011         default:
+1012             RELEASE_ASSERT_NOT_REACHED();
+1013             break;
+1014         }
+1015         jit.call(GPRInfo::nonArgGPR0, OperationPtrTag);
+1016         jit.storeCell(GPRInfo::returnValueGPR, AssemblyHelpers::addressFor(operand));
+1017 
+1018         alreadyAllocatedArguments.add(id, operand);
+1019     }
+1020 }
+1021 
+1022 void JIT_OPERATION OSRExit::compileOSRExit(ExecState* exec)
+1023 {
+1024     VM&amp; vm = exec-&gt;vm();
+1025     auto scope = DECLARE_THROW_SCOPE(vm);
+1026 
+1027     if (validateDFGDoesGC) {
+1028         // We&#39;re about to exit optimized code. So, there&#39;s no longer any optimized
+1029         // code running that expects no GC.
+1030         vm.heap.setExpectDoesGC(true);
+1031     }
+1032 
+1033     if (vm.callFrameForCatch)
+1034         RELEASE_ASSERT(vm.callFrameForCatch == exec);
+1035 
+1036     CodeBlock* codeBlock = exec-&gt;codeBlock();
+1037     ASSERT(codeBlock);
+1038     ASSERT(codeBlock-&gt;jitType() == JITType::DFGJIT);
+1039 
+1040     // It&#39;s sort of preferable that we don&#39;t GC while in here. Anyways, doing so wouldn&#39;t
+1041     // really be profitable.
+1042     DeferGCForAWhile deferGC(vm.heap);
+1043 
+1044     uint32_t exitIndex = vm.osrExitIndex;
+1045     OSRExit&amp; exit = codeBlock-&gt;jitCode()-&gt;dfg()-&gt;osrExit[exitIndex];
+1046 
+1047     ASSERT(!vm.callFrameForCatch || exit.m_kind == GenericUnwind);
+1048     EXCEPTION_ASSERT_UNUSED(scope, !!scope.exception() || !exit.isExceptionHandler());
+1049 
+1050     prepareCodeOriginForOSRExit(exec, exit.m_codeOrigin);
+1051 
+1052     // Compute the value recoveries.
+1053     Operands&lt;ValueRecovery&gt; operands;
+1054     codeBlock-&gt;jitCode()-&gt;dfg()-&gt;variableEventStream.reconstruct(codeBlock, exit.m_codeOrigin, codeBlock-&gt;jitCode()-&gt;dfg()-&gt;minifiedDFG, exit.m_streamIndex, operands);
+1055 
+1056     SpeculationRecovery* recovery = 0;
+1057     if (exit.m_recoveryIndex != UINT_MAX)
+1058         recovery = &amp;codeBlock-&gt;jitCode()-&gt;dfg()-&gt;speculationRecovery[exit.m_recoveryIndex];
+1059 
+1060     {
+1061         CCallHelpers jit(codeBlock);
+1062 
+1063         if (exit.m_kind == GenericUnwind) {
+1064             // We are acting as a defacto op_catch because we arrive here from genericUnwind().
+1065             // So, we must restore our call frame and stack pointer.
+1066             jit.restoreCalleeSavesFromEntryFrameCalleeSavesBuffer(vm.topEntryFrame);
+1067             jit.loadPtr(vm.addressOfCallFrameForCatch(), GPRInfo::callFrameRegister);
+1068         }
+1069         jit.addPtr(
+1070             CCallHelpers::TrustedImm32(codeBlock-&gt;stackPointerOffset() * sizeof(Register)),
+1071             GPRInfo::callFrameRegister, CCallHelpers::stackPointerRegister);
+1072 
+1073         jit.jitAssertHasValidCallFrame();
+1074 
+1075         if (UNLIKELY(vm.m_perBytecodeProfiler &amp;&amp; codeBlock-&gt;jitCode()-&gt;dfgCommon()-&gt;compilation)) {
+1076             Profiler::Database&amp; database = *vm.m_perBytecodeProfiler;
+1077             Profiler::Compilation* compilation = codeBlock-&gt;jitCode()-&gt;dfgCommon()-&gt;compilation.get();
+1078 
+1079             Profiler::OSRExit* profilerExit = compilation-&gt;addOSRExit(
+1080                 exitIndex, Profiler::OriginStack(database, codeBlock, exit.m_codeOrigin),
+1081                 exit.m_kind, exit.m_kind == UncountableInvalidation);
+1082             jit.add64(CCallHelpers::TrustedImm32(1), CCallHelpers::AbsoluteAddress(profilerExit-&gt;counterAddress()));
+1083         }
+1084 
+1085         compileExit(jit, vm, exit, operands, recovery);
+1086 
+1087         LinkBuffer patchBuffer(jit, codeBlock);
+1088         exit.m_code = FINALIZE_CODE_IF(
+1089             shouldDumpDisassembly() || Options::verboseOSR() || Options::verboseDFGOSRExit(),
+1090             patchBuffer, OSRExitPtrTag,
+1091             &quot;DFG OSR exit #%u (%s, %s) from %s, with operands = %s&quot;,
+1092                 exitIndex, toCString(exit.m_codeOrigin).data(),
+1093                 exitKindToString(exit.m_kind), toCString(*codeBlock).data(),
+1094                 toCString(ignoringContext&lt;DumpContext&gt;(operands)).data());
+1095     }
+1096 
+1097     MacroAssembler::repatchJump(exit.codeLocationForRepatch(), CodeLocationLabel&lt;OSRExitPtrTag&gt;(exit.m_code.code()));
+1098 
+1099     vm.osrExitJumpDestination = exit.m_code.code().executableAddress();
+1100 }
+1101 
+1102 void OSRExit::compileExit(CCallHelpers&amp; jit, VM&amp; vm, const OSRExit&amp; exit, const Operands&lt;ValueRecovery&gt;&amp; operands, SpeculationRecovery* recovery)
+1103 {
+1104     jit.jitAssertTagsInPlace();
+1105 
+1106     // Pro-forma stuff.
+1107     if (Options::printEachOSRExit()) {
+1108         SpeculationFailureDebugInfo* debugInfo = new SpeculationFailureDebugInfo;
+1109         debugInfo-&gt;codeBlock = jit.codeBlock();
+1110         debugInfo-&gt;kind = exit.m_kind;
+1111         debugInfo-&gt;bytecodeOffset = exit.m_codeOrigin.bytecodeIndex();
+1112 
+1113         jit.debugCall(vm, debugOperationPrintSpeculationFailure, debugInfo);
+1114     }
+1115 
+1116     // Perform speculation recovery. This only comes into play when an operation
+1117     // starts mutating state before verifying the speculation it has already made.
+1118 
+1119     if (recovery) {
+1120         switch (recovery-&gt;type()) {
+1121         case SpeculativeAdd:
+1122             jit.sub32(recovery-&gt;src(), recovery-&gt;dest());
+1123 #if USE(JSVALUE64)
+1124             jit.or64(GPRInfo::tagTypeNumberRegister, recovery-&gt;dest());
+1125 #endif
+1126             break;
+1127 
+1128         case SpeculativeAddSelf:
+1129             // If A + A = A (int32_t) overflows, A can be recovered by ((static_cast&lt;int32_t&gt;(A) &gt;&gt; 1) ^ 0x8000000).
+1130             jit.rshift32(AssemblyHelpers::TrustedImm32(1), recovery-&gt;dest());
+1131             jit.xor32(AssemblyHelpers::TrustedImm32(0x80000000), recovery-&gt;dest());
+1132 #if USE(JSVALUE64)
+1133             jit.or64(GPRInfo::tagTypeNumberRegister, recovery-&gt;dest());
+1134 #endif
+1135             break;
+1136 
+1137         case SpeculativeAddImmediate:
+1138             jit.sub32(AssemblyHelpers::Imm32(recovery-&gt;immediate()), recovery-&gt;dest());
+1139 #if USE(JSVALUE64)
+1140             jit.or64(GPRInfo::tagTypeNumberRegister, recovery-&gt;dest());
+1141 #endif
+1142             break;
+1143 
+1144         case BooleanSpeculationCheck:
+1145 #if USE(JSVALUE64)
+1146             jit.xor64(AssemblyHelpers::TrustedImm32(static_cast&lt;int32_t&gt;(ValueFalse)), recovery-&gt;dest());
+1147 #endif
+1148             break;
+1149 
+1150         default:
+1151             break;
+1152         }
+1153     }
+1154 
+1155     // Refine some array and/or value profile, if appropriate.
+1156 
+1157     if (!!exit.m_jsValueSource) {
+1158         if (exit.m_kind == BadCache || exit.m_kind == BadIndexingType) {
+1159             // If the instruction that this originated from has an array profile, then
+1160             // refine it. If it doesn&#39;t, then do nothing. The latter could happen for
+1161             // hoisted checks, or checks emitted for operations that didn&#39;t have array
+1162             // profiling - either ops that aren&#39;t array accesses at all, or weren&#39;t
+1163             // known to be array acceses in the bytecode. The latter case is a FIXME
+1164             // while the former case is an outcome of a CheckStructure not knowing why
+1165             // it was emitted (could be either due to an inline cache of a property
+1166             // property access, or due to an array profile).
+1167 
+1168             CodeOrigin codeOrigin = exit.m_codeOriginForExitProfile;
+1169             if (ArrayProfile* arrayProfile = jit.baselineCodeBlockFor(codeOrigin)-&gt;getArrayProfile(codeOrigin.bytecodeIndex())) {
+1170 #if USE(JSVALUE64)
+1171                 GPRReg usedRegister;
+1172                 if (exit.m_jsValueSource.isAddress())
+1173                     usedRegister = exit.m_jsValueSource.base();
+1174                 else
+1175                     usedRegister = exit.m_jsValueSource.gpr();
+1176 #else
+1177                 GPRReg usedRegister1;
+1178                 GPRReg usedRegister2;
+1179                 if (exit.m_jsValueSource.isAddress()) {
+1180                     usedRegister1 = exit.m_jsValueSource.base();
+1181                     usedRegister2 = InvalidGPRReg;
+1182                 } else {
+1183                     usedRegister1 = exit.m_jsValueSource.payloadGPR();
+1184                     if (exit.m_jsValueSource.hasKnownTag())
+1185                         usedRegister2 = InvalidGPRReg;
+1186                     else
+1187                         usedRegister2 = exit.m_jsValueSource.tagGPR();
+1188                 }
+1189 #endif
+1190 
+1191                 GPRReg scratch1;
+1192                 GPRReg scratch2;
+1193 #if USE(JSVALUE64)
+1194                 scratch1 = AssemblyHelpers::selectScratchGPR(usedRegister);
+1195                 scratch2 = AssemblyHelpers::selectScratchGPR(usedRegister, scratch1);
+1196 #else
+1197                 scratch1 = AssemblyHelpers::selectScratchGPR(usedRegister1, usedRegister2);
+1198                 scratch2 = AssemblyHelpers::selectScratchGPR(usedRegister1, usedRegister2, scratch1);
+1199 #endif
+1200 
+1201                 if (isARM64()) {
+1202                     jit.pushToSave(scratch1);
+1203                     jit.pushToSave(scratch2);
+1204                 } else {
+1205                     jit.push(scratch1);
+1206                     jit.push(scratch2);
+1207                 }
+1208 
+1209                 GPRReg value;
+1210                 if (exit.m_jsValueSource.isAddress()) {
+1211                     value = scratch1;
+1212                     jit.loadPtr(AssemblyHelpers::Address(exit.m_jsValueSource.asAddress()), value);
+1213                 } else
+1214                     value = exit.m_jsValueSource.payloadGPR();
+1215 
+1216                 jit.load32(AssemblyHelpers::Address(value, JSCell::structureIDOffset()), scratch1);
+1217                 jit.store32(scratch1, arrayProfile-&gt;addressOfLastSeenStructureID());
+1218 
+1219                 jit.load8(AssemblyHelpers::Address(value, JSCell::typeInfoTypeOffset()), scratch2);
+1220                 jit.sub32(AssemblyHelpers::TrustedImm32(FirstTypedArrayType), scratch2);
+1221                 auto notTypedArray = jit.branch32(MacroAssembler::AboveOrEqual, scratch2, AssemblyHelpers::TrustedImm32(NumberOfTypedArrayTypesExcludingDataView));
+1222                 jit.move(AssemblyHelpers::TrustedImmPtr(typedArrayModes), scratch1);
+1223                 jit.load32(AssemblyHelpers::BaseIndex(scratch1, scratch2, AssemblyHelpers::TimesFour), scratch2);
+1224                 auto storeArrayModes = jit.jump();
+1225 
+1226                 notTypedArray.link(&amp;jit);
+1227 #if USE(JSVALUE64)
+1228                 jit.load8(AssemblyHelpers::Address(value, JSCell::indexingTypeAndMiscOffset()), scratch1);
+1229 #else
+1230                 jit.load8(AssemblyHelpers::Address(scratch1, Structure::indexingModeIncludingHistoryOffset()), scratch1);
+1231 #endif
+1232                 jit.and32(AssemblyHelpers::TrustedImm32(IndexingModeMask), scratch1);
+1233                 jit.move(AssemblyHelpers::TrustedImm32(1), scratch2);
+1234                 jit.lshift32(scratch1, scratch2);
+1235                 storeArrayModes.link(&amp;jit);
+1236                 jit.or32(scratch2, AssemblyHelpers::AbsoluteAddress(arrayProfile-&gt;addressOfArrayModes()));
+1237 
+1238                 if (isARM64()) {
+1239                     jit.popToRestore(scratch2);
+1240                     jit.popToRestore(scratch1);
+1241                 } else {
+1242                     jit.pop(scratch2);
+1243                     jit.pop(scratch1);
+1244                 }
+1245             }
+1246         }
+1247 
+1248         if (MethodOfGettingAValueProfile profile = exit.m_valueProfile) {
+1249 #if USE(JSVALUE64)
+1250             if (exit.m_jsValueSource.isAddress()) {
+1251                 // We can&#39;t be sure that we have a spare register. So use the tagTypeNumberRegister,
+1252                 // since we know how to restore it.
+1253                 jit.load64(AssemblyHelpers::Address(exit.m_jsValueSource.asAddress()), GPRInfo::tagTypeNumberRegister);
+1254                 profile.emitReportValue(jit, JSValueRegs(GPRInfo::tagTypeNumberRegister));
+1255                 jit.move(AssemblyHelpers::TrustedImm64(TagTypeNumber), GPRInfo::tagTypeNumberRegister);
+1256             } else
+1257                 profile.emitReportValue(jit, JSValueRegs(exit.m_jsValueSource.gpr()));
+1258 #else // not USE(JSVALUE64)
+1259             if (exit.m_jsValueSource.isAddress()) {
+1260                 // Save a register so we can use it.
+1261                 GPRReg scratchPayload = AssemblyHelpers::selectScratchGPR(exit.m_jsValueSource.base());
+1262                 GPRReg scratchTag = AssemblyHelpers::selectScratchGPR(exit.m_jsValueSource.base(), scratchPayload);
+1263                 jit.pushToSave(scratchPayload);
+1264                 jit.pushToSave(scratchTag);
+1265 
+1266                 JSValueRegs scratch(scratchTag, scratchPayload);
+1267 
+1268                 jit.loadValue(exit.m_jsValueSource.asAddress(), scratch);
+1269                 profile.emitReportValue(jit, scratch);
+1270 
+1271                 jit.popToRestore(scratchTag);
+1272                 jit.popToRestore(scratchPayload);
+1273             } else if (exit.m_jsValueSource.hasKnownTag()) {
+1274                 GPRReg scratchTag = AssemblyHelpers::selectScratchGPR(exit.m_jsValueSource.payloadGPR());
+1275                 jit.pushToSave(scratchTag);
+1276                 jit.move(AssemblyHelpers::TrustedImm32(exit.m_jsValueSource.tag()), scratchTag);
+1277                 JSValueRegs value(scratchTag, exit.m_jsValueSource.payloadGPR());
+1278                 profile.emitReportValue(jit, value);
+1279                 jit.popToRestore(scratchTag);
+1280             } else
+1281                 profile.emitReportValue(jit, exit.m_jsValueSource.regs());
+1282 #endif // USE(JSVALUE64)
+1283         }
+1284     }
+1285 
+1286     // What follows is an intentionally simple OSR exit implementation that generates
+1287     // fairly poor code but is very easy to hack. In particular, it dumps all state that
+1288     // needs conversion into a scratch buffer so that in step 6, where we actually do the
+1289     // conversions, we know that all temp registers are free to use and the variable is
+1290     // definitely in a well-known spot in the scratch buffer regardless of whether it had
+1291     // originally been in a register or spilled. This allows us to decouple &quot;where was
+1292     // the variable&quot; from &quot;how was it represented&quot;. Consider that the
+1293     // Int32DisplacedInJSStack recovery: it tells us that the value is in a
+1294     // particular place and that that place holds an unboxed int32. We have two different
+1295     // places that a value could be (displaced, register) and a bunch of different
+1296     // ways of representing a value. The number of recoveries is two * a bunch. The code
+1297     // below means that we have to have two + a bunch cases rather than two * a bunch.
+1298     // Once we have loaded the value from wherever it was, the reboxing is the same
+1299     // regardless of its location. Likewise, before we do the reboxing, the way we get to
+1300     // the value (i.e. where we load it from) is the same regardless of its type. Because
+1301     // the code below always dumps everything into a scratch buffer first, the two
+1302     // questions become orthogonal, which simplifies adding new types and adding new
+1303     // locations.
+1304     //
+1305     // This raises the question: does using such a suboptimal implementation of OSR exit,
+1306     // where we always emit code to dump all state into a scratch buffer only to then
+1307     // dump it right back into the stack, hurt us in any way? The asnwer is that OSR exits
+1308     // are rare. Our tiering strategy ensures this. This is because if an OSR exit is
+1309     // taken more than ~100 times, we jettison the DFG code block along with all of its
+1310     // exits. It is impossible for an OSR exit - i.e. the code we compile below - to
+1311     // execute frequently enough for the codegen to matter that much. It probably matters
+1312     // enough that we don&#39;t want to turn this into some super-slow function call, but so
+1313     // long as we&#39;re generating straight-line code, that code can be pretty bad. Also
+1314     // because we tend to exit only along one OSR exit from any DFG code block - that&#39;s an
+1315     // empirical result that we&#39;re extremely confident about - the code size of this
+1316     // doesn&#39;t matter much. Hence any attempt to optimize the codegen here is just purely
+1317     // harmful to the system: it probably won&#39;t reduce either net memory usage or net
+1318     // execution time. It will only prevent us from cleanly decoupling &quot;where was the
+1319     // variable&quot; from &quot;how was it represented&quot;, which will make it more difficult to add
+1320     // features in the future and it will make it harder to reason about bugs.
+1321 
+1322     // Save all state from GPRs into the scratch buffer.
+1323 
+1324     ScratchBuffer* scratchBuffer = vm.scratchBufferForSize(sizeof(EncodedJSValue) * operands.size());
+1325     EncodedJSValue* scratch = scratchBuffer ? static_cast&lt;EncodedJSValue*&gt;(scratchBuffer-&gt;dataBuffer()) : 0;
+1326 
+1327     for (size_t index = 0; index &lt; operands.size(); ++index) {
+1328         const ValueRecovery&amp; recovery = operands[index];
+1329 
+1330         switch (recovery.technique()) {
+1331         case UnboxedInt32InGPR:
+1332         case UnboxedCellInGPR:
+1333 #if USE(JSVALUE64)
+1334         case InGPR:
+1335         case UnboxedInt52InGPR:
+1336         case UnboxedStrictInt52InGPR:
+1337             jit.store64(recovery.gpr(), scratch + index);
+1338             break;
+1339 #else
+1340         case UnboxedBooleanInGPR:
+1341             jit.store32(
+1342                 recovery.gpr(),
+1343                 &amp;bitwise_cast&lt;EncodedValueDescriptor*&gt;(scratch + index)-&gt;asBits.payload);
+1344             break;
+1345 
+1346         case InPair:
+1347             jit.store32(
+1348                 recovery.tagGPR(),
+1349                 &amp;bitwise_cast&lt;EncodedValueDescriptor*&gt;(scratch + index)-&gt;asBits.tag);
+1350             jit.store32(
+1351                 recovery.payloadGPR(),
+1352                 &amp;bitwise_cast&lt;EncodedValueDescriptor*&gt;(scratch + index)-&gt;asBits.payload);
+1353             break;
+1354 #endif
+1355 
+1356         default:
+1357             break;
+1358         }
+1359     }
+1360 
+1361     // And voila, all GPRs are free to reuse.
+1362 
+1363     // Save all state from FPRs into the scratch buffer.
+1364 
+1365     for (size_t index = 0; index &lt; operands.size(); ++index) {
+1366         const ValueRecovery&amp; recovery = operands[index];
+1367 
+1368         switch (recovery.technique()) {
+1369         case UnboxedDoubleInFPR:
+1370         case InFPR:
+1371             jit.move(AssemblyHelpers::TrustedImmPtr(scratch + index), GPRInfo::regT0);
+1372             jit.storeDouble(recovery.fpr(), MacroAssembler::Address(GPRInfo::regT0));
+1373             break;
+1374 
+1375         default:
+1376             break;
+1377         }
+1378     }
+1379 
+1380     // Now, all FPRs are also free.
+1381 
+1382     // Save all state from the stack into the scratch buffer. For simplicity we
+1383     // do this even for state that&#39;s already in the right place on the stack.
+1384     // It makes things simpler later.
+1385 
+1386     for (size_t index = 0; index &lt; operands.size(); ++index) {
+1387         const ValueRecovery&amp; recovery = operands[index];
+1388 
+1389         switch (recovery.technique()) {
+1390         case DisplacedInJSStack:
+1391         case CellDisplacedInJSStack:
+1392         case BooleanDisplacedInJSStack:
+1393         case Int32DisplacedInJSStack:
+1394         case DoubleDisplacedInJSStack:
+1395 #if USE(JSVALUE64)
+1396         case Int52DisplacedInJSStack:
+1397         case StrictInt52DisplacedInJSStack:
+1398             jit.load64(AssemblyHelpers::addressFor(recovery.virtualRegister()), GPRInfo::regT0);
+1399             jit.store64(GPRInfo::regT0, scratch + index);
+1400             break;
+1401 #else
+1402             jit.load32(
+1403                 AssemblyHelpers::tagFor(recovery.virtualRegister()),
+1404                 GPRInfo::regT0);
+1405             jit.load32(
+1406                 AssemblyHelpers::payloadFor(recovery.virtualRegister()),
+1407                 GPRInfo::regT1);
+1408             jit.store32(
+1409                 GPRInfo::regT0,
+1410                 &amp;bitwise_cast&lt;EncodedValueDescriptor*&gt;(scratch + index)-&gt;asBits.tag);
+1411             jit.store32(
+1412                 GPRInfo::regT1,
+1413                 &amp;bitwise_cast&lt;EncodedValueDescriptor*&gt;(scratch + index)-&gt;asBits.payload);
+1414             break;
+1415 #endif
+1416 
+1417         default:
+1418             break;
+1419         }
+1420     }
+1421 
+1422     if (validateDFGDoesGC) {
+1423         // We&#39;re about to exit optimized code. So, there&#39;s no longer any optimized
+1424         // code running that expects no GC. We need to set this before arguments
+1425         // materialization below (see emitRestoreArguments()).
+1426 
+1427         // Even though we set Heap::m_expectDoesGC in compileOSRExit(), we also need
+1428         // to set it here because compileOSRExit() is only called on the first time
+1429         // we exit from this site, but all subsequent exits will take this compiled
+1430         // ramp without calling compileOSRExit() first.
+1431         jit.store8(CCallHelpers::TrustedImm32(true), vm.heap.addressOfExpectDoesGC());
+1432     }
+1433 
+1434     // Need to ensure that the stack pointer accounts for the worst-case stack usage at exit. This
+1435     // could toast some stack that the DFG used. We need to do it before storing to stack offsets
+1436     // used by baseline.
+1437     jit.addPtr(
+1438         CCallHelpers::TrustedImm32(
+1439             -jit.codeBlock()-&gt;jitCode()-&gt;dfgCommon()-&gt;requiredRegisterCountForExit * sizeof(Register)),
+1440         CCallHelpers::framePointerRegister, CCallHelpers::stackPointerRegister);
+1441 
+1442     // Restore the DFG callee saves and then save the ones the baseline JIT uses.
+1443     jit.emitRestoreCalleeSaves();
+1444     jit.emitSaveCalleeSavesFor(jit.baselineCodeBlock());
+1445 
+1446     // The tag registers are needed to materialize recoveries below.
+1447     jit.emitMaterializeTagCheckRegisters();
+1448 
+1449     if (exit.isExceptionHandler())
+1450         jit.copyCalleeSavesToEntryFrameCalleeSavesBuffer(vm.topEntryFrame);
+1451 
+1452     // Do all data format conversions and store the results into the stack.
+1453 
+1454     for (size_t index = 0; index &lt; operands.size(); ++index) {
+1455         const ValueRecovery&amp; recovery = operands[index];
+1456         VirtualRegister reg = operands.virtualRegisterForIndex(index);
+1457 
+1458         if (reg.isLocal() &amp;&amp; reg.toLocal() &lt; static_cast&lt;int&gt;(jit.baselineCodeBlock()-&gt;calleeSaveSpaceAsVirtualRegisters()))
+1459             continue;
+1460 
+1461         int operand = reg.offset();
+1462 
+1463         switch (recovery.technique()) {
+1464         case DisplacedInJSStack:
+1465         case InFPR:
+1466 #if USE(JSVALUE64)
+1467         case InGPR:
+1468         case UnboxedCellInGPR:
+1469         case CellDisplacedInJSStack:
+1470         case BooleanDisplacedInJSStack:
+1471             jit.load64(scratch + index, GPRInfo::regT0);
+1472             jit.store64(GPRInfo::regT0, AssemblyHelpers::addressFor(operand));
+1473             break;
+1474 #else // not USE(JSVALUE64)
+1475         case InPair:
+1476             jit.load32(
+1477                 &amp;bitwise_cast&lt;EncodedValueDescriptor*&gt;(scratch + index)-&gt;asBits.tag,
+1478                 GPRInfo::regT0);
+1479             jit.load32(
+1480                 &amp;bitwise_cast&lt;EncodedValueDescriptor*&gt;(scratch + index)-&gt;asBits.payload,
+1481                 GPRInfo::regT1);
+1482             jit.store32(
+1483                 GPRInfo::regT0,
+1484                 AssemblyHelpers::tagFor(operand));
+1485             jit.store32(
+1486                 GPRInfo::regT1,
+1487                 AssemblyHelpers::payloadFor(operand));
+1488             break;
+1489 
+1490         case UnboxedCellInGPR:
+1491         case CellDisplacedInJSStack:
+1492             jit.load32(
+1493                 &amp;bitwise_cast&lt;EncodedValueDescriptor*&gt;(scratch + index)-&gt;asBits.payload,
+1494                 GPRInfo::regT0);
+1495             jit.store32(
+1496                 AssemblyHelpers::TrustedImm32(JSValue::CellTag),
+1497                 AssemblyHelpers::tagFor(operand));
+1498             jit.store32(
+1499                 GPRInfo::regT0,
+1500                 AssemblyHelpers::payloadFor(operand));
+1501             break;
+1502 
+1503         case UnboxedBooleanInGPR:
+1504         case BooleanDisplacedInJSStack:
+1505             jit.load32(
+1506                 &amp;bitwise_cast&lt;EncodedValueDescriptor*&gt;(scratch + index)-&gt;asBits.payload,
+1507                 GPRInfo::regT0);
+1508             jit.store32(
+1509                 AssemblyHelpers::TrustedImm32(JSValue::BooleanTag),
+1510                 AssemblyHelpers::tagFor(operand));
+1511             jit.store32(
+1512                 GPRInfo::regT0,
+1513                 AssemblyHelpers::payloadFor(operand));
+1514             break;
+1515 #endif // USE(JSVALUE64)
+1516 
+1517         case UnboxedInt32InGPR:
+1518         case Int32DisplacedInJSStack:
+1519 #if USE(JSVALUE64)
+1520             jit.load64(scratch + index, GPRInfo::regT0);
+1521             jit.zeroExtend32ToPtr(GPRInfo::regT0, GPRInfo::regT0);
+1522             jit.or64(GPRInfo::tagTypeNumberRegister, GPRInfo::regT0);
+1523             jit.store64(GPRInfo::regT0, AssemblyHelpers::addressFor(operand));
+1524 #else
+1525             jit.load32(
+1526                 &amp;bitwise_cast&lt;EncodedValueDescriptor*&gt;(scratch + index)-&gt;asBits.payload,
+1527                 GPRInfo::regT0);
+1528             jit.store32(
+1529                 AssemblyHelpers::TrustedImm32(JSValue::Int32Tag),
+1530                 AssemblyHelpers::tagFor(operand));
+1531             jit.store32(
+1532                 GPRInfo::regT0,
+1533                 AssemblyHelpers::payloadFor(operand));
+1534 #endif
+1535             break;
+1536 
+1537 #if USE(JSVALUE64)
+1538         case UnboxedInt52InGPR:
+1539         case Int52DisplacedInJSStack:
+1540             jit.load64(scratch + index, GPRInfo::regT0);
+1541             jit.rshift64(
+1542                 AssemblyHelpers::TrustedImm32(JSValue::int52ShiftAmount), GPRInfo::regT0);
+1543             jit.boxInt52(GPRInfo::regT0, GPRInfo::regT0, GPRInfo::regT1, FPRInfo::fpRegT0);
+1544             jit.store64(GPRInfo::regT0, AssemblyHelpers::addressFor(operand));
+1545             break;
+1546 
+1547         case UnboxedStrictInt52InGPR:
+1548         case StrictInt52DisplacedInJSStack:
+1549             jit.load64(scratch + index, GPRInfo::regT0);
+1550             jit.boxInt52(GPRInfo::regT0, GPRInfo::regT0, GPRInfo::regT1, FPRInfo::fpRegT0);
+1551             jit.store64(GPRInfo::regT0, AssemblyHelpers::addressFor(operand));
+1552             break;
+1553 #endif
+1554 
+1555         case UnboxedDoubleInFPR:
+1556         case DoubleDisplacedInJSStack:
+1557             jit.move(AssemblyHelpers::TrustedImmPtr(scratch + index), GPRInfo::regT0);
+1558             jit.loadDouble(MacroAssembler::Address(GPRInfo::regT0), FPRInfo::fpRegT0);
+1559             jit.purifyNaN(FPRInfo::fpRegT0);
+1560 #if USE(JSVALUE64)
+1561             jit.boxDouble(FPRInfo::fpRegT0, GPRInfo::regT0);
+1562             jit.store64(GPRInfo::regT0, AssemblyHelpers::addressFor(operand));
+1563 #else
+1564             jit.storeDouble(FPRInfo::fpRegT0, AssemblyHelpers::addressFor(operand));
+1565 #endif
+1566             break;
+1567 
+1568         case Constant:
+1569 #if USE(JSVALUE64)
+1570             jit.store64(
+1571                 AssemblyHelpers::TrustedImm64(JSValue::encode(recovery.constant())),
+1572                 AssemblyHelpers::addressFor(operand));
+1573 #else
+1574             jit.store32(
+1575                 AssemblyHelpers::TrustedImm32(recovery.constant().tag()),
+1576                 AssemblyHelpers::tagFor(operand));
+1577             jit.store32(
+1578                 AssemblyHelpers::TrustedImm32(recovery.constant().payload()),
+1579                 AssemblyHelpers::payloadFor(operand));
+1580 #endif
+1581             break;
+1582 
+1583         case DirectArgumentsThatWereNotCreated:
+1584         case ClonedArgumentsThatWereNotCreated:
+1585             // Don&#39;t do this, yet.
+1586             break;
+1587 
+1588         default:
+1589             RELEASE_ASSERT_NOT_REACHED();
+1590             break;
+1591         }
+1592     }
+1593 
+1594     // Now that things on the stack are recovered, do the arguments recovery. We assume that arguments
+1595     // recoveries don&#39;t recursively refer to each other. But, we don&#39;t try to assume that they only
+1596     // refer to certain ranges of locals. Hence why we need to do this here, once the stack is sensible.
+1597     // Note that we also roughly assume that the arguments might still be materialized outside of its
+1598     // inline call frame scope - but for now the DFG wouldn&#39;t do that.
+1599 
+1600     emitRestoreArguments(jit, operands);
+1601 
+1602     // Adjust the old JIT&#39;s execute counter. Since we are exiting OSR, we know
+1603     // that all new calls into this code will go to the new JIT, so the execute
+1604     // counter only affects call frames that performed OSR exit and call frames
+1605     // that were still executing the old JIT at the time of another call frame&#39;s
+1606     // OSR exit. We want to ensure that the following is true:
+1607     //
+1608     // (a) Code the performs an OSR exit gets a chance to reenter optimized
+1609     //     code eventually, since optimized code is faster. But we don&#39;t
+1610     //     want to do such reentery too aggressively (see (c) below).
+1611     //
+1612     // (b) If there is code on the call stack that is still running the old
+1613     //     JIT&#39;s code and has never OSR&#39;d, then it should get a chance to
+1614     //     perform OSR entry despite the fact that we&#39;ve exited.
+1615     //
+1616     // (c) Code the performs an OSR exit should not immediately retry OSR
+1617     //     entry, since both forms of OSR are expensive. OSR entry is
+1618     //     particularly expensive.
+1619     //
+1620     // (d) Frequent OSR failures, even those that do not result in the code
+1621     //     running in a hot loop, result in recompilation getting triggered.
+1622     //
+1623     // To ensure (c), we&#39;d like to set the execute counter to
+1624     // counterValueForOptimizeAfterWarmUp(). This seems like it would endanger
+1625     // (a) and (b), since then every OSR exit would delay the opportunity for
+1626     // every call frame to perform OSR entry. Essentially, if OSR exit happens
+1627     // frequently and the function has few loops, then the counter will never
+1628     // become non-negative and OSR entry will never be triggered. OSR entry
+1629     // will only happen if a loop gets hot in the old JIT, which does a pretty
+1630     // good job of ensuring (a) and (b). But that doesn&#39;t take care of (d),
+1631     // since each speculation failure would reset the execute counter.
+1632     // So we check here if the number of speculation failures is significantly
+1633     // larger than the number of successes (we want 90% success rate), and if
+1634     // there have been a large enough number of failures. If so, we set the
+1635     // counter to 0; otherwise we set the counter to
+1636     // counterValueForOptimizeAfterWarmUp().
+1637 
+1638     handleExitCounts(jit, exit);
+1639 
+1640     // Reify inlined call frames.
+1641 
+1642     reifyInlinedCallFrames(jit, exit);
+1643 
+1644     // And finish.
+1645     adjustAndJumpToTarget(vm, jit, exit);
+1646 }
+1647 
+1648 void JIT_OPERATION OSRExit::debugOperationPrintSpeculationFailure(ExecState* exec, void* debugInfoRaw, void* scratch)
+1649 {
+1650     VM&amp; vm = exec-&gt;vm();
+1651     NativeCallFrameTracer tracer(vm, exec);
+1652 
+1653     SpeculationFailureDebugInfo* debugInfo = static_cast&lt;SpeculationFailureDebugInfo*&gt;(debugInfoRaw);
+1654     CodeBlock* codeBlock = debugInfo-&gt;codeBlock;
+1655     CodeBlock* alternative = codeBlock-&gt;alternative();
+1656     dataLog(&quot;Speculation failure in &quot;, *codeBlock);
+1657     dataLog(&quot; @ exit #&quot;, vm.osrExitIndex, &quot; (bc#&quot;, debugInfo-&gt;bytecodeOffset, &quot;, &quot;, exitKindToString(debugInfo-&gt;kind), &quot;) with &quot;);
+1658     if (alternative) {
+1659         dataLog(
+1660             &quot;executeCounter = &quot;, alternative-&gt;jitExecuteCounter(),
+1661             &quot;, reoptimizationRetryCounter = &quot;, alternative-&gt;reoptimizationRetryCounter(),
+1662             &quot;, optimizationDelayCounter = &quot;, alternative-&gt;optimizationDelayCounter());
+1663     } else
+1664         dataLog(&quot;no alternative code block (i.e. we&#39;ve been jettisoned)&quot;);
+1665     dataLog(&quot;, osrExitCounter = &quot;, codeBlock-&gt;osrExitCounter(), &quot;\n&quot;);
+1666     dataLog(&quot;    GPRs at time of exit:&quot;);
+1667     char* scratchPointer = static_cast&lt;char*&gt;(scratch);
+1668     for (unsigned i = 0; i &lt; GPRInfo::numberOfRegisters; ++i) {
+1669         GPRReg gpr = GPRInfo::toRegister(i);
+1670         dataLog(&quot; &quot;, GPRInfo::debugName(gpr), &quot;:&quot;, RawPointer(*reinterpret_cast_ptr&lt;void**&gt;(scratchPointer)));
+1671         scratchPointer += sizeof(EncodedJSValue);
+1672     }
+1673     dataLog(&quot;\n&quot;);
+1674     dataLog(&quot;    FPRs at time of exit:&quot;);
+1675     for (unsigned i = 0; i &lt; FPRInfo::numberOfRegisters; ++i) {
+1676         FPRReg fpr = FPRInfo::toRegister(i);
+1677         dataLog(&quot; &quot;, FPRInfo::debugName(fpr), &quot;:&quot;);
+1678         uint64_t bits = *reinterpret_cast_ptr&lt;uint64_t*&gt;(scratchPointer);
+1679         double value = *reinterpret_cast_ptr&lt;double*&gt;(scratchPointer);
+1680         dataLogF(&quot;%llx:%lf&quot;, static_cast&lt;long long&gt;(bits), value);
+1681         scratchPointer += sizeof(EncodedJSValue);
+1682     }
+1683     dataLog(&quot;\n&quot;);
+1684 }
+1685 
+1686 } } // namespace JSC::DFG
+1687 
+1688 #endif // ENABLE(DFG_JIT)
+    </pre>
+  </body>
+</html>
