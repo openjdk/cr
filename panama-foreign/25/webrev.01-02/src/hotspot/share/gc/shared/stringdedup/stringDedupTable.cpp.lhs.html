@@ -1,0 +1,748 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Frames src/hotspot/share/gc/shared/stringdedup/stringDedupTable.cpp</title>
+    <link rel="stylesheet" href="../../../../../../style.css" />
+    <script type="text/javascript" src="../../../../../../navigation.js"></script>
+  </head>
+<body onkeypress="keypress(event);">
+<a name="0"></a>
+<hr />
+<pre>  1 /*
+  2  * Copyright (c) 2014, 2020, Oracle and/or its affiliates. All rights reserved.
+  3  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  4  *
+  5  * This code is free software; you can redistribute it and/or modify it
+  6  * under the terms of the GNU General Public License version 2 only, as
+  7  * published by the Free Software Foundation.
+  8  *
+  9  * This code is distributed in the hope that it will be useful, but WITHOUT
+ 10  * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ 11  * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ 12  * version 2 for more details (a copy is included in the LICENSE file that
+ 13  * accompanied this code).
+ 14  *
+ 15  * You should have received a copy of the GNU General Public License version
+ 16  * 2 along with this work; if not, write to the Free Software Foundation,
+ 17  * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ 18  *
+ 19  * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ 20  * or visit www.oracle.com if you need additional information or have any
+ 21  * questions.
+ 22  *
+ 23  */
+ 24 
+ 25 #include &quot;precompiled.hpp&quot;
+ 26 #include &quot;classfile/altHashing.hpp&quot;
+ 27 #include &quot;classfile/javaClasses.inline.hpp&quot;
+ 28 #include &quot;gc/shared/stringdedup/stringDedup.hpp&quot;
+ 29 #include &quot;gc/shared/stringdedup/stringDedupTable.hpp&quot;
+ 30 #include &quot;gc/shared/suspendibleThreadSet.hpp&quot;
+ 31 #include &quot;logging/log.hpp&quot;
+ 32 #include &quot;memory/padded.inline.hpp&quot;
+ 33 #include &quot;memory/universe.hpp&quot;
+ 34 #include &quot;oops/access.inline.hpp&quot;
+ 35 #include &quot;oops/arrayOop.inline.hpp&quot;
+ 36 #include &quot;oops/oop.inline.hpp&quot;
+ 37 #include &quot;oops/typeArrayOop.hpp&quot;
+ 38 #include &quot;runtime/atomic.hpp&quot;
+ 39 #include &quot;runtime/mutexLocker.hpp&quot;
+ 40 #include &quot;runtime/safepointVerifiers.hpp&quot;
+<a name="1" id="anc1"></a>
+ 41 
+ 42 //
+ 43 // List of deduplication table entries. Links table
+ 44 // entries together using their _next fields.
+ 45 //
+ 46 class StringDedupEntryList : public CHeapObj&lt;mtGC&gt; {
+ 47 private:
+ 48   StringDedupEntry*   _list;
+ 49   size_t              _length;
+ 50 
+ 51 public:
+ 52   StringDedupEntryList() :
+ 53     _list(NULL),
+ 54     _length(0) {
+ 55   }
+ 56 
+ 57   void add(StringDedupEntry* entry) {
+ 58     entry-&gt;set_next(_list);
+ 59     _list = entry;
+ 60     _length++;
+ 61   }
+ 62 
+ 63   StringDedupEntry* remove() {
+ 64     StringDedupEntry* entry = _list;
+ 65     if (entry != NULL) {
+ 66       _list = entry-&gt;next();
+ 67       _length--;
+ 68     }
+ 69     return entry;
+ 70   }
+ 71 
+ 72   StringDedupEntry* remove_all() {
+ 73     StringDedupEntry* list = _list;
+ 74     _list = NULL;
+ 75     return list;
+ 76   }
+ 77 
+ 78   size_t length() {
+ 79     return _length;
+ 80   }
+ 81 };
+ 82 
+ 83 //
+ 84 // Cache of deduplication table entries. This cache provides fast allocation and
+ 85 // reuse of table entries to lower the pressure on the underlying allocator.
+ 86 // But more importantly, it provides fast/deferred freeing of table entries. This
+ 87 // is important because freeing of table entries is done during stop-the-world
+ 88 // phases and it is not uncommon for large number of entries to be freed at once.
+ 89 // Tables entries that are freed during these phases are placed onto a freelist in
+ 90 // the cache. The deduplication thread, which executes in a concurrent phase, will
+ 91 // later reuse or free the underlying memory for these entries.
+ 92 //
+ 93 // The cache allows for single-threaded allocations and multi-threaded frees.
+ 94 // Allocations are synchronized by StringDedupTable_lock as part of a table
+ 95 // modification.
+ 96 //
+ 97 class StringDedupEntryCache : public CHeapObj&lt;mtGC&gt; {
+ 98 private:
+ 99   // One cache/overflow list per GC worker to allow lock less freeing of
+100   // entries while doing a parallel scan of the table. Using PaddedEnd to
+101   // avoid false sharing.
+102   size_t                             _nlists;
+103   size_t                             _max_list_length;
+104   PaddedEnd&lt;StringDedupEntryList&gt;*   _cached;
+105   PaddedEnd&lt;StringDedupEntryList&gt;*   _overflowed;
+106 
+107 public:
+108   StringDedupEntryCache(size_t max_size);
+109   ~StringDedupEntryCache();
+110 
+111   // Set max number of table entries to cache.
+112   void set_max_size(size_t max_size);
+113 
+114   // Get a table entry from the cache, or allocate a new entry if the cache is empty.
+115   StringDedupEntry* alloc();
+116 
+117   // Insert a table entry into the cache.
+118   void free(StringDedupEntry* entry, uint worker_id);
+119 
+120   // Returns current number of entries in the cache.
+121   size_t size();
+122 
+123   // Deletes overflowed entries.
+124   void delete_overflowed();
+125 };
+126 
+127 StringDedupEntryCache::StringDedupEntryCache(size_t max_size) :
+128   _nlists(ParallelGCThreads),
+129   _max_list_length(0),
+130   _cached(PaddedArray&lt;StringDedupEntryList, mtGC&gt;::create_unfreeable((uint)_nlists)),
+131   _overflowed(PaddedArray&lt;StringDedupEntryList, mtGC&gt;::create_unfreeable((uint)_nlists)) {
+132   set_max_size(max_size);
+133 }
+134 
+135 StringDedupEntryCache::~StringDedupEntryCache() {
+136   ShouldNotReachHere();
+137 }
+138 
+139 void StringDedupEntryCache::set_max_size(size_t size) {
+140   _max_list_length = size / _nlists;
+141 }
+142 
+143 StringDedupEntry* StringDedupEntryCache::alloc() {
+144   for (size_t i = 0; i &lt; _nlists; i++) {
+145     StringDedupEntry* entry = _cached[i].remove();
+146     if (entry != NULL) {
+147       return entry;
+148     }
+149   }
+150   return new StringDedupEntry();
+151 }
+152 
+153 void StringDedupEntryCache::free(StringDedupEntry* entry, uint worker_id) {
+154   assert(entry-&gt;obj() != NULL, &quot;Double free&quot;);
+155   assert(worker_id &lt; _nlists, &quot;Invalid worker id&quot;);
+156 
+157   entry-&gt;set_obj(NULL);
+158   entry-&gt;set_hash(0);
+159 
+160   if (_cached[worker_id].length() &lt; _max_list_length) {
+161     // Cache is not full
+162     _cached[worker_id].add(entry);
+163   } else {
+164     // Cache is full, add to overflow list for later deletion
+165     _overflowed[worker_id].add(entry);
+166   }
+167 }
+168 
+169 size_t StringDedupEntryCache::size() {
+170   size_t size = 0;
+171   for (size_t i = 0; i &lt; _nlists; i++) {
+172     size += _cached[i].length();
+173   }
+174   return size;
+175 }
+176 
+177 void StringDedupEntryCache::delete_overflowed() {
+178   double start = os::elapsedTime();
+179   uintx count = 0;
+180 
+181   for (size_t i = 0; i &lt; _nlists; i++) {
+182     StringDedupEntry* entry;
+183 
+184     {
+185       // The overflow list can be modified during safepoints, therefore
+186       // we temporarily join the suspendible thread set while removing
+187       // all entries from the list.
+188       SuspendibleThreadSetJoiner sts_join;
+189       entry = _overflowed[i].remove_all();
+190     }
+191 
+192     // Delete all entries
+193     while (entry != NULL) {
+194       StringDedupEntry* next = entry-&gt;next();
+195       delete entry;
+196       entry = next;
+197       count++;
+198     }
+199   }
+200 
+201   double end = os::elapsedTime();
+202   log_trace(gc, stringdedup)(&quot;Deleted &quot; UINTX_FORMAT &quot; entries, &quot; STRDEDUP_TIME_FORMAT_MS,
+203                              count, STRDEDUP_TIME_PARAM_MS(end - start));
+204 }
+205 
+206 StringDedupTable*        StringDedupTable::_table = NULL;
+207 StringDedupEntryCache*   StringDedupTable::_entry_cache = NULL;
+208 
+209 const size_t             StringDedupTable::_min_size = (1 &lt;&lt; 10);   // 1024
+210 const size_t             StringDedupTable::_max_size = (1 &lt;&lt; 24);   // 16777216
+211 const double             StringDedupTable::_grow_load_factor = 2.0; // Grow table at 200% load
+212 const double             StringDedupTable::_shrink_load_factor = _grow_load_factor / 3.0; // Shrink table at 67% load
+213 const double             StringDedupTable::_max_cache_factor = 0.1; // Cache a maximum of 10% of the table size
+214 const uintx              StringDedupTable::_rehash_multiple = 60;   // Hash bucket has 60 times more collisions than expected
+215 const uintx              StringDedupTable::_rehash_threshold = (uintx)(_rehash_multiple * _grow_load_factor);
+216 
+217 uintx                    StringDedupTable::_entries_added = 0;
+218 volatile uintx           StringDedupTable::_entries_removed = 0;
+219 uintx                    StringDedupTable::_resize_count = 0;
+220 uintx                    StringDedupTable::_rehash_count = 0;
+221 
+222 StringDedupTable*        StringDedupTable::_resized_table = NULL;
+223 StringDedupTable*        StringDedupTable::_rehashed_table = NULL;
+224 volatile size_t          StringDedupTable::_claimed_index = 0;
+225 
+226 StringDedupTable::StringDedupTable(size_t size, jint hash_seed) :
+227   _size(size),
+228   _entries(0),
+229   _shrink_threshold((uintx)(size * _shrink_load_factor)),
+230   _grow_threshold((uintx)(size * _grow_load_factor)),
+231   _rehash_needed(false),
+232   _hash_seed(hash_seed) {
+233   assert(is_power_of_2(size), &quot;Table size must be a power of 2&quot;);
+234   _buckets = NEW_C_HEAP_ARRAY(StringDedupEntry*, _size, mtGC);
+235   memset(_buckets, 0, _size * sizeof(StringDedupEntry*));
+236 }
+237 
+238 StringDedupTable::~StringDedupTable() {
+239   FREE_C_HEAP_ARRAY(StringDedupEntry*, _buckets);
+240 }
+241 
+242 void StringDedupTable::create() {
+243   assert(_table == NULL, &quot;One string deduplication table allowed&quot;);
+244   _entry_cache = new StringDedupEntryCache(_min_size * _max_cache_factor);
+245   _table = new StringDedupTable(_min_size);
+246 }
+247 
+248 void StringDedupTable::add(typeArrayOop value, bool latin1, unsigned int hash, StringDedupEntry** list) {
+249   StringDedupEntry* entry = _entry_cache-&gt;alloc();
+250   entry-&gt;set_obj(value);
+251   entry-&gt;set_hash(hash);
+252   entry-&gt;set_latin1(latin1);
+253   entry-&gt;set_next(*list);
+254   *list = entry;
+255   _entries++;
+256 }
+257 
+258 void StringDedupTable::remove(StringDedupEntry** pentry, uint worker_id) {
+259   StringDedupEntry* entry = *pentry;
+260   *pentry = entry-&gt;next();
+261   _entry_cache-&gt;free(entry, worker_id);
+262 }
+263 
+264 void StringDedupTable::transfer(StringDedupEntry** pentry, StringDedupTable* dest) {
+265   StringDedupEntry* entry = *pentry;
+266   *pentry = entry-&gt;next();
+267   unsigned int hash = entry-&gt;hash();
+268   size_t index = dest-&gt;hash_to_index(hash);
+269   StringDedupEntry** list = dest-&gt;bucket(index);
+270   entry-&gt;set_next(*list);
+271   *list = entry;
+272 }
+273 
+274 typeArrayOop StringDedupTable::lookup(typeArrayOop value, bool latin1, unsigned int hash,
+275                                       StringDedupEntry** list, uintx &amp;count) {
+276   for (StringDedupEntry* entry = *list; entry != NULL; entry = entry-&gt;next()) {
+277     if (entry-&gt;hash() == hash &amp;&amp; entry-&gt;latin1() == latin1) {
+278       oop* obj_addr = (oop*)entry-&gt;obj_addr();
+279       oop obj = NativeAccess&lt;ON_PHANTOM_OOP_REF | AS_NO_KEEPALIVE&gt;::oop_load(obj_addr);
+280       if (java_lang_String::value_equals(value, static_cast&lt;typeArrayOop&gt;(obj))) {
+281         obj = NativeAccess&lt;ON_PHANTOM_OOP_REF&gt;::oop_load(obj_addr);
+282         return static_cast&lt;typeArrayOop&gt;(obj);
+283       }
+284     }
+285     count++;
+286   }
+287 
+288   // Not found
+289   return NULL;
+290 }
+291 
+292 typeArrayOop StringDedupTable::lookup_or_add_inner(typeArrayOop value, bool latin1, unsigned int hash) {
+293   size_t index = hash_to_index(hash);
+294   StringDedupEntry** list = bucket(index);
+295   uintx count = 0;
+296 
+297   // Lookup in list
+298   typeArrayOop existing_value = lookup(value, latin1, hash, list, count);
+299 
+300   // Check if rehash is needed
+301   if (count &gt; _rehash_threshold) {
+302     _rehash_needed = true;
+303   }
+304 
+305   if (existing_value == NULL) {
+306     // Not found, add new entry
+307     add(value, latin1, hash, list);
+308 
+309     // Update statistics
+310     _entries_added++;
+311   }
+312 
+313   return existing_value;
+314 }
+315 
+316 unsigned int StringDedupTable::hash_code(typeArrayOop value, bool latin1) {
+317   unsigned int hash;
+318   int length = value-&gt;length();
+319   if (latin1) {
+320     const jbyte* data = (jbyte*)value-&gt;base(T_BYTE);
+321     if (use_java_hash()) {
+322       hash = java_lang_String::hash_code(data, length);
+323     } else {
+324       hash = AltHashing::murmur3_32(_table-&gt;_hash_seed, data, length);
+325     }
+326   } else {
+327     length /= sizeof(jchar) / sizeof(jbyte); // Convert number of bytes to number of chars
+328     const jchar* data = (jchar*)value-&gt;base(T_CHAR);
+329     if (use_java_hash()) {
+330       hash = java_lang_String::hash_code(data, length);
+331     } else {
+332       hash = AltHashing::murmur3_32(_table-&gt;_hash_seed, data, length);
+333     }
+334   }
+335 
+336   return hash;
+337 }
+338 
+339 void StringDedupTable::deduplicate(oop java_string, StringDedupStat* stat) {
+340   assert(java_lang_String::is_instance(java_string), &quot;Must be a string&quot;);
+341   NoSafepointVerifier nsv;
+342 
+343   stat-&gt;inc_inspected();
+344 
+345   typeArrayOop value = java_lang_String::value(java_string);
+346   if (value == NULL) {
+347     // String has no value
+348     stat-&gt;inc_skipped();
+349     return;
+350   }
+351 
+352   bool latin1 = java_lang_String::is_latin1(java_string);
+353   unsigned int hash = 0;
+354 
+355   if (use_java_hash()) {
+356     if (!java_lang_String::hash_is_set(java_string)) {
+357       stat-&gt;inc_hashed();
+358     }
+359     hash = java_lang_String::hash_code(java_string);
+360   } else {
+361     // Compute hash
+362     hash = hash_code(value, latin1);
+363     stat-&gt;inc_hashed();
+364   }
+365 
+366   typeArrayOop existing_value = lookup_or_add(value, latin1, hash);
+367   if (existing_value == value) {
+368     // Same value, already known
+369     stat-&gt;inc_known();
+370     return;
+371   }
+372 
+373   // Get size of value array
+374   uintx size_in_bytes = value-&gt;size() * HeapWordSize;
+375   stat-&gt;inc_new(size_in_bytes);
+376 
+377   if (existing_value != NULL) {
+378     // Existing value found, deduplicate string
+379     java_lang_String::set_value(java_string, existing_value);
+380     stat-&gt;deduped(value, size_in_bytes);
+381   }
+382 }
+383 
+384 bool StringDedupTable::is_resizing() {
+385   return _resized_table != NULL;
+386 }
+387 
+388 bool StringDedupTable::is_rehashing() {
+389   return _rehashed_table != NULL;
+390 }
+391 
+392 StringDedupTable* StringDedupTable::prepare_resize() {
+393   size_t size = _table-&gt;_size;
+394 
+395   // Check if the hashtable needs to be resized
+396   if (_table-&gt;_entries &gt; _table-&gt;_grow_threshold) {
+397     // Grow table, double the size
+398     size *= 2;
+399     if (size &gt; _max_size) {
+400       // Too big, don&#39;t resize
+401       return NULL;
+402     }
+403   } else if (_table-&gt;_entries &lt; _table-&gt;_shrink_threshold) {
+404     // Shrink table, half the size
+405     size /= 2;
+406     if (size &lt; _min_size) {
+407       // Too small, don&#39;t resize
+408       return NULL;
+409     }
+410   } else if (StringDeduplicationResizeALot) {
+411     // Force grow
+412     size *= 2;
+413     if (size &gt; _max_size) {
+414       // Too big, force shrink instead
+415       size /= 4;
+416     }
+417   } else {
+418     // Resize not needed
+419     return NULL;
+420   }
+421 
+422   // Update statistics
+423   _resize_count++;
+424 
+425   // Update max cache size
+426   _entry_cache-&gt;set_max_size(size * _max_cache_factor);
+427 
+428   // Allocate the new table. The new table will be populated by workers
+429   // calling unlink_or_oops_do() and finally installed by finish_resize().
+430   return new StringDedupTable(size, _table-&gt;_hash_seed);
+431 }
+432 
+433 void StringDedupTable::finish_resize(StringDedupTable* resized_table) {
+434   assert(resized_table != NULL, &quot;Invalid table&quot;);
+435 
+436   resized_table-&gt;_entries = _table-&gt;_entries;
+437 
+438   // Free old table
+439   delete _table;
+440 
+441   // Install new table
+442   _table = resized_table;
+443 }
+444 
+445 void StringDedupTable::unlink_or_oops_do(StringDedupUnlinkOrOopsDoClosure* cl, uint worker_id) {
+446   // The table is divided into partitions to allow lock-less parallel processing by
+447   // multiple worker threads. A worker thread first claims a partition, which ensures
+448   // exclusive access to that part of the table, then continues to process it. To allow
+449   // shrinking of the table in parallel we also need to make sure that the same worker
+450   // thread processes all partitions where entries will hash to the same destination
+451   // partition. Since the table size is always a power of two and we always shrink by
+452   // dividing the table in half, we know that for a given partition there is only one
+453   // other partition whoes entries will hash to the same destination partition. That
+454   // other partition is always the sibling partition in the second half of the table.
+455   // For example, if the table is divided into 8 partitions, the sibling of partition 0
+456   // is partition 4, the sibling of partition 1 is partition 5, etc.
+457   size_t table_half = _table-&gt;_size / 2;
+458 
+459   // Let each partition be one page worth of buckets
+460   size_t partition_size = MIN2(table_half, os::vm_page_size() / sizeof(StringDedupEntry*));
+461   assert(table_half % partition_size == 0, &quot;Invalid partition size&quot;);
+462 
+463   // Number of entries removed during the scan
+464   uintx removed = 0;
+465 
+466   for (;;) {
+467     // Grab next partition to scan
+468     size_t partition_begin = claim_table_partition(partition_size);
+469     size_t partition_end = partition_begin + partition_size;
+470     if (partition_begin &gt;= table_half) {
+471       // End of table
+472       break;
+473     }
+474 
+475     // Scan the partition followed by the sibling partition in the second half of the table
+476     removed += unlink_or_oops_do(cl, partition_begin, partition_end, worker_id);
+477     removed += unlink_or_oops_do(cl, table_half + partition_begin, table_half + partition_end, worker_id);
+478   }
+479 
+480   // Do atomic update here instead of taking StringDedupTable_lock. This allows concurrent
+481   // cleanup when multiple workers are cleaning up the table, while the mutators are blocked
+482   // on StringDedupTable_lock.
+483   if (removed &gt; 0) {
+484     assert_locked_or_safepoint_weak(StringDedupTable_lock);
+485     Atomic::sub(&amp;_table-&gt;_entries, removed);
+486     Atomic::add(&amp;_entries_removed, removed);
+487   }
+488 }
+489 
+490 uintx StringDedupTable::unlink_or_oops_do(StringDedupUnlinkOrOopsDoClosure* cl,
+491                                           size_t partition_begin,
+492                                           size_t partition_end,
+493                                           uint worker_id) {
+494   uintx removed = 0;
+495   for (size_t bucket = partition_begin; bucket &lt; partition_end; bucket++) {
+496     StringDedupEntry** entry = _table-&gt;bucket(bucket);
+497     while (*entry != NULL) {
+498       oop* p = (oop*)(*entry)-&gt;obj_addr();
+499       if (cl-&gt;is_alive(*p)) {
+500         cl-&gt;keep_alive(p);
+501         if (is_resizing()) {
+502           // We are resizing the table, transfer entry to the new table
+503           _table-&gt;transfer(entry, _resized_table);
+504         } else {
+505           if (is_rehashing()) {
+506             // We are rehashing the table, rehash the entry but keep it
+507             // in the table. We can&#39;t transfer entries into the new table
+508             // at this point since we don&#39;t have exclusive access to all
+509             // destination partitions. finish_rehash() will do a single
+510             // threaded transfer of all entries.
+511             typeArrayOop value = (typeArrayOop)*p;
+512             bool latin1 = (*entry)-&gt;latin1();
+513             unsigned int hash = hash_code(value, latin1);
+514             (*entry)-&gt;set_hash(hash);
+515           }
+516 
+517           // Move to next entry
+518           entry = (*entry)-&gt;next_addr();
+519         }
+520       } else {
+521         // Not alive, remove entry from table
+522         _table-&gt;remove(entry, worker_id);
+523         removed++;
+524       }
+525     }
+526   }
+527 
+528   return removed;
+529 }
+530 
+531 void StringDedupTable::gc_prologue(bool resize_and_rehash_table) {
+532   assert(!is_resizing() &amp;&amp; !is_rehashing(), &quot;Already in progress?&quot;);
+533 
+534   _claimed_index = 0;
+535   if (resize_and_rehash_table) {
+536     // If both resize and rehash is needed, only do resize. Rehash of
+537     // the table will eventually happen if the situation persists.
+538     _resized_table = StringDedupTable::prepare_resize();
+539     if (!is_resizing()) {
+540       _rehashed_table = StringDedupTable::prepare_rehash();
+541     }
+542   }
+543 }
+544 
+545 void StringDedupTable::gc_epilogue() {
+546   assert(!is_resizing() || !is_rehashing(), &quot;Can not both resize and rehash&quot;);
+547   assert(_claimed_index &gt;= _table-&gt;_size / 2 || _claimed_index == 0, &quot;All or nothing&quot;);
+548 
+549   if (is_resizing()) {
+550     StringDedupTable::finish_resize(_resized_table);
+551     _resized_table = NULL;
+552   } else if (is_rehashing()) {
+553     StringDedupTable::finish_rehash(_rehashed_table);
+554     _rehashed_table = NULL;
+555   }
+556 }
+557 
+558 StringDedupTable* StringDedupTable::prepare_rehash() {
+559   if (!_table-&gt;_rehash_needed &amp;&amp; !StringDeduplicationRehashALot) {
+560     // Rehash not needed
+561     return NULL;
+562   }
+563 
+564   // Update statistics
+565   _rehash_count++;
+566 
+567   // Compute new hash seed
+568   _table-&gt;_hash_seed = AltHashing::compute_seed();
+569 
+570   // Allocate the new table, same size and hash seed
+571   return new StringDedupTable(_table-&gt;_size, _table-&gt;_hash_seed);
+572 }
+573 
+574 void StringDedupTable::finish_rehash(StringDedupTable* rehashed_table) {
+575   assert(rehashed_table != NULL, &quot;Invalid table&quot;);
+576 
+577   // Move all newly rehashed entries into the correct buckets in the new table
+578   for (size_t bucket = 0; bucket &lt; _table-&gt;_size; bucket++) {
+579     StringDedupEntry** entry = _table-&gt;bucket(bucket);
+580     while (*entry != NULL) {
+581       _table-&gt;transfer(entry, rehashed_table);
+582     }
+583   }
+584 
+585   rehashed_table-&gt;_entries = _table-&gt;_entries;
+586 
+587   // Free old table
+588   delete _table;
+589 
+590   // Install new table
+591   _table = rehashed_table;
+592 }
+593 
+594 size_t StringDedupTable::claim_table_partition(size_t partition_size) {
+595   return Atomic::fetch_and_add(&amp;_claimed_index, partition_size);
+596 }
+597 
+598 void StringDedupTable::verify() {
+599   for (size_t bucket = 0; bucket &lt; _table-&gt;_size; bucket++) {
+600     // Verify entries
+601     StringDedupEntry** entry = _table-&gt;bucket(bucket);
+602     while (*entry != NULL) {
+603       typeArrayOop value = (*entry)-&gt;obj();
+604       guarantee(value != NULL, &quot;Object must not be NULL&quot;);
+605       guarantee(Universe::heap()-&gt;is_in(value), &quot;Object must be on the heap&quot;);
+606       guarantee(!value-&gt;is_forwarded(), &quot;Object must not be forwarded&quot;);
+607       guarantee(value-&gt;is_typeArray(), &quot;Object must be a typeArrayOop&quot;);
+608       bool latin1 = (*entry)-&gt;latin1();
+609       unsigned int hash = hash_code(value, latin1);
+610       guarantee((*entry)-&gt;hash() == hash, &quot;Table entry has inorrect hash&quot;);
+611       guarantee(_table-&gt;hash_to_index(hash) == bucket, &quot;Table entry has incorrect index&quot;);
+612       entry = (*entry)-&gt;next_addr();
+613     }
+614 
+615     // Verify that we do not have entries with identical oops or identical arrays.
+616     // We only need to compare entries in the same bucket. If the same oop or an
+617     // identical array has been inserted more than once into different/incorrect
+618     // buckets the verification step above will catch that.
+619     StringDedupEntry** entry1 = _table-&gt;bucket(bucket);
+620     while (*entry1 != NULL) {
+621       typeArrayOop value1 = (*entry1)-&gt;obj();
+622       bool latin1_1 = (*entry1)-&gt;latin1();
+623       StringDedupEntry** entry2 = (*entry1)-&gt;next_addr();
+624       while (*entry2 != NULL) {
+625         typeArrayOop value2 = (*entry2)-&gt;obj();
+626         bool latin1_2 = (*entry2)-&gt;latin1();
+627         guarantee(latin1_1 != latin1_2 || !java_lang_String::value_equals(value1, value2), &quot;Table entries must not have identical arrays&quot;);
+628         entry2 = (*entry2)-&gt;next_addr();
+629       }
+630       entry1 = (*entry1)-&gt;next_addr();
+631     }
+632   }
+633 }
+634 
+635 void StringDedupTable::clean_entry_cache() {
+636   _entry_cache-&gt;delete_overflowed();
+637 }
+638 
+639 void StringDedupTable::print_statistics() {
+640   Log(gc, stringdedup) log;
+641   log.debug(&quot;  Table&quot;);
+642   log.debug(&quot;    Memory Usage: &quot; STRDEDUP_BYTES_FORMAT_NS,
+643             STRDEDUP_BYTES_PARAM(_table-&gt;_size * sizeof(StringDedupEntry*) + (_table-&gt;_entries + _entry_cache-&gt;size()) * sizeof(StringDedupEntry)));
+644   log.debug(&quot;    Size: &quot; SIZE_FORMAT &quot;, Min: &quot; SIZE_FORMAT &quot;, Max: &quot; SIZE_FORMAT, _table-&gt;_size, _min_size, _max_size);
+645   log.debug(&quot;    Entries: &quot; UINTX_FORMAT &quot;, Load: &quot; STRDEDUP_PERCENT_FORMAT_NS &quot;, Cached: &quot; UINTX_FORMAT &quot;, Added: &quot; UINTX_FORMAT &quot;, Removed: &quot; UINTX_FORMAT,
+646             _table-&gt;_entries, percent_of((size_t)_table-&gt;_entries, _table-&gt;_size), _entry_cache-&gt;size(), _entries_added, _entries_removed);
+647   log.debug(&quot;    Resize Count: &quot; UINTX_FORMAT &quot;, Shrink Threshold: &quot; UINTX_FORMAT &quot;(&quot; STRDEDUP_PERCENT_FORMAT_NS &quot;), Grow Threshold: &quot; UINTX_FORMAT &quot;(&quot; STRDEDUP_PERCENT_FORMAT_NS &quot;)&quot;,
+648             _resize_count, _table-&gt;_shrink_threshold, _shrink_load_factor * 100.0, _table-&gt;_grow_threshold, _grow_load_factor * 100.0);
+649   log.debug(&quot;    Rehash Count: &quot; UINTX_FORMAT &quot;, Rehash Threshold: &quot; UINTX_FORMAT &quot;, Hash Seed: 0x%x&quot;, _rehash_count, _rehash_threshold, _table-&gt;_hash_seed);
+650   log.debug(&quot;    Age Threshold: &quot; UINTX_FORMAT, StringDeduplicationAgeThreshold);
+651 }
+<a name="2" id="anc2"></a><b style="font-size: large; color: red">--- EOF ---</b>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+</pre>
+<input id="eof" value="2" type="hidden" />
+</body>
+</html>
