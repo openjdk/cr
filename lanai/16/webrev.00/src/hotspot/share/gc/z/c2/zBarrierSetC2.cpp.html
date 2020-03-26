@@ -1,0 +1,490 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>New src/hotspot/share/gc/z/c2/zBarrierSetC2.cpp</title>
+    <link rel="stylesheet" href="../../../../../../style.css" />
+  </head>
+  <body>
+    <pre>
+  1 /*
+  2  * Copyright (c) 2015, 2019, Oracle and/or its affiliates. All rights reserved.
+  3  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  4  *
+  5  * This code is free software; you can redistribute it and/or modify it
+  6  * under the terms of the GNU General Public License version 2 only, as
+  7  * published by the Free Software Foundation.
+  8  *
+  9  * This code is distributed in the hope that it will be useful, but WITHOUT
+ 10  * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ 11  * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ 12  * version 2 for more details (a copy is included in the LICENSE file that
+ 13  * accompanied this code).
+ 14  *
+ 15  * You should have received a copy of the GNU General Public License version
+ 16  * 2 along with this work; if not, write to the Free Software Foundation,
+ 17  * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ 18  *
+ 19  * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ 20  * or visit www.oracle.com if you need additional information or have any
+ 21  * questions.
+ 22  */
+ 23 
+ 24 #include &quot;precompiled.hpp&quot;
+ 25 #include &quot;classfile/javaClasses.hpp&quot;
+ 26 #include &quot;gc/z/c2/zBarrierSetC2.hpp&quot;
+ 27 #include &quot;gc/z/zBarrierSet.hpp&quot;
+ 28 #include &quot;gc/z/zBarrierSetAssembler.hpp&quot;
+ 29 #include &quot;gc/z/zBarrierSetRuntime.hpp&quot;
+ 30 #include &quot;opto/arraycopynode.hpp&quot;
+ 31 #include &quot;opto/addnode.hpp&quot;
+ 32 #include &quot;opto/block.hpp&quot;
+ 33 #include &quot;opto/compile.hpp&quot;
+ 34 #include &quot;opto/graphKit.hpp&quot;
+ 35 #include &quot;opto/machnode.hpp&quot;
+ 36 #include &quot;opto/macro.hpp&quot;
+ 37 #include &quot;opto/memnode.hpp&quot;
+ 38 #include &quot;opto/node.hpp&quot;
+ 39 #include &quot;opto/output.hpp&quot;
+ 40 #include &quot;opto/regalloc.hpp&quot;
+ 41 #include &quot;opto/rootnode.hpp&quot;
+ 42 #include &quot;opto/type.hpp&quot;
+ 43 #include &quot;utilities/growableArray.hpp&quot;
+ 44 #include &quot;utilities/macros.hpp&quot;
+ 45 
+ 46 class ZBarrierSetC2State : public ResourceObj {
+ 47 private:
+ 48   GrowableArray&lt;ZLoadBarrierStubC2*&gt;* _stubs;
+ 49   Node_Array                          _live;
+ 50 
+ 51 public:
+ 52   ZBarrierSetC2State(Arena* arena) :
+ 53     _stubs(new (arena) GrowableArray&lt;ZLoadBarrierStubC2*&gt;(arena, 8,  0, NULL)),
+ 54     _live(arena) {}
+ 55 
+ 56   GrowableArray&lt;ZLoadBarrierStubC2*&gt;* stubs() {
+ 57     return _stubs;
+ 58   }
+ 59 
+ 60   RegMask* live(const Node* node) {
+ 61     if (!node-&gt;is_Mach()) {
+ 62       // Don&#39;t need liveness for non-MachNodes
+ 63       return NULL;
+ 64     }
+ 65 
+ 66     const MachNode* const mach = node-&gt;as_Mach();
+ 67     if (mach-&gt;barrier_data() != ZLoadBarrierStrong &amp;&amp;
+ 68         mach-&gt;barrier_data() != ZLoadBarrierWeak) {
+ 69       // Don&#39;t need liveness data for nodes without barriers
+ 70       return NULL;
+ 71     }
+ 72 
+ 73     RegMask* live = (RegMask*)_live[node-&gt;_idx];
+ 74     if (live == NULL) {
+ 75       live = new (Compile::current()-&gt;comp_arena()-&gt;Amalloc_D(sizeof(RegMask))) RegMask();
+ 76       _live.map(node-&gt;_idx, (Node*)live);
+ 77     }
+ 78 
+ 79     return live;
+ 80   }
+ 81 };
+ 82 
+ 83 static ZBarrierSetC2State* barrier_set_state() {
+ 84   return reinterpret_cast&lt;ZBarrierSetC2State*&gt;(Compile::current()-&gt;barrier_set_state());
+ 85 }
+ 86 
+ 87 ZLoadBarrierStubC2* ZLoadBarrierStubC2::create(const MachNode* node, Address ref_addr, Register ref, Register tmp, bool weak) {
+ 88   ZLoadBarrierStubC2* const stub = new (Compile::current()-&gt;comp_arena()) ZLoadBarrierStubC2(node, ref_addr, ref, tmp, weak);
+ 89   if (!Compile::current()-&gt;output()-&gt;in_scratch_emit_size()) {
+ 90     barrier_set_state()-&gt;stubs()-&gt;append(stub);
+ 91   }
+ 92 
+ 93   return stub;
+ 94 }
+ 95 
+ 96 ZLoadBarrierStubC2::ZLoadBarrierStubC2(const MachNode* node, Address ref_addr, Register ref, Register tmp, bool weak) :
+ 97     _node(node),
+ 98     _ref_addr(ref_addr),
+ 99     _ref(ref),
+100     _tmp(tmp),
+101     _weak(weak),
+102     _entry(),
+103     _continuation() {
+104   assert_different_registers(ref, ref_addr.base());
+105   assert_different_registers(ref, ref_addr.index());
+106 }
+107 
+108 Address ZLoadBarrierStubC2::ref_addr() const {
+109   return _ref_addr;
+110 }
+111 
+112 Register ZLoadBarrierStubC2::ref() const {
+113   return _ref;
+114 }
+115 
+116 Register ZLoadBarrierStubC2::tmp() const {
+117   return _tmp;
+118 }
+119 
+120 address ZLoadBarrierStubC2::slow_path() const {
+121   const DecoratorSet decorators = _weak ? ON_WEAK_OOP_REF : ON_STRONG_OOP_REF;
+122   return ZBarrierSetRuntime::load_barrier_on_oop_field_preloaded_addr(decorators);
+123 }
+124 
+125 RegMask&amp; ZLoadBarrierStubC2::live() const {
+126   return *barrier_set_state()-&gt;live(_node);
+127 }
+128 
+129 Label* ZLoadBarrierStubC2::entry() {
+130   // The _entry will never be bound when in_scratch_emit_size() is true.
+131   // However, we still need to return a label that is not bound now, but
+132   // will eventually be bound. Any lable will do, as it will only act as
+133   // a placeholder, so we return the _continuation label.
+134   return Compile::current()-&gt;output()-&gt;in_scratch_emit_size() ? &amp;_continuation : &amp;_entry;
+135 }
+136 
+137 Label* ZLoadBarrierStubC2::continuation() {
+138   return &amp;_continuation;
+139 }
+140 
+141 void* ZBarrierSetC2::create_barrier_state(Arena* comp_arena) const {
+142   return new (comp_arena) ZBarrierSetC2State(comp_arena);
+143 }
+144 
+145 void ZBarrierSetC2::late_barrier_analysis() const {
+146   analyze_dominating_barriers();
+147   compute_liveness_at_stubs();
+148 }
+149 
+150 void ZBarrierSetC2::emit_stubs(CodeBuffer&amp; cb) const {
+151   MacroAssembler masm(&amp;cb);
+152   GrowableArray&lt;ZLoadBarrierStubC2*&gt;* const stubs = barrier_set_state()-&gt;stubs();
+153 
+154   for (int i = 0; i &lt; stubs-&gt;length(); i++) {
+155     // Make sure there is enough space in the code buffer
+156     if (cb.insts()-&gt;maybe_expand_to_ensure_remaining(PhaseOutput::MAX_inst_size) &amp;&amp; cb.blob() == NULL) {
+157       ciEnv::current()-&gt;record_failure(&quot;CodeCache is full&quot;);
+158       return;
+159     }
+160 
+161     ZBarrierSet::assembler()-&gt;generate_c2_load_barrier_stub(&amp;masm, stubs-&gt;at(i));
+162   }
+163 
+164   masm.flush();
+165 }
+166 
+167 int ZBarrierSetC2::estimate_stub_size() const {
+168   Compile* const C = Compile::current();
+169   BufferBlob* const blob = C-&gt;output()-&gt;scratch_buffer_blob();
+170   GrowableArray&lt;ZLoadBarrierStubC2*&gt;* const stubs = barrier_set_state()-&gt;stubs();
+171   int size = 0;
+172 
+173   for (int i = 0; i &lt; stubs-&gt;length(); i++) {
+174     CodeBuffer cb(blob-&gt;content_begin(), (address)C-&gt;output()-&gt;scratch_locs_memory() - blob-&gt;content_begin());
+175     MacroAssembler masm(&amp;cb);
+176     ZBarrierSet::assembler()-&gt;generate_c2_load_barrier_stub(&amp;masm, stubs-&gt;at(i));
+177     size += cb.insts_size();
+178   }
+179 
+180   return size;
+181 }
+182 
+183 static void set_barrier_data(C2Access&amp; access) {
+184   if (ZBarrierSet::barrier_needed(access.decorators(), access.type())) {
+185     if (access.decorators() &amp; ON_WEAK_OOP_REF) {
+186       access.set_barrier_data(ZLoadBarrierWeak);
+187     } else {
+188       access.set_barrier_data(ZLoadBarrierStrong);
+189     }
+190   }
+191 }
+192 
+193 Node* ZBarrierSetC2::load_at_resolved(C2Access&amp; access, const Type* val_type) const {
+194   set_barrier_data(access);
+195   return BarrierSetC2::load_at_resolved(access, val_type);
+196 }
+197 
+198 Node* ZBarrierSetC2::atomic_cmpxchg_val_at_resolved(C2AtomicParseAccess&amp; access, Node* expected_val,
+199                                                     Node* new_val, const Type* val_type) const {
+200   set_barrier_data(access);
+201   return BarrierSetC2::atomic_cmpxchg_val_at_resolved(access, expected_val, new_val, val_type);
+202 }
+203 
+204 Node* ZBarrierSetC2::atomic_cmpxchg_bool_at_resolved(C2AtomicParseAccess&amp; access, Node* expected_val,
+205                                                      Node* new_val, const Type* value_type) const {
+206   set_barrier_data(access);
+207   return BarrierSetC2::atomic_cmpxchg_bool_at_resolved(access, expected_val, new_val, value_type);
+208 }
+209 
+210 Node* ZBarrierSetC2::atomic_xchg_at_resolved(C2AtomicParseAccess&amp; access, Node* new_val, const Type* val_type) const {
+211   set_barrier_data(access);
+212   return BarrierSetC2::atomic_xchg_at_resolved(access, new_val, val_type);
+213 }
+214 
+215 bool ZBarrierSetC2::array_copy_requires_gc_barriers(bool tightly_coupled_alloc, BasicType type,
+216                                                     bool is_clone, ArrayCopyPhase phase) const {
+217   return type == T_OBJECT || type == T_ARRAY;
+218 }
+219 
+220 // This TypeFunc assumes a 64bit system
+221 static const TypeFunc* clone_type() {
+222   // Create input type (domain)
+223   const Type** domain_fields = TypeTuple::fields(4);
+224   domain_fields[TypeFunc::Parms + 0] = TypeInstPtr::NOTNULL;  // src
+225   domain_fields[TypeFunc::Parms + 1] = TypeInstPtr::NOTNULL;  // dst
+226   domain_fields[TypeFunc::Parms + 2] = TypeLong::LONG;        // size lower
+227   domain_fields[TypeFunc::Parms + 3] = Type::HALF;            // size upper
+228   const TypeTuple* domain = TypeTuple::make(TypeFunc::Parms + 4, domain_fields);
+229 
+230   // Create result type (range)
+231   const Type** range_fields = TypeTuple::fields(0);
+232   const TypeTuple* range = TypeTuple::make(TypeFunc::Parms + 0, range_fields);
+233 
+234   return TypeFunc::make(domain, range);
+235 }
+236 
+237 void ZBarrierSetC2::clone_at_expansion(PhaseMacroExpand* phase, ArrayCopyNode* ac) const {
+238   Node* const src = ac-&gt;in(ArrayCopyNode::Src);
+239   if (ac-&gt;is_clone_array()) {
+240     // Clone primitive array
+241     BarrierSetC2::clone_at_expansion(phase, ac);
+242     return;
+243   }
+244 
+245   // Clone instance
+246   Node* const ctrl       = ac-&gt;in(TypeFunc::Control);
+247   Node* const mem        = ac-&gt;in(TypeFunc::Memory);
+248   Node* const dst        = ac-&gt;in(ArrayCopyNode::Dest);
+249   Node* const size       = ac-&gt;in(ArrayCopyNode::Length);
+250 
+251   assert(ac-&gt;is_clone_inst(), &quot;Sanity check&quot;);
+252   assert(size-&gt;bottom_type()-&gt;is_long(), &quot;Should be long&quot;);
+253 
+254   // The native clone we are calling here expects the instance size in words
+255   // Add header/offset size to payload size to get instance size.
+256   Node* const base_offset = phase-&gt;longcon(arraycopy_payload_base_offset(false) &gt;&gt; LogBytesPerLong);
+257   Node* const full_size = phase-&gt;transform_later(new AddLNode(size, base_offset));
+258 
+259   Node* const call = phase-&gt;make_leaf_call(ctrl,
+260                                            mem,
+261                                            clone_type(),
+262                                            ZBarrierSetRuntime::clone_addr(),
+263                                            &quot;ZBarrierSetRuntime::clone&quot;,
+264                                            TypeRawPtr::BOTTOM,
+265                                            src,
+266                                            dst,
+267                                            full_size,
+268                                            phase-&gt;top());
+269   phase-&gt;transform_later(call);
+270   phase-&gt;igvn().replace_node(ac, call);
+271 }
+272 
+273 // == Dominating barrier elision ==
+274 
+275 static bool block_has_safepoint(const Block* block, uint from, uint to) {
+276   for (uint i = from; i &lt; to; i++) {
+277     if (block-&gt;get_node(i)-&gt;is_MachSafePoint()) {
+278       // Safepoint found
+279       return true;
+280     }
+281   }
+282 
+283   // Safepoint not found
+284   return false;
+285 }
+286 
+287 static bool block_has_safepoint(const Block* block) {
+288   return block_has_safepoint(block, 0, block-&gt;number_of_nodes());
+289 }
+290 
+291 static uint block_index(const Block* block, const Node* node) {
+292   for (uint j = 0; j &lt; block-&gt;number_of_nodes(); ++j) {
+293     if (block-&gt;get_node(j) == node) {
+294       return j;
+295     }
+296   }
+297   ShouldNotReachHere();
+298   return 0;
+299 }
+300 
+301 void ZBarrierSetC2::analyze_dominating_barriers() const {
+302   ResourceMark rm;
+303   Compile* const C = Compile::current();
+304   PhaseCFG* const cfg = C-&gt;cfg();
+305   Block_List worklist;
+306   Node_List mem_ops;
+307   Node_List barrier_loads;
+308 
+309   // Step 1 - Find accesses, and track them in lists
+310   for (uint i = 0; i &lt; cfg-&gt;number_of_blocks(); ++i) {
+311     const Block* const block = cfg-&gt;get_block(i);
+312     for (uint j = 0; j &lt; block-&gt;number_of_nodes(); ++j) {
+313       const Node* const node = block-&gt;get_node(j);
+314       if (!node-&gt;is_Mach()) {
+315         continue;
+316       }
+317 
+318       MachNode* const mach = node-&gt;as_Mach();
+319       switch (mach-&gt;ideal_Opcode()) {
+320       case Op_LoadP:
+321       case Op_CompareAndExchangeP:
+322       case Op_CompareAndSwapP:
+323       case Op_GetAndSetP:
+324         if (mach-&gt;barrier_data() == ZLoadBarrierStrong) {
+325           barrier_loads.push(mach);
+326         }
+327       case Op_StoreP:
+328         mem_ops.push(mach);
+329         break;
+330 
+331       default:
+332         break;
+333       }
+334     }
+335   }
+336 
+337   // Step 2 - Find dominating accesses for each load
+338   for (uint i = 0; i &lt; barrier_loads.size(); i++) {
+339     MachNode* const load = barrier_loads.at(i)-&gt;as_Mach();
+340     const TypePtr* load_adr_type = NULL;
+341     intptr_t load_offset = 0;
+342     const Node* const load_obj = load-&gt;get_base_and_disp(load_offset, load_adr_type);
+343     Block* const load_block = cfg-&gt;get_block_for_node(load);
+344     const uint load_index = block_index(load_block, load);
+345 
+346     for (uint j = 0; j &lt; mem_ops.size(); j++) {
+347       MachNode* mem = mem_ops.at(j)-&gt;as_Mach();
+348       const TypePtr* mem_adr_type = NULL;
+349       intptr_t mem_offset = 0;
+350       const Node* mem_obj = mem-&gt;get_base_and_disp(mem_offset, mem_adr_type);
+351       Block* mem_block = cfg-&gt;get_block_for_node(mem);
+352       uint mem_index = block_index(mem_block, mem);
+353 
+354       if (load_obj == NodeSentinel || mem_obj == NodeSentinel ||
+355           load_obj == NULL || mem_obj == NULL ||
+356           load_offset &lt; 0 || mem_offset &lt; 0) {
+357         continue;
+358       }
+359 
+360       if (mem_obj != load_obj || mem_offset != load_offset) {
+361         // Not the same addresses, not a candidate
+362         continue;
+363       }
+364 
+365       if (load_block == mem_block) {
+366         // Earlier accesses in the same block
+367         if (mem_index &lt; load_index &amp;&amp; !block_has_safepoint(mem_block, mem_index + 1, load_index)) {
+368           load-&gt;set_barrier_data(ZLoadBarrierElided);
+369         }
+370       } else if (mem_block-&gt;dominates(load_block)) {
+371         // Dominating block? Look around for safepoints
+372         ResourceMark rm;
+373         Block_List stack;
+374         VectorSet visited(Thread::current()-&gt;resource_area());
+375         stack.push(load_block);
+376         bool safepoint_found = block_has_safepoint(load_block);
+377         while (!safepoint_found &amp;&amp; stack.size() &gt; 0) {
+378           Block* block = stack.pop();
+379           if (visited.test_set(block-&gt;_pre_order)) {
+380             continue;
+381           }
+382           if (block_has_safepoint(block)) {
+383             safepoint_found = true;
+384             break;
+385           }
+386           if (block == mem_block) {
+387             continue;
+388           }
+389 
+390           // Push predecessor blocks
+391           for (uint p = 1; p &lt; block-&gt;num_preds(); ++p) {
+392             Block* pred = cfg-&gt;get_block_for_node(block-&gt;pred(p));
+393             stack.push(pred);
+394           }
+395         }
+396 
+397         if (!safepoint_found) {
+398           load-&gt;set_barrier_data(ZLoadBarrierElided);
+399         }
+400       }
+401     }
+402   }
+403 }
+404 
+405 // == Reduced spilling optimization ==
+406 
+407 void ZBarrierSetC2::compute_liveness_at_stubs() const {
+408   ResourceMark rm;
+409   Compile* const C = Compile::current();
+410   Arena* const A = Thread::current()-&gt;resource_area();
+411   PhaseCFG* const cfg = C-&gt;cfg();
+412   PhaseRegAlloc* const regalloc = C-&gt;regalloc();
+413   RegMask* const live = NEW_ARENA_ARRAY(A, RegMask, cfg-&gt;number_of_blocks() * sizeof(RegMask));
+414   ZBarrierSetAssembler* const bs = ZBarrierSet::assembler();
+415   Block_List worklist;
+416 
+417   for (uint i = 0; i &lt; cfg-&gt;number_of_blocks(); ++i) {
+418     new ((void*)(live + i)) RegMask();
+419     worklist.push(cfg-&gt;get_block(i));
+420   }
+421 
+422   while (worklist.size() &gt; 0) {
+423     const Block* const block = worklist.pop();
+424     RegMask&amp; old_live = live[block-&gt;_pre_order];
+425     RegMask new_live;
+426 
+427     // Initialize to union of successors
+428     for (uint i = 0; i &lt; block-&gt;_num_succs; i++) {
+429       const uint succ_id = block-&gt;_succs[i]-&gt;_pre_order;
+430       new_live.OR(live[succ_id]);
+431     }
+432 
+433     // Walk block backwards, computing liveness
+434     for (int i = block-&gt;number_of_nodes() - 1; i &gt;= 0; --i) {
+435       const Node* const node = block-&gt;get_node(i);
+436 
+437       // Remove def bits
+438       const OptoReg::Name first = bs-&gt;refine_register(node, regalloc-&gt;get_reg_first(node));
+439       const OptoReg::Name second = bs-&gt;refine_register(node, regalloc-&gt;get_reg_second(node));
+440       if (first != OptoReg::Bad) {
+441         new_live.Remove(first);
+442       }
+443       if (second != OptoReg::Bad) {
+444         new_live.Remove(second);
+445       }
+446 
+447       // Add use bits
+448       for (uint j = 1; j &lt; node-&gt;req(); ++j) {
+449         const Node* const use = node-&gt;in(j);
+450         const OptoReg::Name first = bs-&gt;refine_register(use, regalloc-&gt;get_reg_first(use));
+451         const OptoReg::Name second = bs-&gt;refine_register(use, regalloc-&gt;get_reg_second(use));
+452         if (first != OptoReg::Bad) {
+453           new_live.Insert(first);
+454         }
+455         if (second != OptoReg::Bad) {
+456           new_live.Insert(second);
+457         }
+458       }
+459 
+460       // If this node tracks liveness, update it
+461       RegMask* const regs = barrier_set_state()-&gt;live(node);
+462       if (regs != NULL) {
+463         regs-&gt;OR(new_live);
+464       }
+465     }
+466 
+467     // Now at block top, see if we have any changes
+468     new_live.SUBTRACT(old_live);
+469     if (new_live.is_NotEmpty()) {
+470       // Liveness has refined, update and propagate to prior blocks
+471       old_live.OR(new_live);
+472       for (uint i = 1; i &lt; block-&gt;num_preds(); ++i) {
+473         Block* const pred = cfg-&gt;get_block_for_node(block-&gt;pred(i));
+474         worklist.push(pred);
+475       }
+476     }
+477   }
+478 }
+    </pre>
+  </body>
+</html>
