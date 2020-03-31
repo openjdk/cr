@@ -1,0 +1,1204 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Frames src/hotspot/share/aot/aotCodeHeap.cpp</title>
+    <link rel="stylesheet" href="../../../../style.css" />
+    <script type="text/javascript" src="../../../../navigation.js"></script>
+  </head>
+<body onkeypress="keypress(event);">
+<a name="0"></a>
+<hr />
+<pre>   1 /*
+   2  * Copyright (c) 2016, 2020, Oracle and/or its affiliates. All rights reserved.
+   3  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+   4  *
+   5  * This code is free software; you can redistribute it and/or modify it
+   6  * under the terms of the GNU General Public License version 2 only, as
+   7  * published by the Free Software Foundation.
+   8  *
+   9  * This code is distributed in the hope that it will be useful, but WITHOUT
+  10  * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+  11  * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+  12  * version 2 for more details (a copy is included in the LICENSE file that
+  13  * accompanied this code).
+  14  *
+  15  * You should have received a copy of the GNU General Public License version
+  16  * 2 along with this work; if not, write to the Free Software Foundation,
+  17  * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+  18  *
+  19  * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+  20  * or visit www.oracle.com if you need additional information or have any
+  21  * questions.
+  22  */
+  23 
+  24 #include &quot;precompiled.hpp&quot;
+  25 
+  26 #include &quot;aot/aotCodeHeap.hpp&quot;
+  27 #include &quot;aot/aotLoader.hpp&quot;
+  28 #include &quot;ci/ciUtilities.inline.hpp&quot;
+  29 #include &quot;classfile/javaAssertions.hpp&quot;
+  30 #include &quot;gc/shared/cardTable.hpp&quot;
+  31 #include &quot;gc/shared/cardTableBarrierSet.hpp&quot;
+  32 #include &quot;gc/shared/gcConfig.hpp&quot;
+  33 #include &quot;gc/g1/heapRegion.hpp&quot;
+  34 #include &quot;interpreter/abstractInterpreter.hpp&quot;
+  35 #include &quot;jvmci/compilerRuntime.hpp&quot;
+  36 #include &quot;jvmci/jvmciRuntime.hpp&quot;
+  37 #include &quot;logging/log.hpp&quot;
+  38 #include &quot;memory/allocation.inline.hpp&quot;
+  39 #include &quot;memory/universe.hpp&quot;
+  40 #include &quot;oops/compressedOops.hpp&quot;
+  41 #include &quot;oops/klass.inline.hpp&quot;
+  42 #include &quot;oops/method.inline.hpp&quot;
+  43 #include &quot;runtime/atomic.hpp&quot;
+  44 #include &quot;runtime/deoptimization.hpp&quot;
+  45 #include &quot;runtime/handles.inline.hpp&quot;
+  46 #include &quot;runtime/os.hpp&quot;
+  47 #include &quot;runtime/safepointVerifiers.hpp&quot;
+  48 #include &quot;runtime/sharedRuntime.hpp&quot;
+  49 #include &quot;runtime/vmOperations.hpp&quot;
+<a name="1" id="anc1"></a>
+  50 #include &quot;utilities/sizes.hpp&quot;
+  51 
+  52 bool AOTLib::_narrow_oop_shift_initialized = false;
+  53 int  AOTLib::_narrow_oop_shift = 0;
+  54 int  AOTLib::_narrow_klass_shift = 0;
+  55 
+  56 address AOTLib::load_symbol(const char *name) {
+  57   address symbol = (address) os::dll_lookup(_dl_handle, name);
+  58   if (symbol == NULL) {
+  59     tty-&gt;print_cr(&quot;Shared file %s error: missing %s&quot;, _name, name);
+  60     vm_exit(1);
+  61   }
+  62   return symbol;
+  63 }
+  64 
+  65 Klass* AOTCodeHeap::get_klass_from_got(const char* klass_name, int klass_len, const Method* method) {
+  66   AOTKlassData* klass_data = (AOTKlassData*)_lib-&gt;load_symbol(klass_name);
+  67   Klass* k = (Klass*)_klasses_got[klass_data-&gt;_got_index];
+  68   if (k == NULL) {
+  69     Thread* thread = Thread::current();
+  70     k = lookup_klass(klass_name, klass_len, method, thread);
+  71     // Note, exceptions are cleared.
+  72     if (k == NULL) {
+  73       fatal(&quot;Shared file %s error: klass %s should be resolved already&quot;, _lib-&gt;name(), klass_name);
+  74       vm_exit(1);
+  75     }
+  76     // Patch now to avoid extra runtime lookup
+  77     _klasses_got[klass_data-&gt;_got_index] = k;
+  78     if (k-&gt;is_instance_klass()) {
+  79       InstanceKlass* ik = InstanceKlass::cast(k);
+  80       if (ik-&gt;is_initialized()) {
+  81         _klasses_got[klass_data-&gt;_got_index - 1] = ik;
+  82       }
+  83     }
+  84   }
+  85   return k;
+  86 }
+  87 
+  88 Klass* AOTCodeHeap::lookup_klass(const char* name, int len, const Method* method, Thread* thread) {
+  89   ResourceMark rm(thread);
+  90   assert(method != NULL, &quot;incorrect call parameter&quot;);
+  91   methodHandle caller(thread, (Method*)method);
+  92 
+  93   // Use class loader of aot method.
+  94   Handle loader(thread, caller-&gt;method_holder()-&gt;class_loader());
+  95   Handle protection_domain(thread, caller-&gt;method_holder()-&gt;protection_domain());
+  96 
+  97   // Ignore wrapping L and ;
+  98   if (name[0] == JVM_SIGNATURE_CLASS) {
+  99     assert(len &gt; 2, &quot;small name %s&quot;, name);
+ 100     name++;
+ 101     len -= 2;
+ 102   }
+ 103   TempNewSymbol sym = SymbolTable::probe(name, len);
+ 104   if (sym == NULL) {
+ 105     log_debug(aot, class, resolve)(&quot;Probe failed for AOT class %s&quot;, name);
+ 106     return NULL;
+ 107   }
+ 108   Klass* k = SystemDictionary::find_instance_or_array_klass(sym, loader, protection_domain, thread);
+ 109   assert(!thread-&gt;has_pending_exception(), &quot;should not throw&quot;);
+ 110 
+ 111   if (k != NULL) {
+ 112     log_info(aot, class, resolve)(&quot;%s %s (lookup)&quot;, caller-&gt;method_holder()-&gt;external_name(), k-&gt;external_name());
+ 113   }
+ 114   return k;
+ 115 }
+ 116 
+ 117 void AOTLib::handle_config_error(const char* format, ...) {
+ 118   if (PrintAOT) {
+ 119     va_list ap;
+ 120     va_start(ap, format);
+ 121     tty-&gt;vprint_cr(format, ap);
+ 122     va_end(ap);
+ 123   }
+ 124   if (UseAOTStrictLoading) {
+ 125     vm_exit(1);
+ 126   }
+ 127   _valid = false;
+ 128 }
+ 129 
+ 130 void AOTLib::verify_flag(bool aot_flag, bool flag, const char* name) {
+ 131   if (_valid &amp;&amp; aot_flag != flag) {
+ 132     handle_config_error(&quot;Shared file %s error: %s has different value &#39;%s&#39; from current &#39;%s&#39;&quot;, _name, name , (aot_flag ? &quot;true&quot; : &quot;false&quot;), (flag ? &quot;true&quot; : &quot;false&quot;));
+ 133   }
+ 134 }
+ 135 
+ 136 void AOTLib::verify_flag(int aot_flag, int flag, const char* name) {
+ 137   if (_valid &amp;&amp; aot_flag != flag) {
+ 138     handle_config_error(&quot;Shared file %s error: %s has different value &#39;%d&#39; from current &#39;%d&#39;&quot;, _name, name , aot_flag, flag);
+ 139   }
+ 140 }
+ 141 
+ 142 void AOTLib::verify_config() {
+ 143   GrowableArray&lt;AOTLib*&gt;* libraries = AOTLoader::libraries();
+ 144   for (GrowableArrayIterator&lt;AOTLib*&gt; lib = libraries-&gt;begin(); lib != libraries-&gt;end(); ++lib) {
+ 145     if ((*lib)-&gt;_config == _config) {
+ 146       handle_config_error(&quot;AOT library %s already loaded.&quot;, (*lib)-&gt;_name);
+ 147       return;
+ 148     }
+ 149   }
+ 150 
+ 151   if (_header-&gt;_version != AOTHeader::AOT_SHARED_VERSION) {
+ 152     handle_config_error(&quot;Invalid version of the shared file %s. Expected %d but was %d&quot;, _name, _header-&gt;_version, AOTHeader::AOT_SHARED_VERSION);
+ 153     return;
+ 154   }
+ 155 
+ 156   const char* aot_jvm_version = (const char*)_header + _header-&gt;_jvm_version_offset + 2;
+ 157   if (strcmp(aot_jvm_version, VM_Version::jre_release_version()) != 0) {
+ 158     handle_config_error(&quot;JVM version &#39;%s&#39; recorded in the shared file %s does not match current version &#39;%s&#39;&quot;, aot_jvm_version, _name, VM_Version::jre_release_version());
+ 159     return;
+ 160   }
+ 161 
+ 162   // Debug VM has different layout of runtime and metadata structures
+ 163 #ifdef ASSERT
+ 164   verify_flag(_config-&gt;_debug_VM, true, &quot;Debug VM version&quot;);
+ 165 #else
+ 166   verify_flag(!(_config-&gt;_debug_VM), true, &quot;Product VM version&quot;);
+ 167 #endif
+ 168   // Check configuration size
+ 169   verify_flag(_config-&gt;_config_size, AOTConfiguration::CONFIG_SIZE, &quot;AOT configuration size&quot;);
+ 170 
+ 171   // Check GC
+ 172   CollectedHeap::Name gc = (CollectedHeap::Name)_config-&gt;_gc;
+ 173   if (_valid &amp;&amp; !GCConfig::is_gc_selected(gc)) {
+ 174     handle_config_error(&quot;Shared file %s error: used &#39;%s&#39; is different from current &#39;%s&#39;&quot;, _name, GCConfig::hs_err_name(gc), GCConfig::hs_err_name());
+ 175   }
+ 176 
+ 177   // Check flags
+ 178   verify_flag(_config-&gt;_useCompressedOops, UseCompressedOops, &quot;UseCompressedOops&quot;);
+ 179   verify_flag(_config-&gt;_useCompressedClassPointers, UseCompressedClassPointers, &quot;UseCompressedClassPointers&quot;);
+ 180   verify_flag(_config-&gt;_useTLAB, UseTLAB, &quot;UseTLAB&quot;);
+ 181   verify_flag(_config-&gt;_useBiasedLocking, UseBiasedLocking, &quot;UseBiasedLocking&quot;);
+ 182   verify_flag(_config-&gt;_objectAlignment, ObjectAlignmentInBytes, &quot;ObjectAlignmentInBytes&quot;);
+ 183   verify_flag(_config-&gt;_contendedPaddingWidth, ContendedPaddingWidth, &quot;ContendedPaddingWidth&quot;);
+ 184   verify_flag(_config-&gt;_enableContended, EnableContended, &quot;EnableContended&quot;);
+ 185   verify_flag(_config-&gt;_restrictContended, RestrictContended, &quot;RestrictContended&quot;);
+ 186 
+ 187   if (!TieredCompilation &amp;&amp; _config-&gt;_tieredAOT) {
+ 188     handle_config_error(&quot;Shared file %s error: Expected to run with tiered compilation on&quot;, _name);
+ 189   }
+ 190 
+ 191   // Shifts are static values which initialized by 0 until java heap initialization.
+ 192   // AOT libs are loaded before heap initialized so shift values are not set.
+ 193   // It is okay since ObjectAlignmentInBytes flag which defines shifts value is set before AOT libs are loaded.
+ 194   // Set shifts value based on first AOT library config.
+ 195   if (UseCompressedOops &amp;&amp; _valid) {
+ 196     if (!_narrow_oop_shift_initialized) {
+ 197       _narrow_oop_shift = _config-&gt;_narrowOopShift;
+ 198       if (UseCompressedClassPointers) { // It is set only if UseCompressedOops is set
+ 199         _narrow_klass_shift = _config-&gt;_narrowKlassShift;
+ 200       }
+ 201       _narrow_oop_shift_initialized = true;
+ 202     } else {
+ 203       verify_flag(_config-&gt;_narrowOopShift, _narrow_oop_shift, &quot;aot_config-&gt;_narrowOopShift&quot;);
+ 204       if (UseCompressedClassPointers) { // It is set only if UseCompressedOops is set
+ 205         verify_flag(_config-&gt;_narrowKlassShift, _narrow_klass_shift, &quot;aot_config-&gt;_narrowKlassShift&quot;);
+ 206       }
+ 207     }
+ 208   }
+ 209 }
+ 210 
+ 211 AOTLib::~AOTLib() {
+ 212   os::free((void*) _name);
+ 213 }
+ 214 
+ 215 AOTCodeHeap::~AOTCodeHeap() {
+ 216   FREE_C_HEAP_ARRAY(AOTClass, _classes);
+ 217   FREE_C_HEAP_ARRAY(CodeToAMethod, _code_to_aot);
+ 218 }
+ 219 
+ 220 AOTLib::AOTLib(void* handle, const char* name, int dso_id) : _valid(true), _dl_handle(handle), _dso_id(dso_id) {
+ 221   _name = (const char*) os::strdup(name);
+ 222 
+ 223   // Verify that VM runs with the same parameters as AOT tool.
+ 224   _config = (AOTConfiguration*) load_symbol(&quot;A.config&quot;);
+ 225   _header = (AOTHeader*) load_symbol(&quot;A.header&quot;);
+ 226 
+ 227   verify_config();
+ 228 
+ 229   if (!_valid &amp;&amp; PrintAOT) {
+ 230       tty-&gt;print(&quot;%7d &quot;, (int) tty-&gt;time_stamp().milliseconds());
+ 231       tty-&gt;print_cr(&quot;%4d     skipped %s  aot library&quot;, _dso_id, _name);
+ 232   }
+ 233 }
+ 234 
+ 235 AOTCodeHeap::AOTCodeHeap(AOTLib* lib) :
+ 236     CodeHeap(&quot;CodeHeap &#39;AOT&#39;&quot;, CodeBlobType::AOT), _lib(lib), _classes(NULL), _code_to_aot(NULL) {
+ 237   assert(_lib-&gt;is_valid(), &quot;invalid library&quot;);
+ 238 
+ 239   _lib_symbols_initialized = false;
+ 240   _aot_id = 0;
+ 241 
+ 242   _class_count = _lib-&gt;header()-&gt;_class_count;
+ 243   _method_count = _lib-&gt;header()-&gt;_method_count;
+ 244 
+ 245   // Collect metaspace info: names -&gt; address in .got section
+ 246   _metaspace_names = (const char*) _lib-&gt;load_symbol(&quot;A.meta.names&quot;);
+ 247   _method_metadata =     (address) _lib-&gt;load_symbol(&quot;A.meth.metadata&quot;);
+ 248   _methods_offsets =     (address) _lib-&gt;load_symbol(&quot;A.meth.offsets&quot;);
+ 249   _klasses_offsets =     (address) _lib-&gt;load_symbol(&quot;A.kls.offsets&quot;);
+ 250   _dependencies    =     (address) _lib-&gt;load_symbol(&quot;A.kls.dependencies&quot;);
+ 251   _code_space      =     (address) _lib-&gt;load_symbol(&quot;A.text&quot;);
+ 252 
+ 253   // First cell is number of elements.
+ 254   _klasses_got      = (Metadata**) _lib-&gt;load_symbol(&quot;A.kls.got&quot;);
+ 255   _klasses_got_size = _lib-&gt;header()-&gt;_klasses_got_size;
+ 256 
+ 257   _metadata_got      = (Metadata**) _lib-&gt;load_symbol(&quot;A.meta.got&quot;);
+ 258   _metadata_got_size = _lib-&gt;header()-&gt;_metadata_got_size;
+ 259 
+ 260   _oop_got      = (oop*) _lib-&gt;load_symbol(&quot;A.oop.got&quot;);
+ 261   _oop_got_size = _lib-&gt;header()-&gt;_oop_got_size;
+ 262 
+ 263   // Collect stubs info
+ 264   _stubs_offsets = (int*) _lib-&gt;load_symbol(&quot;A.stubs.offsets&quot;);
+ 265 
+ 266   // code segments table
+ 267   _code_segments = (address) _lib-&gt;load_symbol(&quot;A.code.segments&quot;);
+ 268 
+ 269   // method state
+ 270   _method_state = (jlong*) _lib-&gt;load_symbol(&quot;A.meth.state&quot;);
+ 271 
+ 272   // Create a table for mapping classes
+ 273   _classes = NEW_C_HEAP_ARRAY(AOTClass, _class_count, mtCode);
+ 274   memset(_classes, 0, _class_count * sizeof(AOTClass));
+ 275 
+ 276   // Create table for searching AOTCompiledMethod based on pc.
+ 277   _code_to_aot = NEW_C_HEAP_ARRAY(CodeToAMethod, _method_count, mtCode);
+ 278   memset(_code_to_aot, 0, _method_count * sizeof(CodeToAMethod));
+ 279 
+ 280   _memory.set_low_boundary((char *)_code_space);
+ 281   _memory.set_high_boundary((char *)_code_space);
+ 282   _memory.set_low((char *)_code_space);
+ 283   _memory.set_high((char *)_code_space);
+ 284 
+ 285   _segmap.set_low_boundary((char *)_code_segments);
+ 286   _segmap.set_low((char *)_code_segments);
+ 287 
+ 288   _log2_segment_size = exact_log2(_lib-&gt;config()-&gt;_codeSegmentSize);
+ 289 
+ 290   // Register aot stubs
+ 291   register_stubs();
+ 292 
+ 293   if (PrintAOT || (PrintCompilation &amp;&amp; PrintAOT)) {
+ 294     tty-&gt;print(&quot;%7d &quot;, (int) tty-&gt;time_stamp().milliseconds());
+ 295     tty-&gt;print_cr(&quot;%4d     loaded    %s  aot library&quot;, _lib-&gt;id(), _lib-&gt;name());
+ 296   }
+ 297 }
+ 298 
+ 299 void AOTCodeHeap::publish_aot(const methodHandle&amp; mh, AOTMethodData* method_data, int code_id) {
+ 300   // The method may be explicitly excluded by the user.
+ 301   // Or Interpreter uses an intrinsic for this method.
+ 302   // Or method has breakpoints.
+ 303   if (CompilerOracle::should_exclude(mh) ||
+ 304       !AbstractInterpreter::can_be_compiled(mh) ||
+ 305       (mh-&gt;number_of_breakpoints() &gt; 0)) {
+ 306     return;
+ 307   }
+ 308   // Make sure no break points were set in the method in case of a safepoint
+ 309   // in the following code until aot code is registered.
+ 310   NoSafepointVerifier nsv;
+ 311 
+ 312   address code = method_data-&gt;_code;
+ 313   const char* name = method_data-&gt;_name;
+ 314   aot_metadata* meta = method_data-&gt;_meta;
+ 315 
+ 316   if (meta-&gt;scopes_pcs_begin() == meta-&gt;scopes_pcs_end()) {
+ 317     // Switch off NoSafepointVerifier because log_info() may cause safepoint
+ 318     // and it is fine because aot code will not be registered here.
+ 319     PauseNoSafepointVerifier pnsv(&amp;nsv);
+ 320 
+ 321     // When the AOT compiler compiles something big we fail to generate metadata
+ 322     // in CodeInstaller::gather_metadata. In that case the scopes_pcs_begin == scopes_pcs_end.
+ 323     // In all successful cases we always have 2 entries of scope pcs.
+ 324     log_info(aot, class, resolve)(&quot;Failed to load %s (no metadata available)&quot;, mh-&gt;name_and_sig_as_C_string());
+ 325     _code_to_aot[code_id]._state = invalid;
+ 326     return;
+ 327   }
+ 328 
+ 329   jlong* state_adr = &amp;_method_state[code_id];
+ 330   address metadata_table = method_data-&gt;_metadata_table;
+ 331   int metadata_size = method_data-&gt;_metadata_size;
+ 332   assert(code_id &lt; _method_count, &quot;sanity&quot;);
+ 333   _aot_id++;
+ 334 
+ 335 #ifdef ASSERT
+ 336   if (_aot_id &gt; CIStop || _aot_id &lt; CIStart) {
+ 337     // Skip compilation
+ 338     return;
+ 339   }
+ 340 #endif
+ 341   // Check one more time.
+ 342   if (_code_to_aot[code_id]._state == invalid) {
+ 343     return;
+ 344   }
+ 345   AOTCompiledMethod *aot = new AOTCompiledMethod(code, mh(), meta, metadata_table, metadata_size, state_adr, this, name, code_id, _aot_id);
+ 346   assert(_code_to_aot[code_id]._aot == NULL, &quot;should be not initialized&quot;);
+ 347   _code_to_aot[code_id]._aot = aot; // Should set this first
+ 348   if (Atomic::cmpxchg(&amp;_code_to_aot[code_id]._state, not_set, in_use) != not_set) {
+ 349     _code_to_aot[code_id]._aot = NULL; // Clean
+ 350   } else { // success
+ 351     // Publish method
+ 352 #ifdef TIERED
+ 353     mh-&gt;set_aot_code(aot);
+ 354 #endif
+ 355     {
+ 356       MutexLocker pl(CompiledMethod_lock, Mutex::_no_safepoint_check_flag);
+ 357       Method::set_code(mh, aot);
+ 358     }
+ 359     if (PrintAOT || (PrintCompilation &amp;&amp; PrintAOT)) {
+ 360       PauseNoSafepointVerifier pnsv(&amp;nsv); // aot code is registered already
+ 361       aot-&gt;print_on(tty, NULL);
+ 362     }
+ 363     // Publish oop only after we are visible to CompiledMethodIterator
+ 364     aot-&gt;set_oop(mh()-&gt;method_holder()-&gt;klass_holder());
+ 365   }
+ 366 }
+ 367 
+ 368 void AOTCodeHeap::link_primitive_array_klasses() {
+ 369   ResourceMark rm;
+ 370   for (int i = T_BOOLEAN; i &lt;= T_CONFLICT; i++) {
+ 371     BasicType t = (BasicType)i;
+ 372     if (is_java_primitive(t)) {
+ 373       const Klass* arr_klass = Universe::typeArrayKlassObj(t);
+ 374       AOTKlassData* klass_data = (AOTKlassData*) os::dll_lookup(_lib-&gt;dl_handle(), arr_klass-&gt;signature_name());
+ 375       if (klass_data != NULL) {
+ 376         // Set both GOT cells, resolved and initialized klass pointers.
+ 377         // _got_index points to second cell - resolved klass pointer.
+ 378         _klasses_got[klass_data-&gt;_got_index-1] = (Metadata*)arr_klass; // Initialized
+ 379         _klasses_got[klass_data-&gt;_got_index  ] = (Metadata*)arr_klass; // Resolved
+ 380         if (PrintAOT) {
+ 381           tty-&gt;print_cr(&quot;[Found  %s  in  %s]&quot;, arr_klass-&gt;internal_name(), _lib-&gt;name());
+ 382         }
+ 383       }
+ 384     }
+ 385   }
+ 386 }
+ 387 
+ 388 void AOTCodeHeap::register_stubs() {
+ 389   int stubs_count = _stubs_offsets[0]; // contains number
+ 390   _stubs_offsets++;
+ 391   AOTMethodOffsets* stub_offsets = (AOTMethodOffsets*)_stubs_offsets;
+ 392   for (int i = 0; i &lt; stubs_count; ++i) {
+ 393     const char* stub_name = _metaspace_names + stub_offsets[i]._name_offset;
+ 394     address entry = _code_space  + stub_offsets[i]._code_offset;
+ 395     aot_metadata* meta = (aot_metadata *) (_method_metadata + stub_offsets[i]._meta_offset);
+ 396     address metadata_table = (address)_metadata_got + stub_offsets[i]._metadata_got_offset;
+ 397     int metadata_size = stub_offsets[i]._metadata_got_size;
+ 398     int code_id = stub_offsets[i]._code_id;
+ 399     assert(code_id &lt; _method_count, &quot;sanity&quot;);
+ 400     jlong* state_adr = &amp;_method_state[code_id];
+ 401     int len = Bytes::get_Java_u2((address)stub_name);
+ 402     stub_name += 2;
+ 403     char* full_name = NEW_C_HEAP_ARRAY(char, len+5, mtCode);
+ 404     memcpy(full_name, &quot;AOT &quot;, 4);
+ 405     memcpy(full_name+4, stub_name, len);
+ 406     full_name[len+4] = 0;
+ 407     guarantee(_code_to_aot[code_id]._state != invalid, &quot;stub %s can&#39;t be invalidated&quot;, full_name);
+ 408     AOTCompiledMethod* aot = new AOTCompiledMethod(entry, NULL, meta, metadata_table, metadata_size, state_adr, this, full_name, code_id, i);
+ 409     assert(_code_to_aot[code_id]._aot  == NULL, &quot;should be not initialized&quot;);
+ 410     _code_to_aot[code_id]._aot  = aot;
+ 411     if (Atomic::cmpxchg(&amp;_code_to_aot[code_id]._state, not_set, in_use) != not_set) {
+ 412       fatal(&quot;stab &#39;%s&#39; code state is %d&quot;, full_name, _code_to_aot[code_id]._state);
+ 413     }
+ 414     // Adjust code buffer boundaries only for stubs because they are last in the buffer.
+ 415     adjust_boundaries(aot);
+ 416     if (PrintAOT &amp;&amp; Verbose) {
+ 417       aot-&gt;print_on(tty, NULL);
+ 418     }
+ 419   }
+ 420 }
+ 421 
+ 422 #define SET_AOT_GLOBAL_SYMBOL_VALUE(AOTSYMNAME, AOTSYMTYPE, VMSYMVAL) \
+ 423   {                                                                   \
+ 424     AOTSYMTYPE * adr = (AOTSYMTYPE *) os::dll_lookup(_lib-&gt;dl_handle(), AOTSYMNAME);  \
+ 425     /* Check for a lookup error */                                    \
+ 426     guarantee(adr != NULL, &quot;AOT Symbol not found %s&quot;, AOTSYMNAME);    \
+ 427     *adr = (AOTSYMTYPE) VMSYMVAL;                                     \
+ 428   }
+ 429 
+ 430 void AOTCodeHeap::link_graal_runtime_symbols()  {
+ 431     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_jvmci_runtime_monitorenter&quot;, address, JVMCIRuntime::monitorenter);
+ 432     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_jvmci_runtime_monitorexit&quot;, address, JVMCIRuntime::monitorexit);
+ 433     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_jvmci_runtime_log_object&quot;, address, JVMCIRuntime::log_object);
+ 434     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_jvmci_runtime_log_printf&quot;, address, JVMCIRuntime::log_printf);
+ 435     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_jvmci_runtime_log_primitive&quot;, address, JVMCIRuntime::log_primitive);
+ 436     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_jvmci_runtime_new_instance&quot;, address, JVMCIRuntime::new_instance);
+ 437     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_jvmci_runtime_new_array&quot;, address, JVMCIRuntime::new_array);
+ 438     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_jvmci_runtime_new_multi_array&quot;, address, JVMCIRuntime::new_multi_array);
+ 439     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_jvmci_runtime_dynamic_new_instance&quot;, address, JVMCIRuntime::dynamic_new_instance);
+ 440     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_jvmci_runtime_dynamic_new_array&quot;, address, JVMCIRuntime::dynamic_new_array);
+ 441     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_jvmci_runtime_new_instance_or_null&quot;, address, JVMCIRuntime::new_instance_or_null);
+ 442     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_jvmci_runtime_new_array_or_null&quot;, address, JVMCIRuntime::new_array_or_null);
+ 443     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_jvmci_runtime_new_multi_array_or_null&quot;, address, JVMCIRuntime::new_multi_array_or_null);
+ 444     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_jvmci_runtime_dynamic_new_instance_or_null&quot;, address, JVMCIRuntime::dynamic_new_instance_or_null);
+ 445     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_jvmci_runtime_dynamic_new_array_or_null&quot;, address, JVMCIRuntime::dynamic_new_array_or_null);
+ 446     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_jvmci_runtime_validate_object&quot;, address, JVMCIRuntime::validate_object);
+ 447 #if INCLUDE_G1GC
+ 448     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_jvmci_runtime_write_barrier_pre&quot;, address, JVMCIRuntime::write_barrier_pre);
+ 449     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_jvmci_runtime_write_barrier_post&quot;, address, JVMCIRuntime::write_barrier_post);
+ 450 #endif
+ 451     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_jvmci_runtime_identity_hash_code&quot;, address, JVMCIRuntime::identity_hash_code);
+ 452     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_jvmci_runtime_exception_handler_for_pc&quot;, address, JVMCIRuntime::exception_handler_for_pc);
+ 453     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_jvmci_runtime_test_deoptimize_call_int&quot;, address, JVMCIRuntime::test_deoptimize_call_int);
+ 454     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_jvmci_runtime_throw_and_post_jvmti_exception&quot;, address, JVMCIRuntime::throw_and_post_jvmti_exception);
+ 455     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_jvmci_runtime_throw_klass_external_name_exception&quot;, address, JVMCIRuntime::throw_klass_external_name_exception);
+ 456     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_jvmci_runtime_throw_class_cast_exception&quot;, address, JVMCIRuntime::throw_class_cast_exception);
+ 457     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_jvmci_runtime_vm_message&quot;, address, JVMCIRuntime::vm_message);
+ 458     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_jvmci_runtime_vm_error&quot;, address, JVMCIRuntime::vm_error);
+ 459 }
+ 460 
+ 461 void AOTCodeHeap::link_shared_runtime_symbols() {
+ 462     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_resolve_static_entry&quot;, address, SharedRuntime::get_resolve_static_call_stub());
+ 463     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_resolve_virtual_entry&quot;, address, SharedRuntime::get_resolve_virtual_call_stub());
+ 464     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_resolve_opt_virtual_entry&quot;, address, SharedRuntime::get_resolve_opt_virtual_call_stub());
+ 465     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_deopt_blob_unpack&quot;, address, SharedRuntime::deopt_blob()-&gt;unpack());
+ 466     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_deopt_blob_unpack_with_exception_in_tls&quot;, address, SharedRuntime::deopt_blob()-&gt;unpack_with_exception_in_tls());
+ 467     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_deopt_blob_uncommon_trap&quot;, address, SharedRuntime::deopt_blob()-&gt;uncommon_trap());
+ 468     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_ic_miss_stub&quot;, address, SharedRuntime::get_ic_miss_stub());
+ 469     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_handle_wrong_method_stub&quot;, address, SharedRuntime::get_handle_wrong_method_stub());
+ 470     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_exception_handler_for_return_address&quot;, address, SharedRuntime::exception_handler_for_return_address);
+ 471     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_register_finalizer&quot;, address, SharedRuntime::register_finalizer);
+ 472     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_object_notify&quot;, address, JVMCIRuntime::object_notify);
+ 473     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_object_notifyAll&quot;, address, JVMCIRuntime::object_notifyAll);
+ 474     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_OSR_migration_end&quot;, address, SharedRuntime::OSR_migration_end);
+ 475     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_enable_stack_reserved_zone&quot;, address, SharedRuntime::enable_stack_reserved_zone);
+ 476     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_resolve_dynamic_invoke&quot;, address, CompilerRuntime::resolve_dynamic_invoke);
+ 477     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_resolve_string_by_symbol&quot;, address, CompilerRuntime::resolve_string_by_symbol);
+ 478     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_resolve_klass_by_symbol&quot;, address, CompilerRuntime::resolve_klass_by_symbol);
+ 479     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_resolve_method_by_symbol_and_load_counters&quot;, address, CompilerRuntime::resolve_method_by_symbol_and_load_counters);
+ 480     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_initialize_klass_by_symbol&quot;, address, CompilerRuntime::initialize_klass_by_symbol);
+ 481     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_invocation_event&quot;, address, CompilerRuntime::invocation_event);
+ 482     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_backedge_event&quot;, address, CompilerRuntime::backedge_event);
+ 483 
+ 484     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_shared_runtime_dpow&quot;, address, SharedRuntime::dpow);
+ 485     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_shared_runtime_dexp&quot;, address, SharedRuntime::dexp);
+ 486     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_shared_runtime_dcos&quot;, address, SharedRuntime::dcos);
+ 487     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_shared_runtime_dsin&quot;, address, SharedRuntime::dsin);
+ 488     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_shared_runtime_dtan&quot;, address, SharedRuntime::dtan);
+ 489     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_shared_runtime_dlog&quot;, address, SharedRuntime::dlog);
+ 490     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_shared_runtime_dlog10&quot;, address, SharedRuntime::dlog10);
+ 491 }
+ 492 
+ 493 void AOTCodeHeap::link_stub_routines_symbols() {
+ 494     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_stub_routines_jbyte_arraycopy&quot;, address, StubRoutines::_jbyte_arraycopy);
+ 495     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_stub_routines_jshort_arraycopy&quot;, address, StubRoutines::_jshort_arraycopy);
+ 496     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_stub_routines_jint_arraycopy&quot;, address, StubRoutines::_jint_arraycopy);
+ 497     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_stub_routines_jlong_arraycopy&quot;, address, StubRoutines::_jlong_arraycopy);
+ 498     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_stub_routines_oop_arraycopy&quot;, address, StubRoutines::_oop_arraycopy);
+ 499     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_stub_routines_oop_arraycopy_uninit&quot;, address, StubRoutines::_oop_arraycopy_uninit);
+ 500 
+ 501     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_stub_routines_jbyte_disjoint_arraycopy&quot;, address, StubRoutines::_jbyte_disjoint_arraycopy);
+ 502     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_stub_routines_jshort_disjoint_arraycopy&quot;, address, StubRoutines::_jshort_disjoint_arraycopy);
+ 503     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_stub_routines_jint_disjoint_arraycopy&quot;, address, StubRoutines::_jint_disjoint_arraycopy);
+ 504     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_stub_routines_jlong_disjoint_arraycopy&quot;, address, StubRoutines::_jlong_disjoint_arraycopy);
+ 505     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_stub_routines_oop_disjoint_arraycopy&quot;, address, StubRoutines::_oop_disjoint_arraycopy);
+ 506     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_stub_routines_oop_disjoint_arraycopy_uninit&quot;, address, StubRoutines::_oop_disjoint_arraycopy_uninit);
+ 507 
+ 508     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_stub_routines_arrayof_jbyte_arraycopy&quot;, address, StubRoutines::_arrayof_jbyte_arraycopy);
+ 509     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_stub_routines_arrayof_jshort_arraycopy&quot;, address, StubRoutines::_arrayof_jshort_arraycopy);
+ 510     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_stub_routines_arrayof_jint_arraycopy&quot;, address, StubRoutines::_arrayof_jint_arraycopy);
+ 511     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_stub_routines_arrayof_jlong_arraycopy&quot;, address, StubRoutines::_arrayof_jlong_arraycopy);
+ 512     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_stub_routines_arrayof_oop_arraycopy&quot;, address, StubRoutines::_arrayof_oop_arraycopy);
+ 513     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_stub_routines_arrayof_oop_arraycopy_uninit&quot;, address, StubRoutines::_arrayof_oop_arraycopy_uninit);
+ 514 
+ 515     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_stub_routines_arrayof_jbyte_disjoint_arraycopy&quot;, address, StubRoutines::_arrayof_jbyte_disjoint_arraycopy);
+ 516     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_stub_routines_arrayof_jshort_disjoint_arraycopy&quot;, address, StubRoutines::_arrayof_jshort_disjoint_arraycopy);
+ 517     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_stub_routines_arrayof_jint_disjoint_arraycopy&quot;, address, StubRoutines::_arrayof_jint_disjoint_arraycopy);
+ 518     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_stub_routines_arrayof_jlong_disjoint_arraycopy&quot;, address, StubRoutines::_arrayof_jlong_disjoint_arraycopy);
+ 519     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_stub_routines_arrayof_oop_disjoint_arraycopy&quot;, address, StubRoutines::_arrayof_oop_disjoint_arraycopy);
+ 520     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_stub_routines_arrayof_oop_disjoint_arraycopy_uninit&quot;, address, StubRoutines::_arrayof_oop_disjoint_arraycopy_uninit);
+ 521 
+ 522     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_stub_routines_unsafe_arraycopy&quot;, address, StubRoutines::_unsafe_arraycopy);
+ 523 
+ 524     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_stub_routines_checkcast_arraycopy&quot;, address, StubRoutines::_checkcast_arraycopy);
+ 525 
+ 526     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_stub_routines_generic_arraycopy&quot;, address, StubRoutines::_generic_arraycopy);
+ 527 
+ 528     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_stub_routines_aescrypt_encryptBlock&quot;, address, StubRoutines::_aescrypt_encryptBlock);
+ 529     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_stub_routines_aescrypt_decryptBlock&quot;, address, StubRoutines::_aescrypt_decryptBlock);
+ 530     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_stub_routines_cipherBlockChaining_encryptAESCrypt&quot;, address, StubRoutines::_cipherBlockChaining_encryptAESCrypt);
+ 531     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_stub_routines_cipherBlockChaining_decryptAESCrypt&quot;, address, StubRoutines::_cipherBlockChaining_decryptAESCrypt);
+ 532     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_stub_routines_electronicCodeBook_encryptAESCrypt&quot;, address, StubRoutines::_electronicCodeBook_encryptAESCrypt);
+ 533     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_stub_routines_electronicCodeBook_decryptAESCrypt&quot;, address, StubRoutines::_electronicCodeBook_decryptAESCrypt);
+ 534     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_stub_routines_update_bytes_crc32&quot;, address, StubRoutines::_updateBytesCRC32);
+ 535     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_stub_routines_crc_table_adr&quot;, address, StubRoutines::_crc_table_adr);
+ 536 
+ 537 
+ 538     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_stub_routines_sha1_implCompress&quot;, address, StubRoutines::_sha1_implCompress);
+ 539     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_stub_routines_sha1_implCompressMB&quot;, address, StubRoutines::_sha1_implCompressMB);
+ 540     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_stub_routines_sha256_implCompress&quot;, address, StubRoutines::_sha256_implCompress);
+ 541     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_stub_routines_sha256_implCompressMB&quot;, address, StubRoutines::_sha256_implCompressMB);
+ 542     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_stub_routines_sha512_implCompress&quot;, address, StubRoutines::_sha512_implCompress);
+ 543     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_stub_routines_sha512_implCompressMB&quot;, address, StubRoutines::_sha512_implCompressMB);
+ 544     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_stub_routines_multiplyToLen&quot;, address, StubRoutines::_multiplyToLen);
+ 545 
+ 546     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_stub_routines_counterMode_AESCrypt&quot;, address, StubRoutines::_counterMode_AESCrypt);
+ 547     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_stub_routines_ghash_processBlocks&quot;, address, StubRoutines::_ghash_processBlocks);
+ 548     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_stub_routines_base64_encodeBlock&quot;, address, StubRoutines::_base64_encodeBlock);
+ 549     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_stub_routines_crc32c_table_addr&quot;, address, StubRoutines::_crc32c_table_addr);
+ 550     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_stub_routines_updateBytesCRC32C&quot;, address, StubRoutines::_updateBytesCRC32C);
+ 551     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_stub_routines_updateBytesAdler32&quot;, address, StubRoutines::_updateBytesAdler32);
+ 552     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_stub_routines_squareToLen&quot;, address, StubRoutines::_squareToLen);
+ 553     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_stub_routines_mulAdd&quot;, address, StubRoutines::_mulAdd);
+ 554     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_stub_routines_montgomeryMultiply&quot;,  address, StubRoutines::_montgomeryMultiply);
+ 555     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_stub_routines_montgomerySquare&quot;, address, StubRoutines::_montgomerySquare);
+ 556     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_stub_routines_vectorizedMismatch&quot;, address, StubRoutines::_vectorizedMismatch);
+ 557     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_stub_routines_bigIntegerRightShiftWorker&quot;, address, StubRoutines::_bigIntegerRightShiftWorker);
+ 558     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_stub_routines_bigIntegerLeftShiftWorker&quot;, address, StubRoutines::_bigIntegerLeftShiftWorker);
+ 559 
+ 560     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_stub_routines_throw_delayed_StackOverflowError_entry&quot;, address, StubRoutines::_throw_delayed_StackOverflowError_entry);
+ 561 
+ 562 }
+ 563 
+ 564 void AOTCodeHeap::link_os_symbols() {
+ 565     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_os_javaTimeMillis&quot;, address, os::javaTimeMillis);
+ 566     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_os_javaTimeNanos&quot;, address, os::javaTimeNanos);
+ 567 }
+ 568 
+ 569 /*
+ 570  * Link any global symbols in precompiled DSO with dlopen() _dl_handle
+ 571  * dso_handle.
+ 572  */
+ 573 
+ 574 void AOTCodeHeap::link_global_lib_symbols() {
+ 575   if (!_lib_symbols_initialized) {
+ 576     _lib_symbols_initialized = true;
+ 577 
+ 578     CollectedHeap* heap = Universe::heap();
+ 579     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_card_table_address&quot;, address, (BarrierSet::barrier_set()-&gt;is_a(BarrierSet::CardTableBarrierSet) ? ci_card_table_address() : NULL));
+ 580     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_heap_top_address&quot;, address, (heap-&gt;supports_inline_contig_alloc() ? heap-&gt;top_addr() : NULL));
+ 581     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_heap_end_address&quot;, address, (heap-&gt;supports_inline_contig_alloc() ? heap-&gt;end_addr() : NULL));
+ 582     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_polling_page&quot;, address, os::get_polling_page());
+ 583     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_narrow_klass_base_address&quot;, address, CompressedKlassPointers::base());
+ 584     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_narrow_oop_base_address&quot;, address, CompressedOops::base());
+ 585 #if INCLUDE_G1GC
+ 586     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_log_of_heap_region_grain_bytes&quot;, int, HeapRegion::LogOfHRGrainBytes);
+ 587 #endif
+ 588     SET_AOT_GLOBAL_SYMBOL_VALUE(&quot;_aot_inline_contiguous_allocation_supported&quot;, bool, heap-&gt;supports_inline_contig_alloc());
+ 589     link_shared_runtime_symbols();
+ 590     link_stub_routines_symbols();
+ 591     link_os_symbols();
+ 592     link_graal_runtime_symbols();
+ 593 
+ 594     // Link primitive array klasses.
+ 595     link_primitive_array_klasses();
+ 596   }
+ 597 }
+ 598 
+ 599 #ifndef PRODUCT
+ 600 int AOTCodeHeap::klasses_seen = 0;
+ 601 int AOTCodeHeap::aot_klasses_found = 0;
+ 602 int AOTCodeHeap::aot_klasses_fp_miss = 0;
+ 603 int AOTCodeHeap::aot_klasses_cl_miss = 0;
+ 604 int AOTCodeHeap::aot_methods_found = 0;
+ 605 
+ 606 void AOTCodeHeap::print_statistics() {
+ 607   tty-&gt;print_cr(&quot;Classes seen: %d  AOT classes found: %d  AOT methods found: %d&quot;, klasses_seen, aot_klasses_found, aot_methods_found);
+ 608   tty-&gt;print_cr(&quot;AOT fingerprint mismatches: %d  AOT class loader mismatches: %d&quot;, aot_klasses_fp_miss, aot_klasses_cl_miss);
+ 609 }
+ 610 #endif
+ 611 
+ 612 Method* AOTCodeHeap::find_method(Klass* klass, Thread* thread, const char* method_name) {
+ 613   int method_name_len = Bytes::get_Java_u2((address)method_name);
+ 614   method_name += 2;
+ 615   const char* signature_name = method_name + method_name_len;
+ 616   int signature_name_len = Bytes::get_Java_u2((address)signature_name);
+ 617   signature_name += 2;
+ 618   // The class should have been loaded so the method and signature should already be
+ 619   // in the symbol table.  If they&#39;re not there, the method doesn&#39;t exist.
+ 620   TempNewSymbol name = SymbolTable::probe(method_name, method_name_len);
+ 621   TempNewSymbol signature = SymbolTable::probe(signature_name, signature_name_len);
+ 622 
+ 623   Method* m;
+ 624   if (name == NULL || signature == NULL) {
+ 625     m = NULL;
+ 626   } else if (name == vmSymbols::object_initializer_name() ||
+ 627              name == vmSymbols::class_initializer_name()) {
+ 628     // Never search superclasses for constructors
+ 629     if (klass-&gt;is_instance_klass()) {
+ 630       m = InstanceKlass::cast(klass)-&gt;find_method(name, signature);
+ 631     } else {
+ 632       m = NULL;
+ 633     }
+ 634   } else {
+ 635     m = klass-&gt;lookup_method(name, signature);
+ 636     if (m == NULL &amp;&amp; klass-&gt;is_instance_klass()) {
+ 637       m = InstanceKlass::cast(klass)-&gt;lookup_method_in_ordered_interfaces(name, signature);
+ 638     }
+ 639   }
+ 640   if (m == NULL) {
+ 641     // Fatal error because we assume classes and methods should not be changed since aot compilation.
+ 642     const char* klass_name = klass-&gt;external_name();
+ 643     int klass_len = (int)strlen(klass_name);
+ 644     char* meta_name = NEW_RESOURCE_ARRAY(char, klass_len + 1 + method_name_len + signature_name_len + 1);
+ 645     memcpy(meta_name, klass_name, klass_len);
+ 646     meta_name[klass_len] = &#39;.&#39;;
+ 647     memcpy(&amp;meta_name[klass_len + 1], method_name, method_name_len);
+ 648     memcpy(&amp;meta_name[klass_len + 1 + method_name_len], signature_name, signature_name_len);
+ 649     meta_name[klass_len + 1 + method_name_len + signature_name_len] = &#39;\0&#39;;
+ 650     Handle exception = Exceptions::new_exception(thread, vmSymbols::java_lang_NoSuchMethodError(), meta_name);
+ 651     java_lang_Throwable::print(exception(), tty);
+ 652     tty-&gt;cr();
+ 653     java_lang_Throwable::print_stack_trace(exception, tty);
+ 654     tty-&gt;cr();
+ 655     fatal(&quot;Failed to find method &#39;%s&#39;&quot;, meta_name);
+ 656   }
+ 657   NOT_PRODUCT( aot_methods_found++; )
+ 658   return m;
+ 659 }
+ 660 
+ 661 AOTKlassData* AOTCodeHeap::find_klass(const char *name) {
+ 662   return (AOTKlassData*) os::dll_lookup(_lib-&gt;dl_handle(), name);
+ 663 }
+ 664 
+ 665 AOTKlassData* AOTCodeHeap::find_klass(InstanceKlass* ik) {
+ 666   ResourceMark rm;
+ 667   AOTKlassData* klass_data = find_klass(ik-&gt;signature_name());
+ 668   return klass_data;
+ 669 }
+ 670 
+ 671 bool AOTCodeHeap::is_dependent_method(Klass* dependee, AOTCompiledMethod* aot) {
+ 672   InstanceKlass *dependee_ik = InstanceKlass::cast(dependee);
+ 673   AOTKlassData* klass_data = find_klass(dependee_ik);
+ 674   if (klass_data == NULL) {
+ 675     return false; // no AOT records for this class - no dependencies
+ 676   }
+ 677   if (!dependee_ik-&gt;has_passed_fingerprint_check()) {
+ 678     return false; // different class
+ 679   }
+ 680 
+ 681   int methods_offset = klass_data-&gt;_dependent_methods_offset;
+ 682   if (methods_offset &gt;= 0) {
+ 683     address methods_cnt_adr = _dependencies + methods_offset;
+ 684     int methods_cnt = *(int*)methods_cnt_adr;
+ 685     int* indexes = (int*)(methods_cnt_adr + 4);
+ 686     for (int i = 0; i &lt; methods_cnt; ++i) {
+ 687       int code_id = indexes[i];
+ 688       if (_code_to_aot[code_id]._aot == aot) {
+ 689         return true; // found dependent method
+ 690       }
+ 691     }
+ 692   }
+ 693   return false;
+ 694 }
+ 695 
+ 696 void AOTCodeHeap::mark_evol_dependent_methods(InstanceKlass* dependee) {
+ 697   AOTKlassData* klass_data = find_klass(dependee);
+ 698   if (klass_data == NULL) {
+ 699     return; // no AOT records for this class - no dependencies
+ 700   }
+ 701   if (!dependee-&gt;has_passed_fingerprint_check()) {
+ 702     return; // different class
+ 703   }
+ 704 
+ 705   int methods_offset = klass_data-&gt;_dependent_methods_offset;
+ 706   if (methods_offset &gt;= 0) {
+ 707     address methods_cnt_adr = _dependencies + methods_offset;
+ 708     int methods_cnt = *(int*)methods_cnt_adr;
+ 709     int* indexes = (int*)(methods_cnt_adr + 4);
+ 710     for (int i = 0; i &lt; methods_cnt; ++i) {
+ 711       int code_id = indexes[i];
+ 712       AOTCompiledMethod* aot = _code_to_aot[code_id]._aot;
+ 713       if (aot != NULL) {
+ 714         aot-&gt;mark_for_deoptimization(false);
+ 715       }
+ 716     }
+ 717   }
+ 718 }
+ 719 
+ 720 void AOTCodeHeap::sweep_dependent_methods(int* indexes, int methods_cnt) {
+ 721   int marked = 0;
+ 722   for (int i = 0; i &lt; methods_cnt; ++i) {
+ 723     int code_id = indexes[i];
+ 724     // Invalidate aot code.
+ 725     if (Atomic::cmpxchg(&amp;_code_to_aot[code_id]._state, not_set, invalid) != not_set) {
+ 726       if (_code_to_aot[code_id]._state == in_use) {
+ 727         AOTCompiledMethod* aot = _code_to_aot[code_id]._aot;
+ 728         assert(aot != NULL, &quot;aot should be set&quot;);
+ 729         if (!aot-&gt;is_runtime_stub()) { // Something is wrong - should not invalidate stubs.
+ 730           aot-&gt;mark_for_deoptimization(false);
+ 731           marked++;
+ 732         }
+ 733       }
+ 734     }
+ 735   }
+ 736   if (marked &gt; 0) {
+ 737     Deoptimization::deoptimize_all_marked();
+ 738   }
+ 739 }
+ 740 
+ 741 void AOTCodeHeap::sweep_dependent_methods(AOTKlassData* klass_data) {
+ 742   // Make dependent methods non_entrant forever.
+ 743   int methods_offset = klass_data-&gt;_dependent_methods_offset;
+ 744   if (methods_offset &gt;= 0) {
+ 745     address methods_cnt_adr = _dependencies + methods_offset;
+ 746     int methods_cnt = *(int*)methods_cnt_adr;
+ 747     int* indexes = (int*)(methods_cnt_adr + 4);
+ 748     sweep_dependent_methods(indexes, methods_cnt);
+ 749   }
+ 750 }
+ 751 
+ 752 void AOTCodeHeap::sweep_dependent_methods(InstanceKlass* ik) {
+ 753   AOTKlassData* klass_data = find_klass(ik);
+ 754   vmassert(klass_data != NULL, &quot;dependency data missing&quot;);
+ 755   sweep_dependent_methods(klass_data);
+ 756 }
+ 757 
+ 758 void AOTCodeHeap::sweep_method(AOTCompiledMethod *aot) {
+ 759   int indexes[] = {aot-&gt;method_index()};
+ 760   sweep_dependent_methods(indexes, 1);
+ 761   vmassert(aot-&gt;method()-&gt;code() != aot TIERED_ONLY( &amp;&amp; aot-&gt;method()-&gt;aot_code() == NULL), &quot;method still active&quot;);
+ 762 }
+ 763 
+ 764 
+ 765 bool AOTCodeHeap::load_klass_data(InstanceKlass* ik, Thread* thread) {
+ 766   ResourceMark rm;
+ 767 
+ 768   NOT_PRODUCT( klasses_seen++; )
+ 769 
+ 770   // AOT does not support custom class loaders.
+ 771   ClassLoaderData* cld = ik-&gt;class_loader_data();
+ 772   if (!cld-&gt;is_builtin_class_loader_data()) {
+ 773     log_trace(aot, class, load)(&quot;skip class  %s  for custom classloader %s (%p) tid=&quot; INTPTR_FORMAT,
+ 774                                 ik-&gt;internal_name(), cld-&gt;loader_name(), cld, p2i(thread));
+ 775     return false;
+ 776   }
+ 777 
+ 778   AOTKlassData* klass_data = find_klass(ik);
+ 779   if (klass_data == NULL) {
+ 780     return false;
+ 781   }
+ 782 
+ 783   if (!ik-&gt;has_passed_fingerprint_check()) {
+ 784     NOT_PRODUCT( aot_klasses_fp_miss++; )
+ 785     log_trace(aot, class, fingerprint)(&quot;class  %s%s  has bad fingerprint in  %s tid=&quot; INTPTR_FORMAT,
+ 786                                        ik-&gt;internal_name(), ik-&gt;is_shared() ? &quot; (shared)&quot; : &quot;&quot;,
+ 787                                        _lib-&gt;name(), p2i(thread));
+ 788     sweep_dependent_methods(klass_data);
+ 789     return false;
+ 790   }
+ 791 
+ 792   if (ik-&gt;has_been_redefined()) {
+ 793     log_trace(aot, class, load)(&quot;class  %s%s in %s  has been redefined tid=&quot; INTPTR_FORMAT,
+ 794                                 ik-&gt;internal_name(), ik-&gt;is_shared() ? &quot; (shared)&quot; : &quot;&quot;,
+ 795                                 _lib-&gt;name(), p2i(thread));
+ 796     sweep_dependent_methods(klass_data);
+ 797     return false;
+ 798   }
+ 799 
+ 800   assert(klass_data-&gt;_class_id &lt; _class_count, &quot;invalid class id&quot;);
+ 801   AOTClass* aot_class = &amp;_classes[klass_data-&gt;_class_id];
+ 802   ClassLoaderData* aot_cld = aot_class-&gt;_classloader;
+ 803   if (aot_cld != NULL &amp;&amp; aot_cld != cld) {
+ 804     log_trace(aot, class, load)(&quot;class  %s  in  %s already loaded for classloader %s (%p) vs %s (%p) tid=&quot; INTPTR_FORMAT,
+ 805                                 ik-&gt;internal_name(), _lib-&gt;name(), aot_cld-&gt;loader_name(), aot_cld, cld-&gt;loader_name(), cld, p2i(thread));
+ 806     NOT_PRODUCT( aot_klasses_cl_miss++; )
+ 807     return false;
+ 808   }
+ 809 
+ 810   if (_lib-&gt;config()-&gt;_omitAssertions &amp;&amp; JavaAssertions::enabled(ik-&gt;name()-&gt;as_C_string(), ik-&gt;class_loader() == NULL)) {
+ 811     log_trace(aot, class, load)(&quot;class  %s  in  %s does not have java assertions in compiled code, but assertions are enabled for this execution.&quot;, ik-&gt;internal_name(), _lib-&gt;name());
+ 812     sweep_dependent_methods(klass_data);
+ 813     return false;
+ 814   }
+ 815 
+ 816   NOT_PRODUCT( aot_klasses_found++; )
+ 817 
+ 818   log_trace(aot, class, load)(&quot;found  %s  in  %s for classloader %s (%p) tid=&quot; INTPTR_FORMAT, ik-&gt;internal_name(), _lib-&gt;name(), cld-&gt;loader_name(), cld, p2i(thread));
+ 819 
+ 820   aot_class-&gt;_classloader = cld;
+ 821   // Set klass&#39;s Resolve (second) got cell.
+ 822   _klasses_got[klass_data-&gt;_got_index] = ik;
+ 823   if (ik-&gt;is_initialized()) {
+ 824     _klasses_got[klass_data-&gt;_got_index - 1] = ik;
+ 825   }
+ 826 
+ 827   // Initialize global symbols of the DSO to the corresponding VM symbol values.
+ 828   link_global_lib_symbols();
+ 829 
+ 830   int methods_offset = klass_data-&gt;_compiled_methods_offset;
+ 831   if (methods_offset &gt;= 0) {
+ 832     address methods_cnt_adr = _methods_offsets + methods_offset;
+ 833     int methods_cnt = *(int*)methods_cnt_adr;
+ 834     // Collect data about compiled methods
+ 835     AOTMethodData* methods_data = NEW_RESOURCE_ARRAY(AOTMethodData, methods_cnt);
+ 836     AOTMethodOffsets* methods_offsets = (AOTMethodOffsets*)(methods_cnt_adr + 4);
+ 837     for (int i = 0; i &lt; methods_cnt; ++i) {
+ 838       AOTMethodOffsets* method_offsets = &amp;methods_offsets[i];
+ 839       int code_id = method_offsets-&gt;_code_id;
+ 840       if (_code_to_aot[code_id]._state == invalid) {
+ 841         continue; // skip AOT methods slots which have been invalidated
+ 842       }
+ 843       AOTMethodData* method_data = &amp;methods_data[i];
+ 844       const char* aot_name = _metaspace_names + method_offsets-&gt;_name_offset;
+ 845       method_data-&gt;_name = aot_name;
+ 846       method_data-&gt;_code = _code_space  + method_offsets-&gt;_code_offset;
+ 847       method_data-&gt;_meta = (aot_metadata*)(_method_metadata + method_offsets-&gt;_meta_offset);
+ 848       method_data-&gt;_metadata_table = (address)_metadata_got + method_offsets-&gt;_metadata_got_offset;
+ 849       method_data-&gt;_metadata_size  = method_offsets-&gt;_metadata_got_size;
+ 850       // aot_name format: &quot;&lt;u2_size&gt;Ljava/lang/ThreadGroup;&lt;u2_size&gt;addUnstarted&lt;u2_size&gt;()V&quot;
+ 851       int klass_len = Bytes::get_Java_u2((address)aot_name);
+ 852       const char* method_name = aot_name + 2 + klass_len;
+ 853       Method* m = AOTCodeHeap::find_method(ik, thread, method_name);
+ 854       methodHandle mh(thread, m);
+ 855       if (mh-&gt;code() != NULL) { // Does it have already compiled code?
+ 856         continue; // Don&#39;t overwrite
+ 857       }
+ 858       publish_aot(mh, method_data, code_id);
+ 859     }
+ 860   }
+ 861   return true;
+ 862 }
+ 863 
+ 864 AOTCompiledMethod* AOTCodeHeap::next_in_use_at(int start) const {
+ 865   for (int index = start; index &lt; _method_count; index++) {
+ 866     if (_code_to_aot[index]._state != in_use) {
+ 867       continue; // Skip uninitialized entries.
+ 868     }
+ 869     AOTCompiledMethod* aot = _code_to_aot[index]._aot;
+ 870     return aot;
+ 871   }
+ 872   return NULL;
+ 873 }
+ 874 
+ 875 void* AOTCodeHeap::first() const {
+ 876   return next_in_use_at(0);
+ 877 }
+ 878 
+ 879 void* AOTCodeHeap::next(void* p) const {
+ 880   AOTCompiledMethod *aot = (AOTCompiledMethod *)p;
+ 881   int next_index = aot-&gt;method_index() + 1;
+ 882   assert(next_index &lt;= _method_count, &quot;&quot;);
+ 883   if (next_index == _method_count) {
+ 884     return NULL;
+ 885   }
+ 886   return next_in_use_at(next_index);
+ 887 }
+ 888 
+ 889 void* AOTCodeHeap::find_start(void* p) const {
+ 890   if (!contains(p)) {
+ 891     return NULL;
+ 892   }
+ 893   size_t offset = pointer_delta(p, low_boundary(), 1);
+ 894   // Use segments table
+ 895   size_t seg_idx = offset / _lib-&gt;config()-&gt;_codeSegmentSize;
+ 896   if ((int)(_code_segments[seg_idx]) == 0xff) {
+ 897     return NULL;
+ 898   }
+ 899   while (_code_segments[seg_idx] &gt; 0) {
+ 900     seg_idx -= (int)_code_segments[seg_idx];
+ 901   }
+ 902   int code_offset = (int)seg_idx * _lib-&gt;config()-&gt;_codeSegmentSize;
+ 903   int aot_index = *(int*)(_code_space + code_offset);
+ 904   AOTCompiledMethod* aot = _code_to_aot[aot_index]._aot;
+ 905   assert(aot != NULL, &quot;should find registered aot method&quot;);
+ 906   return aot;
+ 907 }
+ 908 
+ 909 AOTCompiledMethod* AOTCodeHeap::find_aot(address p) const {
+ 910   assert(contains(p), &quot;should be here&quot;);
+ 911   return (AOTCompiledMethod *)find_start(p);
+ 912 }
+ 913 
+ 914 CodeBlob* AOTCodeHeap::find_blob_unsafe(void* start) const {
+ 915   return (CodeBlob*)AOTCodeHeap::find_start(start);
+ 916 }
+ 917 
+ 918 void AOTCodeHeap::oops_do(OopClosure* f) {
+ 919   for (int i = 0; i &lt; _oop_got_size; i++) {
+ 920     oop* p = &amp;_oop_got[i];
+ 921     if (*p == NULL)  continue;  // skip non-oops
+ 922     f-&gt;do_oop(p);
+ 923   }
+ 924   for (int index = 0; index &lt; _method_count; index++) {
+ 925     if (_code_to_aot[index]._state != in_use) {
+ 926       continue; // Skip uninitialized entries.
+ 927     }
+ 928     AOTCompiledMethod* aot = _code_to_aot[index]._aot;
+ 929     aot-&gt;do_oops(f);
+ 930   }
+ 931 }
+ 932 
+ 933 // Scan only klasses_got cells which should have only Klass*,
+ 934 // metadata_got cells are scanned only for alive AOT methods
+ 935 // by AOTCompiledMethod::metadata_do().
+ 936 void AOTCodeHeap::got_metadata_do(MetadataClosure* f) {
+ 937   for (int i = 1; i &lt; _klasses_got_size; i++) {
+ 938     Metadata** p = &amp;_klasses_got[i];
+ 939     Metadata* md = *p;
+ 940     if (md == NULL)  continue;  // skip non-oops
+ 941     if (Metaspace::contains(md)) {
+ 942       f-&gt;do_metadata(md);
+ 943     } else {
+ 944       intptr_t meta = (intptr_t)md;
+ 945       fatal(&quot;Invalid value in _klasses_got[%d] = &quot; INTPTR_FORMAT, i, meta);
+ 946     }
+ 947   }
+ 948 }
+ 949 
+ 950 void AOTCodeHeap::cleanup_inline_caches() {
+ 951   for (int index = 0; index &lt; _method_count; index++) {
+ 952     if (_code_to_aot[index]._state != in_use) {
+ 953       continue; // Skip uninitialized entries.
+ 954     }
+ 955     AOTCompiledMethod* aot = _code_to_aot[index]._aot;
+ 956     aot-&gt;cleanup_inline_caches(false);
+ 957   }
+ 958 }
+ 959 
+ 960 #ifdef ASSERT
+ 961 int AOTCodeHeap::verify_icholder_relocations() {
+ 962   int count = 0;
+ 963   for (int index = 0; index &lt; _method_count; index++) {
+ 964     if (_code_to_aot[index]._state != in_use) {
+ 965       continue; // Skip uninitialized entries.
+ 966     }
+ 967     AOTCompiledMethod* aot = _code_to_aot[index]._aot;
+ 968     count += aot-&gt;verify_icholder_relocations();
+ 969   }
+ 970   return count;
+ 971 }
+ 972 #endif
+ 973 
+ 974 void AOTCodeHeap::metadata_do(MetadataClosure* f) {
+ 975   for (int index = 0; index &lt; _method_count; index++) {
+ 976     if (_code_to_aot[index]._state != in_use) {
+ 977       continue; // Skip uninitialized entries.
+ 978     }
+ 979     AOTCompiledMethod* aot = _code_to_aot[index]._aot;
+ 980     if (aot-&gt;_is_alive()) {
+ 981       aot-&gt;metadata_do(f);
+ 982     }
+ 983   }
+ 984   // Scan klasses_got cells.
+ 985   got_metadata_do(f);
+ 986 }
+ 987 
+ 988 bool AOTCodeHeap::reconcile_dynamic_klass(AOTCompiledMethod *caller, InstanceKlass* holder, int index, Klass *dyno_klass, const char *descriptor1, const char *descriptor2) {
+ 989   const char * const descriptors[2] = {descriptor1, descriptor2};
+ 990   JavaThread *thread = JavaThread::current();
+ 991   ResourceMark rm(thread);
+ 992 
+ 993   AOTKlassData* holder_data = find_klass(holder);
+ 994   vmassert(holder_data != NULL, &quot;klass %s not found&quot;, holder-&gt;signature_name());
+ 995   vmassert(is_dependent_method(holder, caller), &quot;sanity&quot;);
+ 996 
+ 997   AOTKlassData* dyno_data = NULL;
+ 998   bool adapter_failed = false;
+ 999   char buf[64];
+1000   int descriptor_index = 0;
+1001   // descriptors[0] specific name (&quot;adapter:&lt;method_id&gt;&quot;) for matching
+1002   // descriptors[1] fall-back name (&quot;adapter&quot;) for depdencies
+1003   while (descriptor_index &lt; 2) {
+1004     const char *descriptor = descriptors[descriptor_index];
+1005     if (descriptor == NULL) {
+1006       break;
+1007     }
+1008     jio_snprintf(buf, sizeof buf, &quot;%s&lt;%d:%d&gt;&quot;, descriptor, holder_data-&gt;_class_id, index);
+1009     dyno_data = find_klass(buf);
+1010     if (dyno_data != NULL) {
+1011       break;
+1012     }
+1013     // If match failed then try fall-back for dependencies
+1014     ++descriptor_index;
+1015     adapter_failed = true;
+1016   }
+1017 
+1018   if (dyno_data == NULL &amp;&amp; dyno_klass == NULL) {
+1019     // all is well, no (appendix) at compile-time, and still none
+1020     return true;
+1021   }
+1022 
+1023   if (dyno_data == NULL) {
+1024     // no (appendix) at build-time, but now there is
+1025     sweep_dependent_methods(holder_data);
+1026     return false;
+1027   }
+1028 
+1029   if (adapter_failed) {
+1030     // adapter method mismatch
+1031     sweep_dependent_methods(holder_data);
+1032     sweep_dependent_methods(dyno_data);
+1033     return false;
+1034   }
+1035 
+1036   if (dyno_klass == NULL) {
+1037     // (appendix) at build-time, none now
+1038     sweep_dependent_methods(holder_data);
+1039     sweep_dependent_methods(dyno_data);
+1040     return false;
+1041   }
+1042 
+1043   // TODO: support array appendix object
+1044   if (!dyno_klass-&gt;is_instance_klass()) {
+1045     sweep_dependent_methods(holder_data);
+1046     sweep_dependent_methods(dyno_data);
+1047     return false;
+1048   }
+1049 
+1050   InstanceKlass* dyno = InstanceKlass::cast(dyno_klass);
+1051 
+1052   if (!dyno-&gt;is_unsafe_anonymous()) {
+1053     if (_klasses_got[dyno_data-&gt;_got_index] != dyno) {
+1054       // compile-time class different from runtime class, fail and deoptimize
+1055       sweep_dependent_methods(holder_data);
+1056       sweep_dependent_methods(dyno_data);
+1057       return false;
+1058     }
+1059 
+1060     if (dyno-&gt;is_initialized()) {
+1061       _klasses_got[dyno_data-&gt;_got_index - 1] = dyno;
+1062     }
+1063     return true;
+1064   }
+1065 
+1066   // TODO: support anonymous supers
+1067   if (!dyno-&gt;supers_have_passed_fingerprint_checks() || dyno-&gt;get_stored_fingerprint() != dyno_data-&gt;_fingerprint) {
+1068       NOT_PRODUCT( aot_klasses_fp_miss++; )
+1069       log_trace(aot, class, fingerprint)(&quot;class  %s%s  has bad fingerprint in  %s tid=&quot; INTPTR_FORMAT,
+1070           dyno-&gt;internal_name(), dyno-&gt;is_shared() ? &quot; (shared)&quot; : &quot;&quot;,
+1071           _lib-&gt;name(), p2i(thread));
+1072     sweep_dependent_methods(holder_data);
+1073     sweep_dependent_methods(dyno_data);
+1074     return false;
+1075   }
+1076 
+1077   _klasses_got[dyno_data-&gt;_got_index] = dyno;
+1078   if (dyno-&gt;is_initialized()) {
+1079     _klasses_got[dyno_data-&gt;_got_index - 1] = dyno;
+1080   }
+1081 
+1082   // TODO: hook up any AOT code
+1083   // load_klass_data(dyno_data, thread);
+1084   return true;
+1085 }
+1086 
+1087 bool AOTCodeHeap::reconcile_dynamic_method(AOTCompiledMethod *caller, InstanceKlass* holder, int index, Method *adapter_method) {
+1088     InstanceKlass *adapter_klass = adapter_method-&gt;method_holder();
+1089     char buf[64];
+1090     jio_snprintf(buf, sizeof buf, &quot;adapter:%d&quot;, adapter_method-&gt;method_idnum());
+1091     if (!reconcile_dynamic_klass(caller, holder, index, adapter_klass, buf, &quot;adapter&quot;)) {
+1092       return false;
+1093     }
+1094     return true;
+1095 }
+1096 
+1097 bool AOTCodeHeap::reconcile_dynamic_invoke(AOTCompiledMethod* caller, InstanceKlass* holder, int index, Method* adapter_method, Klass *appendix_klass) {
+1098     if (!reconcile_dynamic_klass(caller, holder, index, appendix_klass, &quot;appendix&quot;)) {
+1099       return false;
+1100     }
+1101 
+1102     if (!reconcile_dynamic_method(caller, holder, index, adapter_method)) {
+1103       return false;
+1104     }
+1105 
+1106     return true;
+1107 }
+<a name="2" id="anc2"></a><b style="font-size: large; color: red">--- EOF ---</b>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+</pre>
+<input id="eof" value="2" type="hidden" />
+</body>
+</html>
