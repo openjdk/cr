@@ -1,0 +1,326 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>New src/hotspot/share/gc/shared/cardGeneration.cpp</title>
+    <link rel="stylesheet" href="../../../../../style.css" />
+  </head>
+  <body>
+    <pre>
+  1 /*
+  2  * Copyright (c) 2014, 2018, Oracle and/or its affiliates. All rights reserved.
+  3  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  4  *
+  5  * This code is free software; you can redistribute it and/or modify it
+  6  * under the terms of the GNU General Public License version 2 only, as
+  7  * published by the Free Software Foundation.
+  8  *
+  9  * This code is distributed in the hope that it will be useful, but WITHOUT
+ 10  * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ 11  * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ 12  * version 2 for more details (a copy is included in the LICENSE file that
+ 13  * accompanied this code).
+ 14  *
+ 15  * You should have received a copy of the GNU General Public License version
+ 16  * 2 along with this work; if not, write to the Free Software Foundation,
+ 17  * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ 18  *
+ 19  * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ 20  * or visit www.oracle.com if you need additional information or have any
+ 21  * questions.
+ 22  *
+ 23  */
+ 24 
+ 25 #include &quot;precompiled.hpp&quot;
+ 26 
+ 27 #include &quot;gc/shared/blockOffsetTable.inline.hpp&quot;
+ 28 #include &quot;gc/shared/cardGeneration.inline.hpp&quot;
+ 29 #include &quot;gc/shared/cardTableRS.hpp&quot;
+ 30 #include &quot;gc/shared/gcLocker.hpp&quot;
+ 31 #include &quot;gc/shared/genCollectedHeap.hpp&quot;
+ 32 #include &quot;gc/shared/genOopClosures.inline.hpp&quot;
+ 33 #include &quot;gc/shared/generationSpec.hpp&quot;
+ 34 #include &quot;gc/shared/space.inline.hpp&quot;
+ 35 #include &quot;memory/iterator.hpp&quot;
+ 36 #include &quot;memory/memRegion.hpp&quot;
+ 37 #include &quot;logging/log.hpp&quot;
+ 38 #include &quot;runtime/java.hpp&quot;
+ 39 
+ 40 CardGeneration::CardGeneration(ReservedSpace rs,
+ 41                                size_t initial_byte_size,
+ 42                                CardTableRS* remset) :
+ 43   Generation(rs, initial_byte_size), _rs(remset),
+ 44   _shrink_factor(0), _min_heap_delta_bytes(), _capacity_at_prologue(),
+ 45   _used_at_prologue()
+ 46 {
+ 47   HeapWord* start = (HeapWord*)rs.base();
+ 48   size_t reserved_byte_size = rs.size();
+ 49   assert((uintptr_t(start) &amp; 3) == 0, &quot;bad alignment&quot;);
+ 50   assert((reserved_byte_size &amp; 3) == 0, &quot;bad alignment&quot;);
+ 51   MemRegion reserved_mr(start, heap_word_size(reserved_byte_size));
+ 52   _bts = new BlockOffsetSharedArray(reserved_mr,
+ 53                                     heap_word_size(initial_byte_size));
+ 54   MemRegion committed_mr(start, heap_word_size(initial_byte_size));
+ 55   _rs-&gt;resize_covered_region(committed_mr);
+ 56 
+ 57   // Verify that the start and end of this generation is the start of a card.
+ 58   // If this wasn&#39;t true, a single card could span more than on generation,
+ 59   // which would cause problems when we commit/uncommit memory, and when we
+ 60   // clear and dirty cards.
+ 61   guarantee(_rs-&gt;is_aligned(reserved_mr.start()), &quot;generation must be card aligned&quot;);
+ 62   if (reserved_mr.end() != GenCollectedHeap::heap()-&gt;reserved_region().end()) {
+ 63     // Don&#39;t check at the very end of the heap as we&#39;ll assert that we&#39;re probing off
+ 64     // the end if we try.
+ 65     guarantee(_rs-&gt;is_aligned(reserved_mr.end()), &quot;generation must be card aligned&quot;);
+ 66   }
+ 67   _min_heap_delta_bytes = MinHeapDeltaBytes;
+ 68   _capacity_at_prologue = initial_byte_size;
+ 69   _used_at_prologue = 0;
+ 70 }
+ 71 
+ 72 bool CardGeneration::grow_by(size_t bytes) {
+ 73   assert_correct_size_change_locking();
+ 74   bool result = _virtual_space.expand_by(bytes);
+ 75   if (result) {
+ 76     size_t new_word_size =
+ 77        heap_word_size(_virtual_space.committed_size());
+ 78     MemRegion mr(space()-&gt;bottom(), new_word_size);
+ 79     // Expand card table
+ 80     GenCollectedHeap::heap()-&gt;rem_set()-&gt;resize_covered_region(mr);
+ 81     // Expand shared block offset array
+ 82     _bts-&gt;resize(new_word_size);
+ 83 
+ 84     // Fix for bug #4668531
+ 85     if (ZapUnusedHeapArea) {
+ 86       MemRegion mangle_region(space()-&gt;end(),
+ 87       (HeapWord*)_virtual_space.high());
+ 88       SpaceMangler::mangle_region(mangle_region);
+ 89     }
+ 90 
+ 91     // Expand space -- also expands space&#39;s BOT
+ 92     // (which uses (part of) shared array above)
+ 93     space()-&gt;set_end((HeapWord*)_virtual_space.high());
+ 94 
+ 95     // update the space and generation capacity counters
+ 96     update_counters();
+ 97 
+ 98     size_t new_mem_size = _virtual_space.committed_size();
+ 99     size_t old_mem_size = new_mem_size - bytes;
+100     log_trace(gc, heap)(&quot;Expanding %s from &quot; SIZE_FORMAT &quot;K by &quot; SIZE_FORMAT &quot;K to &quot; SIZE_FORMAT &quot;K&quot;,
+101                     name(), old_mem_size/K, bytes/K, new_mem_size/K);
+102   }
+103   return result;
+104 }
+105 
+106 bool CardGeneration::expand(size_t bytes, size_t expand_bytes) {
+107   assert_locked_or_safepoint(Heap_lock);
+108   if (bytes == 0) {
+109     return true;  // That&#39;s what grow_by(0) would return
+110   }
+111   size_t aligned_bytes  = ReservedSpace::page_align_size_up(bytes);
+112   if (aligned_bytes == 0){
+113     // The alignment caused the number of bytes to wrap.  An expand_by(0) will
+114     // return true with the implication that an expansion was done when it
+115     // was not.  A call to expand implies a best effort to expand by &quot;bytes&quot;
+116     // but not a guarantee.  Align down to give a best effort.  This is likely
+117     // the most that the generation can expand since it has some capacity to
+118     // start with.
+119     aligned_bytes = ReservedSpace::page_align_size_down(bytes);
+120   }
+121   size_t aligned_expand_bytes = ReservedSpace::page_align_size_up(expand_bytes);
+122   bool success = false;
+123   if (aligned_expand_bytes &gt; aligned_bytes) {
+124     success = grow_by(aligned_expand_bytes);
+125   }
+126   if (!success) {
+127     success = grow_by(aligned_bytes);
+128   }
+129   if (!success) {
+130     success = grow_to_reserved();
+131   }
+132   if (success &amp;&amp; GCLocker::is_active_and_needs_gc()) {
+133     log_trace(gc, heap)(&quot;Garbage collection disabled, expanded heap instead&quot;);
+134   }
+135 
+136   return success;
+137 }
+138 
+139 bool CardGeneration::grow_to_reserved() {
+140   assert_correct_size_change_locking();
+141   bool success = true;
+142   const size_t remaining_bytes = _virtual_space.uncommitted_size();
+143   if (remaining_bytes &gt; 0) {
+144     success = grow_by(remaining_bytes);
+145     DEBUG_ONLY(if (!success) log_warning(gc)(&quot;grow to reserved failed&quot;);)
+146   }
+147   return success;
+148 }
+149 
+150 void CardGeneration::shrink(size_t bytes) {
+151   assert_correct_size_change_locking();
+152 
+153   size_t size = ReservedSpace::page_align_size_down(bytes);
+154   if (size == 0) {
+155     return;
+156   }
+157 
+158   // Shrink committed space
+159   _virtual_space.shrink_by(size);
+160   // Shrink space; this also shrinks the space&#39;s BOT
+161   space()-&gt;set_end((HeapWord*) _virtual_space.high());
+162   size_t new_word_size = heap_word_size(space()-&gt;capacity());
+163   // Shrink the shared block offset array
+164   _bts-&gt;resize(new_word_size);
+165   MemRegion mr(space()-&gt;bottom(), new_word_size);
+166   // Shrink the card table
+167   GenCollectedHeap::heap()-&gt;rem_set()-&gt;resize_covered_region(mr);
+168 
+169   size_t new_mem_size = _virtual_space.committed_size();
+170   size_t old_mem_size = new_mem_size + size;
+171   log_trace(gc, heap)(&quot;Shrinking %s from &quot; SIZE_FORMAT &quot;K to &quot; SIZE_FORMAT &quot;K&quot;,
+172                       name(), old_mem_size/K, new_mem_size/K);
+173 }
+174 
+175 // No young generation references, clear this generation&#39;s cards.
+176 void CardGeneration::clear_remembered_set() {
+177   _rs-&gt;clear(reserved());
+178 }
+179 
+180 // Objects in this generation may have moved, invalidate this
+181 // generation&#39;s cards.
+182 void CardGeneration::invalidate_remembered_set() {
+183   _rs-&gt;invalidate(used_region());
+184 }
+185 
+186 void CardGeneration::compute_new_size() {
+187   assert(_shrink_factor &lt;= 100, &quot;invalid shrink factor&quot;);
+188   size_t current_shrink_factor = _shrink_factor;
+189   _shrink_factor = 0;
+190 
+191   // We don&#39;t have floating point command-line arguments
+192   // Note:  argument processing ensures that MinHeapFreeRatio &lt; 100.
+193   const double minimum_free_percentage = MinHeapFreeRatio / 100.0;
+194   const double maximum_used_percentage = 1.0 - minimum_free_percentage;
+195 
+196   // Compute some numbers about the state of the heap.
+197   const size_t used_after_gc = used();
+198   const size_t capacity_after_gc = capacity();
+199 
+200   const double min_tmp = used_after_gc / maximum_used_percentage;
+201   size_t minimum_desired_capacity = (size_t)MIN2(min_tmp, double(max_uintx));
+202   // Don&#39;t shrink less than the initial generation size
+203   minimum_desired_capacity = MAX2(minimum_desired_capacity, initial_size());
+204   assert(used_after_gc &lt;= minimum_desired_capacity, &quot;sanity check&quot;);
+205 
+206     const size_t free_after_gc = free();
+207     const double free_percentage = ((double)free_after_gc) / capacity_after_gc;
+208     log_trace(gc, heap)(&quot;CardGeneration::compute_new_size:&quot;);
+209     log_trace(gc, heap)(&quot;    minimum_free_percentage: %6.2f  maximum_used_percentage: %6.2f&quot;,
+210                   minimum_free_percentage,
+211                   maximum_used_percentage);
+212     log_trace(gc, heap)(&quot;     free_after_gc   : %6.1fK   used_after_gc   : %6.1fK   capacity_after_gc   : %6.1fK&quot;,
+213                   free_after_gc / (double) K,
+214                   used_after_gc / (double) K,
+215                   capacity_after_gc / (double) K);
+216     log_trace(gc, heap)(&quot;     free_percentage: %6.2f&quot;, free_percentage);
+217 
+218   if (capacity_after_gc &lt; minimum_desired_capacity) {
+219     // If we have less free space than we want then expand
+220     size_t expand_bytes = minimum_desired_capacity - capacity_after_gc;
+221     // Don&#39;t expand unless it&#39;s significant
+222     if (expand_bytes &gt;= _min_heap_delta_bytes) {
+223       expand(expand_bytes, 0); // safe if expansion fails
+224     }
+225     log_trace(gc, heap)(&quot;    expanding:  minimum_desired_capacity: %6.1fK  expand_bytes: %6.1fK  _min_heap_delta_bytes: %6.1fK&quot;,
+226                   minimum_desired_capacity / (double) K,
+227                   expand_bytes / (double) K,
+228                   _min_heap_delta_bytes / (double) K);
+229     return;
+230   }
+231 
+232   // No expansion, now see if we want to shrink
+233   size_t shrink_bytes = 0;
+234   // We would never want to shrink more than this
+235   size_t max_shrink_bytes = capacity_after_gc - minimum_desired_capacity;
+236 
+237   if (MaxHeapFreeRatio &lt; 100) {
+238     const double maximum_free_percentage = MaxHeapFreeRatio / 100.0;
+239     const double minimum_used_percentage = 1.0 - maximum_free_percentage;
+240     const double max_tmp = used_after_gc / minimum_used_percentage;
+241     size_t maximum_desired_capacity = (size_t)MIN2(max_tmp, double(max_uintx));
+242     maximum_desired_capacity = MAX2(maximum_desired_capacity, initial_size());
+243     log_trace(gc, heap)(&quot;    maximum_free_percentage: %6.2f  minimum_used_percentage: %6.2f&quot;,
+244                              maximum_free_percentage, minimum_used_percentage);
+245     log_trace(gc, heap)(&quot;    _capacity_at_prologue: %6.1fK  minimum_desired_capacity: %6.1fK  maximum_desired_capacity: %6.1fK&quot;,
+246                              _capacity_at_prologue / (double) K,
+247                              minimum_desired_capacity / (double) K,
+248                              maximum_desired_capacity / (double) K);
+249     assert(minimum_desired_capacity &lt;= maximum_desired_capacity,
+250            &quot;sanity check&quot;);
+251 
+252     if (capacity_after_gc &gt; maximum_desired_capacity) {
+253       // Capacity too large, compute shrinking size
+254       shrink_bytes = capacity_after_gc - maximum_desired_capacity;
+255       if (ShrinkHeapInSteps) {
+256         // If ShrinkHeapInSteps is true (the default),
+257         // we don&#39;t want to shrink all the way back to initSize if people call
+258         // System.gc(), because some programs do that between &quot;phases&quot; and then
+259         // we&#39;d just have to grow the heap up again for the next phase.  So we
+260         // damp the shrinking: 0% on the first call, 10% on the second call, 40%
+261         // on the third call, and 100% by the fourth call.  But if we recompute
+262         // size without shrinking, it goes back to 0%.
+263         shrink_bytes = shrink_bytes / 100 * current_shrink_factor;
+264         if (current_shrink_factor == 0) {
+265           _shrink_factor = 10;
+266         } else {
+267           _shrink_factor = MIN2(current_shrink_factor * 4, (size_t) 100);
+268         }
+269       }
+270       assert(shrink_bytes &lt;= max_shrink_bytes, &quot;invalid shrink size&quot;);
+271       log_trace(gc, heap)(&quot;    shrinking:  initSize: %.1fK  maximum_desired_capacity: %.1fK&quot;,
+272                                initial_size() / (double) K, maximum_desired_capacity / (double) K);
+273       log_trace(gc, heap)(&quot;    shrink_bytes: %.1fK  current_shrink_factor: &quot; SIZE_FORMAT &quot;  new shrink factor: &quot; SIZE_FORMAT &quot;  _min_heap_delta_bytes: %.1fK&quot;,
+274                                shrink_bytes / (double) K,
+275                                current_shrink_factor,
+276                                _shrink_factor,
+277                                _min_heap_delta_bytes / (double) K);
+278     }
+279   }
+280 
+281   if (capacity_after_gc &gt; _capacity_at_prologue) {
+282     // We might have expanded for promotions, in which case we might want to
+283     // take back that expansion if there&#39;s room after GC.  That keeps us from
+284     // stretching the heap with promotions when there&#39;s plenty of room.
+285     size_t expansion_for_promotion = capacity_after_gc - _capacity_at_prologue;
+286     expansion_for_promotion = MIN2(expansion_for_promotion, max_shrink_bytes);
+287     // We have two shrinking computations, take the largest
+288     shrink_bytes = MAX2(shrink_bytes, expansion_for_promotion);
+289     assert(shrink_bytes &lt;= max_shrink_bytes, &quot;invalid shrink size&quot;);
+290     log_trace(gc, heap)(&quot;    aggressive shrinking:  _capacity_at_prologue: %.1fK  capacity_after_gc: %.1fK  expansion_for_promotion: %.1fK  shrink_bytes: %.1fK&quot;,
+291                         capacity_after_gc / (double) K,
+292                         _capacity_at_prologue / (double) K,
+293                         expansion_for_promotion / (double) K,
+294                         shrink_bytes / (double) K);
+295   }
+296   // Don&#39;t shrink unless it&#39;s significant
+297   if (shrink_bytes &gt;= _min_heap_delta_bytes) {
+298     shrink(shrink_bytes);
+299   }
+300 }
+301 
+302 // Currently nothing to do.
+303 void CardGeneration::prepare_for_verify() {}
+304 
+305 void CardGeneration::space_iterate(SpaceClosure* blk,
+306                                                  bool usedOnly) {
+307   blk-&gt;do_space(space());
+308 }
+309 
+310 void CardGeneration::younger_refs_iterate(OopsInGenClosure* blk, uint n_threads) {
+311   blk-&gt;set_generation(this);
+312   younger_refs_in_space_iterate(space(), blk, n_threads);
+313   blk-&gt;reset_generation();
+314 }
+    </pre>
+  </body>
+</html>
