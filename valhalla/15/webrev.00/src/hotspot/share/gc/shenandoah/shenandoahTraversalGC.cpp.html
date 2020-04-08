@@ -1,0 +1,1129 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>New src/hotspot/share/gc/shenandoah/shenandoahTraversalGC.cpp</title>
+    <link rel="stylesheet" href="../../../../../style.css" />
+  </head>
+  <body>
+    <pre>
+   1 /*
+   2  * Copyright (c) 2018, 2020, Red Hat, Inc. All rights reserved.
+   3  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+   4  *
+   5  * This code is free software; you can redistribute it and/or modify it
+   6  * under the terms of the GNU General Public License version 2 only, as
+   7  * published by the Free Software Foundation.
+   8  *
+   9  * This code is distributed in the hope that it will be useful, but WITHOUT
+  10  * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+  11  * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+  12  * version 2 for more details (a copy is included in the LICENSE file that
+  13  * accompanied this code).
+  14  *
+  15  * You should have received a copy of the GNU General Public License version
+  16  * 2 along with this work; if not, write to the Free Software Foundation,
+  17  * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+  18  *
+  19  * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+  20  * or visit www.oracle.com if you need additional information or have any
+  21  * questions.
+  22  *
+  23  */
+  24 
+  25 #include &quot;precompiled.hpp&quot;
+  26 
+  27 #include &quot;classfile/classLoaderData.hpp&quot;
+  28 #include &quot;classfile/classLoaderDataGraph.hpp&quot;
+  29 #include &quot;gc/shared/referenceProcessor.hpp&quot;
+  30 #include &quot;gc/shared/referenceProcessorPhaseTimes.hpp&quot;
+  31 #include &quot;gc/shared/workgroup.hpp&quot;
+  32 #include &quot;gc/shenandoah/shenandoahBarrierSet.hpp&quot;
+  33 #include &quot;gc/shenandoah/shenandoahClosures.inline.hpp&quot;
+  34 #include &quot;gc/shenandoah/shenandoahCodeRoots.hpp&quot;
+  35 #include &quot;gc/shenandoah/shenandoahCollectionSet.hpp&quot;
+  36 #include &quot;gc/shenandoah/shenandoahCollectorPolicy.hpp&quot;
+  37 #include &quot;gc/shenandoah/shenandoahFreeSet.hpp&quot;
+  38 #include &quot;gc/shenandoah/shenandoahPhaseTimings.hpp&quot;
+  39 #include &quot;gc/shenandoah/shenandoahHeap.inline.hpp&quot;
+  40 #include &quot;gc/shenandoah/shenandoahHeapRegionSet.inline.hpp&quot;
+  41 #include &quot;gc/shenandoah/shenandoahHeuristics.hpp&quot;
+  42 #include &quot;gc/shenandoah/shenandoahMarkingContext.inline.hpp&quot;
+  43 #include &quot;gc/shenandoah/shenandoahOopClosures.inline.hpp&quot;
+  44 #include &quot;gc/shenandoah/shenandoahPhaseTimings.hpp&quot;
+  45 #include &quot;gc/shenandoah/shenandoahRootProcessor.inline.hpp&quot;
+  46 #include &quot;gc/shenandoah/shenandoahStringDedup.hpp&quot;
+  47 #include &quot;gc/shenandoah/shenandoahTaskqueue.inline.hpp&quot;
+  48 #include &quot;gc/shenandoah/shenandoahTraversalGC.hpp&quot;
+  49 #include &quot;gc/shenandoah/shenandoahUtils.hpp&quot;
+  50 #include &quot;gc/shenandoah/shenandoahVerifier.hpp&quot;
+  51 
+  52 #include &quot;memory/iterator.hpp&quot;
+  53 #include &quot;memory/metaspace.hpp&quot;
+  54 #include &quot;memory/resourceArea.hpp&quot;
+  55 #include &quot;memory/universe.hpp&quot;
+  56 
+  57 /**
+  58  * NOTE: We are using the SATB buffer in thread.hpp and satbMarkQueue.hpp, however, it is not an SATB algorithm.
+  59  * We&#39;re using the buffer as generic oop buffer to enqueue new values in concurrent oop stores, IOW, the algorithm
+  60  * is incremental-update-based.
+  61  *
+  62  * NOTE on interaction with TAMS: we want to avoid traversing new objects for
+  63  * several reasons:
+  64  * - We will not reclaim them in this cycle anyway, because they are not in the
+  65  *   cset
+  66  * - It makes up for the bulk of work during final-pause
+  67  * - It also shortens the concurrent cycle because we don&#39;t need to
+  68  *   pointlessly traverse through newly allocated objects.
+  69  * - As a nice side-effect, it solves the I-U termination problem (mutators
+  70  *   cannot outrun the GC by allocating like crazy)
+  71  * - It is an easy way to achieve MWF. What MWF does is to also enqueue the
+  72  *   target object of stores if it&#39;s new. Treating new objects live implicitely
+  73  *   achieves the same, but without extra barriers. I think the effect of
+  74  *   shortened final-pause (mentioned above) is the main advantage of MWF. In
+  75  *   particular, we will not see the head of a completely new long linked list
+  76  *   in final-pause and end up traversing huge chunks of the heap there.
+  77  * - We don&#39;t need to see/update the fields of new objects either, because they
+  78  *   are either still null, or anything that&#39;s been stored into them has been
+  79  *   evacuated+enqueued before (and will thus be treated later).
+  80  *
+  81  * We achieve this by setting TAMS for each region, and everything allocated
+  82  * beyond TAMS will be &#39;implicitely marked&#39;.
+  83  *
+  84  * Gotchas:
+  85  * - While we want new objects to be implicitely marked, we don&#39;t want to count
+  86  *   them alive. Otherwise the next cycle wouldn&#39;t pick them up and consider
+  87  *   them for cset. This means that we need to protect such regions from
+  88  *   getting accidentally thrashed at the end of traversal cycle. This is why I
+  89  *   keep track of alloc-regions and check is_alloc_region() in the trashing
+  90  *   code.
+  91  * - We *need* to traverse through evacuated objects. Those objects are
+  92  *   pre-existing, and any references in them point to interesting objects that
+  93  *   we need to see. We also want to count them as live, because we just
+  94  *   determined that they are alive :-) I achieve this by upping TAMS
+  95  *   concurrently for every gclab/gc-shared alloc before publishing the
+  96  *   evacuated object. This way, the GC threads will not consider such objects
+  97  *   implictely marked, and traverse through them as normal.
+  98  */
+  99 class ShenandoahTraversalSATBBufferClosure : public SATBBufferClosure {
+ 100 private:
+ 101   ShenandoahObjToScanQueue* _queue;
+ 102   ShenandoahTraversalGC* _traversal_gc;
+ 103   ShenandoahHeap* const _heap;
+ 104 
+ 105 public:
+ 106   ShenandoahTraversalSATBBufferClosure(ShenandoahObjToScanQueue* q) :
+ 107     _queue(q),
+ 108     _heap(ShenandoahHeap::heap())
+ 109  { }
+ 110 
+ 111   void do_buffer(void** buffer, size_t size) {
+ 112     for (size_t i = 0; i &lt; size; ++i) {
+ 113       oop* p = (oop*) &amp;buffer[i];
+ 114       oop obj = RawAccess&lt;&gt;::oop_load(p);
+ 115       shenandoah_assert_not_forwarded(p, obj);
+ 116       if (_heap-&gt;marking_context()-&gt;mark(obj)) {
+ 117         _queue-&gt;push(ShenandoahMarkTask(obj));
+ 118       }
+ 119     }
+ 120   }
+ 121 };
+ 122 
+ 123 class ShenandoahTraversalSATBThreadsClosure : public ThreadClosure {
+ 124 private:
+ 125   ShenandoahTraversalSATBBufferClosure* _satb_cl;
+ 126 
+ 127 public:
+ 128   ShenandoahTraversalSATBThreadsClosure(ShenandoahTraversalSATBBufferClosure* satb_cl) :
+ 129     _satb_cl(satb_cl) {}
+ 130 
+ 131   void do_thread(Thread* thread) {
+ 132     ShenandoahThreadLocalData::satb_mark_queue(thread).apply_closure_and_empty(_satb_cl);
+ 133   }
+ 134 };
+ 135 
+ 136 // Like CLDToOopClosure, but clears has_modified_oops, so that we can record modified CLDs during traversal
+ 137 // and remark them later during final-traversal.
+ 138 class ShenandoahMarkCLDClosure : public CLDClosure {
+ 139 private:
+ 140   OopClosure* _cl;
+ 141 public:
+ 142   ShenandoahMarkCLDClosure(OopClosure* cl) : _cl(cl) {}
+ 143   void do_cld(ClassLoaderData* cld) {
+ 144     cld-&gt;oops_do(_cl, ClassLoaderData::_claim_strong, true);
+ 145   }
+ 146 };
+ 147 
+ 148 // Like CLDToOopClosure, but only process modified CLDs
+ 149 class ShenandoahRemarkCLDClosure : public CLDClosure {
+ 150 private:
+ 151   OopClosure* _cl;
+ 152 public:
+ 153   ShenandoahRemarkCLDClosure(OopClosure* cl) : _cl(cl) {}
+ 154   void do_cld(ClassLoaderData* cld) {
+ 155     if (cld-&gt;has_modified_oops()) {
+ 156       cld-&gt;oops_do(_cl, ClassLoaderData::_claim_strong, true);
+ 157     }
+ 158   }
+ 159 };
+ 160 
+ 161 class ShenandoahInitTraversalCollectionTask : public AbstractGangTask {
+ 162 private:
+ 163   ShenandoahCSetRootScanner* _rp;
+ 164   ShenandoahHeap* _heap;
+ 165 
+ 166 public:
+ 167   ShenandoahInitTraversalCollectionTask(ShenandoahCSetRootScanner* rp) :
+ 168     AbstractGangTask(&quot;Shenandoah Init Traversal Collection&quot;),
+ 169     _rp(rp),
+ 170     _heap(ShenandoahHeap::heap()) {}
+ 171 
+ 172   void work(uint worker_id) {
+ 173     ShenandoahParallelWorkerSession worker_session(worker_id);
+ 174 
+ 175     ShenandoahObjToScanQueueSet* queues = _heap-&gt;traversal_gc()-&gt;task_queues();
+ 176     ShenandoahObjToScanQueue* q = queues-&gt;queue(worker_id);
+ 177 
+ 178     bool process_refs = _heap-&gt;process_references();
+ 179     bool unload_classes = _heap-&gt;unload_classes();
+ 180     ReferenceProcessor* rp = NULL;
+ 181     if (process_refs) {
+ 182       rp = _heap-&gt;ref_processor();
+ 183     }
+ 184 
+ 185     // Step 1: Process ordinary GC roots.
+ 186     {
+ 187       ShenandoahTraversalRootsClosure roots_cl(q, rp);
+ 188       ShenandoahMarkCLDClosure cld_cl(&amp;roots_cl);
+ 189       MarkingCodeBlobClosure code_cl(&amp;roots_cl, CodeBlobToOopClosure::FixRelocations);
+ 190       if (unload_classes) {
+ 191         _rp-&gt;roots_do(worker_id, &amp;roots_cl, NULL, &amp;code_cl);
+ 192       } else {
+ 193         _rp-&gt;roots_do(worker_id, &amp;roots_cl, &amp;cld_cl, &amp;code_cl);
+ 194       }
+ 195     }
+ 196   }
+ 197 };
+ 198 
+ 199 class ShenandoahConcurrentTraversalCollectionTask : public AbstractGangTask {
+ 200 private:
+ 201   TaskTerminator* _terminator;
+ 202   ShenandoahHeap* _heap;
+ 203 public:
+ 204   ShenandoahConcurrentTraversalCollectionTask(TaskTerminator* terminator) :
+ 205     AbstractGangTask(&quot;Shenandoah Concurrent Traversal Collection&quot;),
+ 206     _terminator(terminator),
+ 207     _heap(ShenandoahHeap::heap()) {}
+ 208 
+ 209   void work(uint worker_id) {
+ 210     ShenandoahConcurrentWorkerSession worker_session(worker_id);
+ 211     ShenandoahSuspendibleThreadSetJoiner stsj(ShenandoahSuspendibleWorkers);
+ 212     ShenandoahTraversalGC* traversal_gc = _heap-&gt;traversal_gc();
+ 213 
+ 214     // Drain all outstanding work in queues.
+ 215     traversal_gc-&gt;main_loop(worker_id, _terminator, true);
+ 216   }
+ 217 };
+ 218 
+ 219 class ShenandoahFinalTraversalCollectionTask : public AbstractGangTask {
+ 220 private:
+ 221   ShenandoahAllRootScanner* _rp;
+ 222   TaskTerminator*           _terminator;
+ 223   ShenandoahHeap* _heap;
+ 224 public:
+ 225   ShenandoahFinalTraversalCollectionTask(ShenandoahAllRootScanner* rp, TaskTerminator* terminator) :
+ 226     AbstractGangTask(&quot;Shenandoah Final Traversal Collection&quot;),
+ 227     _rp(rp),
+ 228     _terminator(terminator),
+ 229     _heap(ShenandoahHeap::heap()) {}
+ 230 
+ 231   void work(uint worker_id) {
+ 232     ShenandoahParallelWorkerSession worker_session(worker_id);
+ 233 
+ 234     ShenandoahTraversalGC* traversal_gc = _heap-&gt;traversal_gc();
+ 235 
+ 236     ShenandoahObjToScanQueueSet* queues = traversal_gc-&gt;task_queues();
+ 237     ShenandoahObjToScanQueue* q = queues-&gt;queue(worker_id);
+ 238 
+ 239     bool process_refs = _heap-&gt;process_references();
+ 240     bool unload_classes = _heap-&gt;unload_classes();
+ 241     ReferenceProcessor* rp = NULL;
+ 242     if (process_refs) {
+ 243       rp = _heap-&gt;ref_processor();
+ 244     }
+ 245 
+ 246     // Step 0: Drain outstanding SATB queues.
+ 247     // NOTE: we piggy-back draining of remaining thread SATB buffers on the final root scan below.
+ 248     ShenandoahTraversalSATBBufferClosure satb_cl(q);
+ 249     {
+ 250       // Process remaining finished SATB buffers.
+ 251       SATBMarkQueueSet&amp; satb_mq_set = ShenandoahBarrierSet::satb_mark_queue_set();
+ 252       while (satb_mq_set.apply_closure_to_completed_buffer(&amp;satb_cl));
+ 253       // Process remaining threads SATB buffers below.
+ 254     }
+ 255 
+ 256     // Step 1: Process GC roots.
+ 257     // For oops in code roots, they are marked, evacuated, enqueued for further traversal,
+ 258     // and the references to the oops are updated during init pause. We only need to rescan
+ 259     // on stack code roots, in case of class unloading is enabled. Otherwise, code roots are
+ 260     // scanned during init traversal or degenerated GC will update them at the end.
+ 261     if (!_heap-&gt;is_degenerated_gc_in_progress()) {
+ 262       ShenandoahTraversalRootsClosure roots_cl(q, rp);
+ 263       ShenandoahTraversalSATBThreadsClosure tc(&amp;satb_cl);
+ 264       if (unload_classes) {
+ 265         ShenandoahRemarkCLDClosure remark_cld_cl(&amp;roots_cl);
+ 266         MarkingCodeBlobClosure code_cl(&amp;roots_cl, CodeBlobToOopClosure::FixRelocations);
+ 267         _rp-&gt;strong_roots_do(worker_id, &amp;roots_cl, &amp;remark_cld_cl, &amp;code_cl, &amp;tc);
+ 268       } else {
+ 269         CLDToOopClosure cld_cl(&amp;roots_cl, ClassLoaderData::_claim_strong);
+ 270         _rp-&gt;roots_do(worker_id, &amp;roots_cl, &amp;cld_cl, NULL, &amp;tc);
+ 271       }
+ 272     } else {
+ 273       ShenandoahTraversalDegenClosure roots_cl(q, rp);
+ 274       ShenandoahTraversalSATBThreadsClosure tc(&amp;satb_cl);
+ 275       if (unload_classes) {
+ 276         ShenandoahRemarkCLDClosure remark_cld_cl(&amp;roots_cl);
+ 277         _rp-&gt;strong_roots_do(worker_id, &amp;roots_cl, &amp;remark_cld_cl, NULL, &amp;tc);
+ 278       } else {
+ 279         CLDToOopClosure cld_cl(&amp;roots_cl, ClassLoaderData::_claim_strong);
+ 280         _rp-&gt;roots_do(worker_id, &amp;roots_cl, &amp;cld_cl, NULL, &amp;tc);
+ 281       }
+ 282     }
+ 283 
+ 284     {
+ 285       ShenandoahWorkerTimingsTracker timer(ShenandoahPhaseTimings::FinishQueues, worker_id);
+ 286 
+ 287       // Step 3: Finally drain all outstanding work in queues.
+ 288       traversal_gc-&gt;main_loop(worker_id, _terminator, false);
+ 289     }
+ 290 
+ 291   }
+ 292 };
+ 293 
+ 294 ShenandoahTraversalGC::ShenandoahTraversalGC(ShenandoahHeap* heap) :
+ 295   _heap(heap),
+ 296   _task_queues(new ShenandoahObjToScanQueueSet(heap-&gt;max_workers())),
+ 297   _traversal_set(ShenandoahHeapRegionSet()) {
+ 298 
+ 299   // Traversal does not support concurrent code root scanning
+ 300   FLAG_SET_DEFAULT(ShenandoahConcurrentScanCodeRoots, false);
+ 301 
+ 302   uint num_queues = heap-&gt;max_workers();
+ 303   for (uint i = 0; i &lt; num_queues; ++i) {
+ 304     ShenandoahObjToScanQueue* task_queue = new ShenandoahObjToScanQueue();
+ 305     task_queue-&gt;initialize();
+ 306     _task_queues-&gt;register_queue(i, task_queue);
+ 307   }
+ 308 }
+ 309 
+ 310 ShenandoahTraversalGC::~ShenandoahTraversalGC() {
+ 311 }
+ 312 
+ 313 void ShenandoahTraversalGC::prepare_regions() {
+ 314   size_t num_regions = _heap-&gt;num_regions();
+ 315   ShenandoahMarkingContext* const ctx = _heap-&gt;marking_context();
+ 316   for (size_t i = 0; i &lt; num_regions; i++) {
+ 317     ShenandoahHeapRegion* region = _heap-&gt;get_region(i);
+ 318     region-&gt;set_update_watermark(region-&gt;top());
+ 319     if (_heap-&gt;is_bitmap_slice_committed(region)) {
+ 320       if (_traversal_set.is_in(i)) {
+ 321         ctx-&gt;capture_top_at_mark_start(region);
+ 322         region-&gt;clear_live_data();
+ 323         assert(ctx-&gt;is_bitmap_clear_range(region-&gt;bottom(), region-&gt;end()), &quot;bitmap for traversal regions must be cleared&quot;);
+ 324       } else {
+ 325         // Everything outside the traversal set is always considered live.
+ 326         ctx-&gt;reset_top_at_mark_start(region);
+ 327       }
+ 328     } else {
+ 329       // FreeSet may contain uncommitted empty regions, once they are recommitted,
+ 330       // their TAMS may have old values, so reset them here.
+ 331       ctx-&gt;reset_top_at_mark_start(region);
+ 332     }
+ 333   }
+ 334 }
+ 335 
+ 336 void ShenandoahTraversalGC::prepare() {
+ 337   {
+ 338     ShenandoahGCPhase phase(ShenandoahPhaseTimings::traversal_gc_make_parsable);
+ 339     _heap-&gt;make_parsable(true);
+ 340   }
+ 341 
+ 342   if (UseTLAB) {
+ 343     ShenandoahGCPhase phase(ShenandoahPhaseTimings::traversal_gc_resize_tlabs);
+ 344     _heap-&gt;resize_tlabs();
+ 345   }
+ 346 
+ 347   assert(_heap-&gt;marking_context()-&gt;is_bitmap_clear(), &quot;need clean mark bitmap&quot;);
+ 348   assert(!_heap-&gt;marking_context()-&gt;is_complete(), &quot;should not be complete&quot;);
+ 349 
+ 350   // About to choose the collection set, make sure we know which regions are pinned.
+ 351   {
+ 352     ShenandoahGCPhase phase_cleanup(ShenandoahPhaseTimings::traversal_gc_prepare_sync_pinned);
+ 353     _heap-&gt;sync_pinned_region_status();
+ 354   }
+ 355 
+ 356   ShenandoahCollectionSet* collection_set = _heap-&gt;collection_set();
+ 357   {
+ 358     ShenandoahHeapLocker lock(_heap-&gt;lock());
+ 359 
+ 360     collection_set-&gt;clear();
+ 361     assert(collection_set-&gt;count() == 0, &quot;collection set not clear&quot;);
+ 362 
+ 363     // Find collection set
+ 364     _heap-&gt;heuristics()-&gt;choose_collection_set(collection_set);
+ 365     prepare_regions();
+ 366 
+ 367     // Rebuild free set
+ 368     _heap-&gt;free_set()-&gt;rebuild();
+ 369   }
+ 370 
+ 371   log_info(gc, ergo)(&quot;Collectable Garbage: &quot; SIZE_FORMAT &quot;%s, &quot; SIZE_FORMAT &quot;%s CSet, &quot; SIZE_FORMAT &quot; CSet regions&quot;,
+ 372                      byte_size_in_proper_unit(collection_set-&gt;garbage()),   proper_unit_for_byte_size(collection_set-&gt;garbage()),
+ 373                      byte_size_in_proper_unit(collection_set-&gt;live_data()), proper_unit_for_byte_size(collection_set-&gt;live_data()),
+ 374                      collection_set-&gt;count());
+ 375 }
+ 376 
+ 377 void ShenandoahTraversalGC::init_traversal_collection() {
+ 378   assert(ShenandoahSafepoint::is_at_shenandoah_safepoint(), &quot;STW traversal GC&quot;);
+ 379 
+ 380   if (ShenandoahVerify) {
+ 381     _heap-&gt;verifier()-&gt;verify_before_traversal();
+ 382   }
+ 383 
+ 384   if (VerifyBeforeGC) {
+ 385     Universe::verify();
+ 386   }
+ 387 
+ 388   {
+ 389     ShenandoahGCPhase phase_prepare(ShenandoahPhaseTimings::traversal_gc_prepare);
+ 390     prepare();
+ 391   }
+ 392 
+ 393   _heap-&gt;set_concurrent_traversal_in_progress(true);
+ 394   _heap-&gt;set_has_forwarded_objects(true);
+ 395 
+ 396   bool process_refs = _heap-&gt;process_references();
+ 397   if (process_refs) {
+ 398     ReferenceProcessor* rp = _heap-&gt;ref_processor();
+ 399     rp-&gt;enable_discovery(true /*verify_no_refs*/);
+ 400     rp-&gt;setup_policy(_heap-&gt;soft_ref_policy()-&gt;should_clear_all_soft_refs());
+ 401   }
+ 402 
+ 403   {
+ 404     ShenandoahGCPhase phase_work(ShenandoahPhaseTimings::init_traversal_gc_work);
+ 405     assert(_task_queues-&gt;is_empty(), &quot;queues must be empty before traversal GC&quot;);
+ 406     TASKQUEUE_STATS_ONLY(_task_queues-&gt;reset_taskqueue_stats());
+ 407 
+ 408 #if COMPILER2_OR_JVMCI
+ 409     DerivedPointerTable::clear();
+ 410 #endif
+ 411 
+ 412     {
+ 413       uint nworkers = _heap-&gt;workers()-&gt;active_workers();
+ 414       task_queues()-&gt;reserve(nworkers);
+ 415       ShenandoahCSetRootScanner rp(nworkers, ShenandoahPhaseTimings::init_traversal_gc_work);
+ 416       ShenandoahInitTraversalCollectionTask traversal_task(&amp;rp);
+ 417       _heap-&gt;workers()-&gt;run_task(&amp;traversal_task);
+ 418     }
+ 419 
+ 420 #if COMPILER2_OR_JVMCI
+ 421     DerivedPointerTable::update_pointers();
+ 422 #endif
+ 423   }
+ 424 
+ 425   if (ShenandoahPacing) {
+ 426     _heap-&gt;pacer()-&gt;setup_for_traversal();
+ 427   }
+ 428 }
+ 429 
+ 430 void ShenandoahTraversalGC::main_loop(uint w, TaskTerminator* t, bool sts_yield) {
+ 431   ShenandoahObjToScanQueue* q = task_queues()-&gt;queue(w);
+ 432 
+ 433   // Initialize live data.
+ 434   jushort* ld = _heap-&gt;get_liveness_cache(w);
+ 435 
+ 436   ReferenceProcessor* rp = NULL;
+ 437   if (_heap-&gt;process_references()) {
+ 438     rp = _heap-&gt;ref_processor();
+ 439   }
+ 440   {
+ 441     if (!_heap-&gt;is_degenerated_gc_in_progress()) {
+ 442       if (_heap-&gt;unload_classes()) {
+ 443         if (ShenandoahStringDedup::is_enabled()) {
+ 444           ShenandoahTraversalMetadataDedupClosure cl(q, rp);
+ 445           main_loop_work&lt;ShenandoahTraversalMetadataDedupClosure&gt;(&amp;cl, ld, w, t, sts_yield);
+ 446         } else {
+ 447           ShenandoahTraversalMetadataClosure cl(q, rp);
+ 448           main_loop_work&lt;ShenandoahTraversalMetadataClosure&gt;(&amp;cl, ld, w, t, sts_yield);
+ 449         }
+ 450       } else {
+ 451         if (ShenandoahStringDedup::is_enabled()) {
+ 452           ShenandoahTraversalDedupClosure cl(q, rp);
+ 453           main_loop_work&lt;ShenandoahTraversalDedupClosure&gt;(&amp;cl, ld, w, t, sts_yield);
+ 454         } else {
+ 455           ShenandoahTraversalClosure cl(q, rp);
+ 456           main_loop_work&lt;ShenandoahTraversalClosure&gt;(&amp;cl, ld, w, t, sts_yield);
+ 457         }
+ 458       }
+ 459     } else {
+ 460       if (_heap-&gt;unload_classes()) {
+ 461         if (ShenandoahStringDedup::is_enabled()) {
+ 462           ShenandoahTraversalMetadataDedupDegenClosure cl(q, rp);
+ 463           main_loop_work&lt;ShenandoahTraversalMetadataDedupDegenClosure&gt;(&amp;cl, ld, w, t, sts_yield);
+ 464         } else {
+ 465           ShenandoahTraversalMetadataDegenClosure cl(q, rp);
+ 466           main_loop_work&lt;ShenandoahTraversalMetadataDegenClosure&gt;(&amp;cl, ld, w, t, sts_yield);
+ 467         }
+ 468       } else {
+ 469         if (ShenandoahStringDedup::is_enabled()) {
+ 470           ShenandoahTraversalDedupDegenClosure cl(q, rp);
+ 471           main_loop_work&lt;ShenandoahTraversalDedupDegenClosure&gt;(&amp;cl, ld, w, t, sts_yield);
+ 472         } else {
+ 473           ShenandoahTraversalDegenClosure cl(q, rp);
+ 474           main_loop_work&lt;ShenandoahTraversalDegenClosure&gt;(&amp;cl, ld, w, t, sts_yield);
+ 475         }
+ 476       }
+ 477     }
+ 478   }
+ 479 
+ 480   _heap-&gt;flush_liveness_cache(w);
+ 481 }
+ 482 
+ 483 template &lt;class T&gt;
+ 484 void ShenandoahTraversalGC::main_loop_work(T* cl, jushort* live_data, uint worker_id, TaskTerminator* terminator, bool sts_yield) {
+ 485   ShenandoahObjToScanQueueSet* queues = task_queues();
+ 486   ShenandoahObjToScanQueue* q = queues-&gt;queue(worker_id);
+ 487   ShenandoahConcurrentMark* conc_mark = _heap-&gt;concurrent_mark();
+ 488 
+ 489   uintx stride = ShenandoahMarkLoopStride;
+ 490 
+ 491   ShenandoahMarkTask task;
+ 492 
+ 493   // Process outstanding queues, if any.
+ 494   q = queues-&gt;claim_next();
+ 495   while (q != NULL) {
+ 496     if (_heap-&gt;check_cancelled_gc_and_yield(sts_yield)) {
+ 497       return;
+ 498     }
+ 499 
+ 500     for (uint i = 0; i &lt; stride; i++) {
+ 501       if (q-&gt;pop(task)) {
+ 502         conc_mark-&gt;do_task&lt;T&gt;(q, cl, live_data, &amp;task);
+ 503       } else {
+ 504         assert(q-&gt;is_empty(), &quot;Must be empty&quot;);
+ 505         q = queues-&gt;claim_next();
+ 506         break;
+ 507       }
+ 508     }
+ 509   }
+ 510 
+ 511   if (check_and_handle_cancelled_gc(terminator, sts_yield)) return;
+ 512 
+ 513   // Normal loop.
+ 514   q = queues-&gt;queue(worker_id);
+ 515 
+ 516   ShenandoahTraversalSATBBufferClosure drain_satb(q);
+ 517   SATBMarkQueueSet&amp; satb_mq_set = ShenandoahBarrierSet::satb_mark_queue_set();
+ 518 
+ 519   while (true) {
+ 520     if (check_and_handle_cancelled_gc(terminator, sts_yield)) return;
+ 521 
+ 522     while (satb_mq_set.completed_buffers_num() &gt; 0) {
+ 523       satb_mq_set.apply_closure_to_completed_buffer(&amp;drain_satb);
+ 524     }
+ 525 
+ 526     uint work = 0;
+ 527     for (uint i = 0; i &lt; stride; i++) {
+ 528       if (q-&gt;pop(task) ||
+ 529           queues-&gt;steal(worker_id, task)) {
+ 530         conc_mark-&gt;do_task&lt;T&gt;(q, cl, live_data, &amp;task);
+ 531         work++;
+ 532       } else {
+ 533         break;
+ 534       }
+ 535     }
+ 536 
+ 537     if (work == 0) {
+ 538       // No more work, try to terminate
+ 539       ShenandoahSuspendibleThreadSetLeaver stsl(sts_yield &amp;&amp; ShenandoahSuspendibleWorkers);
+ 540       ShenandoahTerminatorTerminator tt(_heap);
+ 541 
+ 542       if (terminator-&gt;offer_termination(&amp;tt)) return;
+ 543     }
+ 544   }
+ 545 }
+ 546 
+ 547 bool ShenandoahTraversalGC::check_and_handle_cancelled_gc(TaskTerminator* terminator, bool sts_yield) {
+ 548   if (_heap-&gt;cancelled_gc()) {
+ 549     return true;
+ 550   }
+ 551   return false;
+ 552 }
+ 553 
+ 554 void ShenandoahTraversalGC::concurrent_traversal_collection() {
+ 555   ShenandoahGCPhase phase_work(ShenandoahPhaseTimings::conc_traversal);
+ 556   if (!_heap-&gt;cancelled_gc()) {
+ 557     uint nworkers = _heap-&gt;workers()-&gt;active_workers();
+ 558     task_queues()-&gt;reserve(nworkers);
+ 559 
+ 560     TaskTerminator terminator(nworkers, task_queues());
+ 561     ShenandoahConcurrentTraversalCollectionTask task(&amp;terminator);
+ 562     _heap-&gt;workers()-&gt;run_task(&amp;task);
+ 563   }
+ 564 
+ 565   if (!_heap-&gt;cancelled_gc() &amp;&amp; ShenandoahPreclean &amp;&amp; _heap-&gt;process_references()) {
+ 566     preclean_weak_refs();
+ 567   }
+ 568 }
+ 569 
+ 570 void ShenandoahTraversalGC::final_traversal_collection() {
+ 571   if (!_heap-&gt;cancelled_gc()) {
+ 572 #if COMPILER2_OR_JVMCI
+ 573     DerivedPointerTable::clear();
+ 574 #endif
+ 575     ShenandoahGCPhase phase_work(ShenandoahPhaseTimings::final_traversal_gc_work);
+ 576     uint nworkers = _heap-&gt;workers()-&gt;active_workers();
+ 577     task_queues()-&gt;reserve(nworkers);
+ 578 
+ 579     // Finish traversal
+ 580     ShenandoahAllRootScanner rp(nworkers, ShenandoahPhaseTimings::final_traversal_gc_work);
+ 581     TaskTerminator terminator(nworkers, task_queues());
+ 582     ShenandoahFinalTraversalCollectionTask task(&amp;rp, &amp;terminator);
+ 583     _heap-&gt;workers()-&gt;run_task(&amp;task);
+ 584 #if COMPILER2_OR_JVMCI
+ 585     DerivedPointerTable::update_pointers();
+ 586 #endif
+ 587   }
+ 588 
+ 589   if (!_heap-&gt;cancelled_gc() &amp;&amp; _heap-&gt;process_references()) {
+ 590     weak_refs_work();
+ 591   }
+ 592 
+ 593   if (!_heap-&gt;cancelled_gc()) {
+ 594     assert(_task_queues-&gt;is_empty(), &quot;queues must be empty after traversal GC&quot;);
+ 595     TASKQUEUE_STATS_ONLY(_task_queues-&gt;print_taskqueue_stats());
+ 596     TASKQUEUE_STATS_ONLY(_task_queues-&gt;reset_taskqueue_stats());
+ 597 
+ 598     // No more marking expected
+ 599     _heap-&gt;set_concurrent_traversal_in_progress(false);
+ 600     _heap-&gt;mark_complete_marking_context();
+ 601 
+ 602     // A rare case, TLAB/GCLAB is initialized from an empty region without
+ 603     // any live data, the region can be trashed and may be uncommitted in later code,
+ 604     // that results the TLAB/GCLAB not usable. Retire them here.
+ 605     _heap-&gt;make_parsable(true);
+ 606 
+ 607     // Do this fixup before the call to parallel_cleaning to ensure that all
+ 608     // forwarded objects (including those that are no longer in the cset) are
+ 609     // updated by the time we do weak root processing.
+ 610     fixup_roots();
+ 611     _heap-&gt;parallel_cleaning(false);
+ 612 
+ 613     _heap-&gt;set_has_forwarded_objects(false);
+ 614 
+ 615     // Resize metaspace
+ 616     MetaspaceGC::compute_new_size();
+ 617 
+ 618     // Need to see that pinned region status is updated: newly pinned regions must not
+ 619     // be trashed. New unpinned regions should be trashed.
+ 620     {
+ 621       ShenandoahGCPhase phase_cleanup(ShenandoahPhaseTimings::traversal_gc_sync_pinned);
+ 622       _heap-&gt;sync_pinned_region_status();
+ 623     }
+ 624 
+ 625     // Still good? We can now trash the cset, and make final verification
+ 626     {
+ 627       ShenandoahGCPhase phase_cleanup(ShenandoahPhaseTimings::traversal_gc_cleanup);
+ 628       ShenandoahHeapLocker lock(_heap-&gt;lock());
+ 629 
+ 630       // Trash everything
+ 631       // Clear immediate garbage regions.
+ 632       size_t num_regions = _heap-&gt;num_regions();
+ 633 
+ 634       ShenandoahHeapRegionSet* traversal_regions = traversal_set();
+ 635       ShenandoahFreeSet* free_regions = _heap-&gt;free_set();
+ 636       ShenandoahMarkingContext* const ctx = _heap-&gt;marking_context();
+ 637       free_regions-&gt;clear();
+ 638       for (size_t i = 0; i &lt; num_regions; i++) {
+ 639         ShenandoahHeapRegion* r = _heap-&gt;get_region(i);
+ 640         bool not_allocated = ctx-&gt;top_at_mark_start(r) == r-&gt;top();
+ 641 
+ 642         bool candidate = traversal_regions-&gt;is_in(r) &amp;&amp; !r-&gt;has_live() &amp;&amp; not_allocated;
+ 643         if (r-&gt;is_humongous_start() &amp;&amp; candidate) {
+ 644           // Trash humongous.
+ 645           HeapWord* humongous_obj = r-&gt;bottom();
+ 646           assert(!ctx-&gt;is_marked(oop(humongous_obj)), &quot;must not be marked&quot;);
+ 647           r-&gt;make_trash_immediate();
+ 648           while (i + 1 &lt; num_regions &amp;&amp; _heap-&gt;get_region(i + 1)-&gt;is_humongous_continuation()) {
+ 649             i++;
+ 650             r = _heap-&gt;get_region(i);
+ 651             assert(r-&gt;is_humongous_continuation(), &quot;must be humongous continuation&quot;);
+ 652             r-&gt;make_trash_immediate();
+ 653           }
+ 654         } else if (!r-&gt;is_empty() &amp;&amp; candidate) {
+ 655           // Trash regular.
+ 656           assert(!r-&gt;is_humongous(), &quot;handled above&quot;);
+ 657           assert(!r-&gt;is_trash(), &quot;must not already be trashed&quot;);
+ 658           r-&gt;make_trash_immediate();
+ 659         }
+ 660       }
+ 661       _heap-&gt;collection_set()-&gt;clear();
+ 662       _heap-&gt;free_set()-&gt;rebuild();
+ 663       reset();
+ 664     }
+ 665 
+ 666     assert(_task_queues-&gt;is_empty(), &quot;queues must be empty after traversal GC&quot;);
+ 667     assert(!_heap-&gt;cancelled_gc(), &quot;must not be cancelled when getting out here&quot;);
+ 668 
+ 669     if (ShenandoahVerify) {
+ 670       _heap-&gt;verifier()-&gt;verify_after_traversal();
+ 671     }
+ 672 #ifdef ASSERT
+ 673     else {
+ 674       verify_roots_after_gc();
+ 675     }
+ 676 #endif
+ 677 
+ 678     if (VerifyAfterGC) {
+ 679       Universe::verify();
+ 680     }
+ 681   }
+ 682 }
+ 683 
+ 684 class ShenandoahVerifyAfterGC : public OopClosure {
+ 685 private:
+ 686   template &lt;class T&gt;
+ 687   void do_oop_work(T* p) {
+ 688     T o = RawAccess&lt;&gt;::oop_load(p);
+ 689     if (!CompressedOops::is_null(o)) {
+ 690       oop obj = CompressedOops::decode_not_null(o);
+ 691       shenandoah_assert_correct(p, obj);
+ 692       shenandoah_assert_not_in_cset_except(p, obj, ShenandoahHeap::heap()-&gt;cancelled_gc());
+ 693       shenandoah_assert_not_forwarded(p, obj);
+ 694     }
+ 695   }
+ 696 
+ 697 public:
+ 698   void do_oop(narrowOop* p) { do_oop_work(p); }
+ 699   void do_oop(oop* p)       { do_oop_work(p); }
+ 700 };
+ 701 
+ 702 void ShenandoahTraversalGC::verify_roots_after_gc() {
+ 703   ShenandoahRootVerifier verifier;
+ 704   ShenandoahVerifyAfterGC cl;
+ 705   verifier.oops_do(&amp;cl);
+ 706 }
+ 707 
+ 708 class ShenandoahTraversalFixRootsClosure : public OopClosure {
+ 709 private:
+ 710   template &lt;class T&gt;
+ 711   inline void do_oop_work(T* p) {
+ 712     T o = RawAccess&lt;&gt;::oop_load(p);
+ 713     if (!CompressedOops::is_null(o)) {
+ 714       oop obj = CompressedOops::decode_not_null(o);
+ 715       oop forw = ShenandoahBarrierSet::resolve_forwarded_not_null(obj);
+ 716       if (obj != forw) {
+ 717         RawAccess&lt;IS_NOT_NULL&gt;::oop_store(p, forw);
+ 718       }
+ 719     }
+ 720   }
+ 721 
+ 722 public:
+ 723   inline void do_oop(oop* p) { do_oop_work(p); }
+ 724   inline void do_oop(narrowOop* p) { do_oop_work(p); }
+ 725 };
+ 726 
+ 727 class ShenandoahTraversalFixRootsTask : public AbstractGangTask {
+ 728 private:
+ 729   ShenandoahRootUpdater* _rp;
+ 730 
+ 731 public:
+ 732   ShenandoahTraversalFixRootsTask(ShenandoahRootUpdater* rp) :
+ 733     AbstractGangTask(&quot;Shenandoah traversal fix roots&quot;),
+ 734     _rp(rp) {
+ 735     assert(ShenandoahHeap::heap()-&gt;has_forwarded_objects(), &quot;Must be&quot;);
+ 736   }
+ 737 
+ 738   void work(uint worker_id) {
+ 739     ShenandoahParallelWorkerSession worker_session(worker_id);
+ 740     ShenandoahTraversalFixRootsClosure cl;
+ 741     ShenandoahForwardedIsAliveClosure is_alive;
+ 742     _rp-&gt;roots_do(worker_id, &amp;is_alive, &amp;cl);
+ 743   }
+ 744 };
+ 745 
+ 746 void ShenandoahTraversalGC::fixup_roots() {
+ 747 #if COMPILER2_OR_JVMCI
+ 748   DerivedPointerTable::clear();
+ 749 #endif
+ 750   ShenandoahRootUpdater rp(_heap-&gt;workers()-&gt;active_workers(), ShenandoahPhaseTimings::final_traversal_update_roots);
+ 751   ShenandoahTraversalFixRootsTask update_roots_task(&amp;rp);
+ 752   _heap-&gt;workers()-&gt;run_task(&amp;update_roots_task);
+ 753 #if COMPILER2_OR_JVMCI
+ 754   DerivedPointerTable::update_pointers();
+ 755 #endif
+ 756 }
+ 757 
+ 758 void ShenandoahTraversalGC::reset() {
+ 759   _task_queues-&gt;clear();
+ 760 }
+ 761 
+ 762 ShenandoahObjToScanQueueSet* ShenandoahTraversalGC::task_queues() {
+ 763   return _task_queues;
+ 764 }
+ 765 
+ 766 class ShenandoahTraversalCancelledGCYieldClosure : public YieldClosure {
+ 767 private:
+ 768   ShenandoahHeap* const _heap;
+ 769 public:
+ 770   ShenandoahTraversalCancelledGCYieldClosure() : _heap(ShenandoahHeap::heap()) {};
+ 771   virtual bool should_return() { return _heap-&gt;cancelled_gc(); }
+ 772 };
+ 773 
+ 774 class ShenandoahTraversalPrecleanCompleteGCClosure : public VoidClosure {
+ 775 public:
+ 776   void do_void() {
+ 777     ShenandoahHeap* sh = ShenandoahHeap::heap();
+ 778     ShenandoahTraversalGC* traversal_gc = sh-&gt;traversal_gc();
+ 779     assert(sh-&gt;process_references(), &quot;why else would we be here?&quot;);
+ 780     TaskTerminator terminator(1, traversal_gc-&gt;task_queues());
+ 781     shenandoah_assert_rp_isalive_installed();
+ 782     traversal_gc-&gt;main_loop((uint) 0, &amp;terminator, true);
+ 783   }
+ 784 };
+ 785 
+ 786 class ShenandoahTraversalKeepAliveUpdateClosure : public OopClosure {
+ 787 private:
+ 788   ShenandoahObjToScanQueue* _queue;
+ 789   Thread* _thread;
+ 790   ShenandoahTraversalGC* _traversal_gc;
+ 791   ShenandoahMarkingContext* const _mark_context;
+ 792 
+ 793   template &lt;class T&gt;
+ 794   inline void do_oop_work(T* p) {
+ 795     _traversal_gc-&gt;process_oop&lt;T, false /* string dedup */, false /* degen */, true /* atomic update */&gt;(p, _thread, _queue, _mark_context);
+ 796   }
+ 797 
+ 798 public:
+ 799   ShenandoahTraversalKeepAliveUpdateClosure(ShenandoahObjToScanQueue* q) :
+ 800     _queue(q), _thread(Thread::current()),
+ 801     _traversal_gc(ShenandoahHeap::heap()-&gt;traversal_gc()),
+ 802     _mark_context(ShenandoahHeap::heap()-&gt;marking_context()) {}
+ 803 
+ 804   void do_oop(narrowOop* p) { do_oop_work(p); }
+ 805   void do_oop(oop* p)       { do_oop_work(p); }
+ 806 };
+ 807 
+ 808 class ShenandoahTraversalKeepAliveUpdateDegenClosure : public OopClosure {
+ 809 private:
+ 810   ShenandoahObjToScanQueue* _queue;
+ 811   Thread* _thread;
+ 812   ShenandoahTraversalGC* _traversal_gc;
+ 813   ShenandoahMarkingContext* const _mark_context;
+ 814 
+ 815   template &lt;class T&gt;
+ 816   inline void do_oop_work(T* p) {
+ 817     _traversal_gc-&gt;process_oop&lt;T, false /* string dedup */, true /* degen */, false /* atomic update */&gt;(p, _thread, _queue, _mark_context);
+ 818   }
+ 819 
+ 820 public:
+ 821   ShenandoahTraversalKeepAliveUpdateDegenClosure(ShenandoahObjToScanQueue* q) :
+ 822           _queue(q), _thread(Thread::current()),
+ 823           _traversal_gc(ShenandoahHeap::heap()-&gt;traversal_gc()),
+ 824           _mark_context(ShenandoahHeap::heap()-&gt;marking_context()) {}
+ 825 
+ 826   void do_oop(narrowOop* p) { do_oop_work(p); }
+ 827   void do_oop(oop* p)       { do_oop_work(p); }
+ 828 };
+ 829 
+ 830 class ShenandoahTraversalSingleThreadKeepAliveUpdateClosure : public OopClosure {
+ 831 private:
+ 832   ShenandoahObjToScanQueue* _queue;
+ 833   Thread* _thread;
+ 834   ShenandoahTraversalGC* _traversal_gc;
+ 835   ShenandoahMarkingContext* const _mark_context;
+ 836 
+ 837   template &lt;class T&gt;
+ 838   inline void do_oop_work(T* p) {
+ 839     _traversal_gc-&gt;process_oop&lt;T, false /* string dedup */, false /* degen */, true /* atomic update */&gt;(p, _thread, _queue, _mark_context);
+ 840   }
+ 841 
+ 842 public:
+ 843   ShenandoahTraversalSingleThreadKeepAliveUpdateClosure(ShenandoahObjToScanQueue* q) :
+ 844           _queue(q), _thread(Thread::current()),
+ 845           _traversal_gc(ShenandoahHeap::heap()-&gt;traversal_gc()),
+ 846           _mark_context(ShenandoahHeap::heap()-&gt;marking_context()) {}
+ 847 
+ 848   void do_oop(narrowOop* p) { do_oop_work(p); }
+ 849   void do_oop(oop* p)       { do_oop_work(p); }
+ 850 };
+ 851 
+ 852 class ShenandoahTraversalSingleThreadKeepAliveUpdateDegenClosure : public OopClosure {
+ 853 private:
+ 854   ShenandoahObjToScanQueue* _queue;
+ 855   Thread* _thread;
+ 856   ShenandoahTraversalGC* _traversal_gc;
+ 857   ShenandoahMarkingContext* const _mark_context;
+ 858 
+ 859   template &lt;class T&gt;
+ 860   inline void do_oop_work(T* p) {
+ 861     _traversal_gc-&gt;process_oop&lt;T, false /* string dedup */, true /* degen */, false /* atomic update */&gt;(p, _thread, _queue, _mark_context);
+ 862   }
+ 863 
+ 864 public:
+ 865   ShenandoahTraversalSingleThreadKeepAliveUpdateDegenClosure(ShenandoahObjToScanQueue* q) :
+ 866           _queue(q), _thread(Thread::current()),
+ 867           _traversal_gc(ShenandoahHeap::heap()-&gt;traversal_gc()),
+ 868           _mark_context(ShenandoahHeap::heap()-&gt;marking_context()) {}
+ 869 
+ 870   void do_oop(narrowOop* p) { do_oop_work(p); }
+ 871   void do_oop(oop* p)       { do_oop_work(p); }
+ 872 };
+ 873 
+ 874 class ShenandoahTraversalPrecleanTask : public AbstractGangTask {
+ 875 private:
+ 876   ReferenceProcessor* _rp;
+ 877 
+ 878 public:
+ 879   ShenandoahTraversalPrecleanTask(ReferenceProcessor* rp) :
+ 880           AbstractGangTask(&quot;Precleaning task&quot;),
+ 881           _rp(rp) {}
+ 882 
+ 883   void work(uint worker_id) {
+ 884     assert(worker_id == 0, &quot;The code below is single-threaded, only one worker is expected&quot;);
+ 885     ShenandoahParallelWorkerSession worker_session(worker_id);
+ 886     ShenandoahSuspendibleThreadSetJoiner stsj(ShenandoahSuspendibleWorkers);
+ 887 
+ 888     ShenandoahHeap* sh = ShenandoahHeap::heap();
+ 889 
+ 890     ShenandoahObjToScanQueue* q = sh-&gt;traversal_gc()-&gt;task_queues()-&gt;queue(worker_id);
+ 891 
+ 892     ShenandoahForwardedIsAliveClosure is_alive;
+ 893     ShenandoahTraversalCancelledGCYieldClosure yield;
+ 894     ShenandoahTraversalPrecleanCompleteGCClosure complete_gc;
+ 895     ShenandoahTraversalKeepAliveUpdateClosure keep_alive(q);
+ 896     ResourceMark rm;
+ 897     _rp-&gt;preclean_discovered_references(&amp;is_alive, &amp;keep_alive,
+ 898                                         &amp;complete_gc, &amp;yield,
+ 899                                         NULL);
+ 900   }
+ 901 };
+ 902 
+ 903 void ShenandoahTraversalGC::preclean_weak_refs() {
+ 904   // Pre-cleaning weak references before diving into STW makes sense at the
+ 905   // end of concurrent mark. This will filter out the references which referents
+ 906   // are alive. Note that ReferenceProcessor already filters out these on reference
+ 907   // discovery, and the bulk of work is done here. This phase processes leftovers
+ 908   // that missed the initial filtering, i.e. when referent was marked alive after
+ 909   // reference was discovered by RP.
+ 910 
+ 911   assert(_heap-&gt;process_references(), &quot;sanity&quot;);
+ 912   assert(!_heap-&gt;is_degenerated_gc_in_progress(), &quot;must be in concurrent non-degenerated phase&quot;);
+ 913 
+ 914   // Shortcut if no references were discovered to avoid winding up threads.
+ 915   ReferenceProcessor* rp = _heap-&gt;ref_processor();
+ 916   if (!rp-&gt;has_discovered_references()) {
+ 917     return;
+ 918   }
+ 919 
+ 920   ReferenceProcessorMTDiscoveryMutator fix_mt_discovery(rp, false);
+ 921 
+ 922   shenandoah_assert_rp_isalive_not_installed();
+ 923   ShenandoahForwardedIsAliveClosure is_alive;
+ 924   ReferenceProcessorIsAliveMutator fix_isalive(rp, &amp;is_alive);
+ 925 
+ 926   assert(task_queues()-&gt;is_empty(), &quot;Should be empty&quot;);
+ 927 
+ 928   // Execute precleaning in the worker thread: it will give us GCLABs, String dedup
+ 929   // queues and other goodies. When upstream ReferenceProcessor starts supporting
+ 930   // parallel precleans, we can extend this to more threads.
+ 931   ShenandoahPushWorkerScope scope(_heap-&gt;workers(), 1, /* check_workers = */ false);
+ 932 
+ 933   WorkGang* workers = _heap-&gt;workers();
+ 934   uint nworkers = workers-&gt;active_workers();
+ 935   assert(nworkers == 1, &quot;This code uses only a single worker&quot;);
+ 936   task_queues()-&gt;reserve(nworkers);
+ 937 
+ 938   ShenandoahTraversalPrecleanTask task(rp);
+ 939   workers-&gt;run_task(&amp;task);
+ 940 
+ 941   assert(_heap-&gt;cancelled_gc() || task_queues()-&gt;is_empty(), &quot;Should be empty&quot;);
+ 942 }
+ 943 
+ 944 // Weak Reference Closures
+ 945 class ShenandoahTraversalDrainMarkingStackClosure: public VoidClosure {
+ 946   uint _worker_id;
+ 947   TaskTerminator* _terminator;
+ 948   bool _reset_terminator;
+ 949 
+ 950 public:
+ 951   ShenandoahTraversalDrainMarkingStackClosure(uint worker_id, TaskTerminator* t, bool reset_terminator = false):
+ 952     _worker_id(worker_id),
+ 953     _terminator(t),
+ 954     _reset_terminator(reset_terminator) {
+ 955   }
+ 956 
+ 957   void do_void() {
+ 958     assert(ShenandoahSafepoint::is_at_shenandoah_safepoint(), &quot;Must be at a safepoint&quot;);
+ 959 
+ 960     ShenandoahHeap* sh = ShenandoahHeap::heap();
+ 961     ShenandoahTraversalGC* traversal_gc = sh-&gt;traversal_gc();
+ 962     assert(sh-&gt;process_references(), &quot;why else would we be here?&quot;);
+ 963     shenandoah_assert_rp_isalive_installed();
+ 964 
+ 965     traversal_gc-&gt;main_loop(_worker_id, _terminator, false);
+ 966 
+ 967     if (_reset_terminator) {
+ 968       _terminator-&gt;reset_for_reuse();
+ 969     }
+ 970   }
+ 971 };
+ 972 
+ 973 class ShenandoahTraversalSingleThreadedDrainMarkingStackClosure: public VoidClosure {
+ 974   uint _worker_id;
+ 975   TaskTerminator* _terminator;
+ 976   bool _reset_terminator;
+ 977 
+ 978 public:
+ 979   ShenandoahTraversalSingleThreadedDrainMarkingStackClosure(uint worker_id, TaskTerminator* t, bool reset_terminator = false):
+ 980           _worker_id(worker_id),
+ 981           _terminator(t),
+ 982           _reset_terminator(reset_terminator) {
+ 983   }
+ 984 
+ 985   void do_void() {
+ 986     assert(ShenandoahSafepoint::is_at_shenandoah_safepoint(), &quot;Must be at a safepoint&quot;);
+ 987 
+ 988     ShenandoahHeap* sh = ShenandoahHeap::heap();
+ 989     ShenandoahTraversalGC* traversal_gc = sh-&gt;traversal_gc();
+ 990     assert(sh-&gt;process_references(), &quot;why else would we be here?&quot;);
+ 991     shenandoah_assert_rp_isalive_installed();
+ 992 
+ 993     traversal_gc-&gt;main_loop(_worker_id, _terminator, false);
+ 994 
+ 995     if (_reset_terminator) {
+ 996       _terminator-&gt;reset_for_reuse();
+ 997     }
+ 998   }
+ 999 };
+1000 
+1001 void ShenandoahTraversalGC::weak_refs_work() {
+1002   assert(_heap-&gt;process_references(), &quot;sanity&quot;);
+1003 
+1004   ShenandoahPhaseTimings::Phase phase_root = ShenandoahPhaseTimings::weakrefs;
+1005 
+1006   ShenandoahGCPhase phase(phase_root);
+1007 
+1008   ReferenceProcessor* rp = _heap-&gt;ref_processor();
+1009 
+1010   // NOTE: We cannot shortcut on has_discovered_references() here, because
+1011   // we will miss marking JNI Weak refs then, see implementation in
+1012   // ReferenceProcessor::process_discovered_references.
+1013   weak_refs_work_doit();
+1014 
+1015   rp-&gt;verify_no_references_recorded();
+1016   assert(!rp-&gt;discovery_enabled(), &quot;Post condition&quot;);
+1017 
+1018 }
+1019 
+1020 class ShenandoahTraversalRefProcTaskProxy : public AbstractGangTask {
+1021 private:
+1022   AbstractRefProcTaskExecutor::ProcessTask&amp; _proc_task;
+1023   TaskTerminator* _terminator;
+1024 
+1025 public:
+1026   ShenandoahTraversalRefProcTaskProxy(AbstractRefProcTaskExecutor::ProcessTask&amp; proc_task,
+1027                                       TaskTerminator* t) :
+1028     AbstractGangTask(&quot;Process reference objects in parallel&quot;),
+1029     _proc_task(proc_task),
+1030     _terminator(t) {
+1031   }
+1032 
+1033   void work(uint worker_id) {
+1034     assert(ShenandoahSafepoint::is_at_shenandoah_safepoint(), &quot;Must be at a safepoint&quot;);
+1035     ShenandoahHeap* heap = ShenandoahHeap::heap();
+1036     ShenandoahTraversalDrainMarkingStackClosure complete_gc(worker_id, _terminator);
+1037 
+1038     ShenandoahForwardedIsAliveClosure is_alive;
+1039     if (!heap-&gt;is_degenerated_gc_in_progress()) {
+1040       ShenandoahTraversalKeepAliveUpdateClosure keep_alive(heap-&gt;traversal_gc()-&gt;task_queues()-&gt;queue(worker_id));
+1041       _proc_task.work(worker_id, is_alive, keep_alive, complete_gc);
+1042     } else {
+1043       ShenandoahTraversalKeepAliveUpdateDegenClosure keep_alive(heap-&gt;traversal_gc()-&gt;task_queues()-&gt;queue(worker_id));
+1044       _proc_task.work(worker_id, is_alive, keep_alive, complete_gc);
+1045     }
+1046   }
+1047 };
+1048 
+1049 class ShenandoahTraversalRefProcTaskExecutor : public AbstractRefProcTaskExecutor {
+1050 private:
+1051   WorkGang* _workers;
+1052 
+1053 public:
+1054   ShenandoahTraversalRefProcTaskExecutor(WorkGang* workers) : _workers(workers) {}
+1055 
+1056   // Executes a task using worker threads.
+1057   void execute(ProcessTask&amp; task, uint ergo_workers) {
+1058     assert(ShenandoahSafepoint::is_at_shenandoah_safepoint(), &quot;Must be at a safepoint&quot;);
+1059 
+1060     ShenandoahHeap* heap = ShenandoahHeap::heap();
+1061     ShenandoahTraversalGC* traversal_gc = heap-&gt;traversal_gc();
+1062     ShenandoahPushWorkerQueuesScope scope(_workers,
+1063                                           traversal_gc-&gt;task_queues(),
+1064                                           ergo_workers,
+1065                                           /* do_check = */ false);
+1066     uint nworkers = _workers-&gt;active_workers();
+1067     traversal_gc-&gt;task_queues()-&gt;reserve(nworkers);
+1068     TaskTerminator terminator(nworkers, traversal_gc-&gt;task_queues());
+1069     ShenandoahTraversalRefProcTaskProxy proc_task_proxy(task, &amp;terminator);
+1070     _workers-&gt;run_task(&amp;proc_task_proxy);
+1071   }
+1072 };
+1073 
+1074 void ShenandoahTraversalGC::weak_refs_work_doit() {
+1075   ReferenceProcessor* rp = _heap-&gt;ref_processor();
+1076 
+1077   ShenandoahPhaseTimings::Phase phase_process = ShenandoahPhaseTimings::weakrefs_process;
+1078 
+1079   shenandoah_assert_rp_isalive_not_installed();
+1080   ShenandoahForwardedIsAliveClosure is_alive;
+1081   ReferenceProcessorIsAliveMutator fix_isalive(rp, &amp;is_alive);
+1082 
+1083   WorkGang* workers = _heap-&gt;workers();
+1084   uint nworkers = workers-&gt;active_workers();
+1085 
+1086   rp-&gt;setup_policy(_heap-&gt;soft_ref_policy()-&gt;should_clear_all_soft_refs());
+1087   rp-&gt;set_active_mt_degree(nworkers);
+1088 
+1089   assert(task_queues()-&gt;is_empty(), &quot;Should be empty&quot;);
+1090 
+1091   // complete_gc and keep_alive closures instantiated here are only needed for
+1092   // single-threaded path in RP. They share the queue 0 for tracking work, which
+1093   // simplifies implementation. Since RP may decide to call complete_gc several
+1094   // times, we need to be able to reuse the terminator.
+1095   uint serial_worker_id = 0;
+1096   TaskTerminator terminator(1, task_queues());
+1097   ShenandoahTraversalSingleThreadedDrainMarkingStackClosure complete_gc(serial_worker_id, &amp;terminator, /* reset_terminator = */ true);
+1098   ShenandoahPushWorkerQueuesScope scope(workers, task_queues(), 1, /* do_check = */ false);
+1099 
+1100   ShenandoahTraversalRefProcTaskExecutor executor(workers);
+1101 
+1102   ReferenceProcessorPhaseTimes pt(_heap-&gt;gc_timer(), rp-&gt;num_queues());
+1103   if (!_heap-&gt;is_degenerated_gc_in_progress()) {
+1104     ShenandoahTraversalSingleThreadKeepAliveUpdateClosure keep_alive(task_queues()-&gt;queue(serial_worker_id));
+1105     rp-&gt;process_discovered_references(&amp;is_alive, &amp;keep_alive,
+1106                                       &amp;complete_gc, &amp;executor,
+1107                                       &amp;pt);
+1108   } else {
+1109     ShenandoahTraversalSingleThreadKeepAliveUpdateDegenClosure keep_alive(task_queues()-&gt;queue(serial_worker_id));
+1110     rp-&gt;process_discovered_references(&amp;is_alive, &amp;keep_alive,
+1111                                       &amp;complete_gc, &amp;executor,
+1112                                       &amp;pt);
+1113   }
+1114 
+1115   pt.print_all_references();
+1116   assert(task_queues()-&gt;is_empty() || _heap-&gt;cancelled_gc(), &quot;Should be empty&quot;);
+1117 }
+    </pre>
+  </body>
+</html>

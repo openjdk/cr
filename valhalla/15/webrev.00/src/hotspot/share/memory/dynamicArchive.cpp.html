@@ -1,0 +1,1189 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>New src/hotspot/share/memory/dynamicArchive.cpp</title>
+    <link rel="stylesheet" href="../../../../style.css" />
+  </head>
+  <body>
+    <pre>
+   1 /*
+   2  * Copyright (c) 2019, 2020, Oracle and/or its affiliates. All rights reserved.
+   3  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+   4  *
+   5  * This code is free software; you can redistribute it and/or modify it
+   6  * under the terms of the GNU General Public License version 2 only, as
+   7  * published by the Free Software Foundation.
+   8  *
+   9  * This code is distributed in the hope that it will be useful, but WITHOUT
+  10  * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+  11  * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+  12  * version 2 for more details (a copy is included in the LICENSE file that
+  13  * accompanied this code).
+  14  *
+  15  * You should have received a copy of the GNU General Public License version
+  16  * 2 along with this work; if not, write to the Free Software Foundation,
+  17  * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+  18  *
+  19  * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+  20  * or visit www.oracle.com if you need additional information or have any
+  21  * questions.
+  22  *
+  23  */
+  24 
+  25 #include &quot;precompiled.hpp&quot;
+  26 #include &quot;jvm.h&quot;
+  27 #include &quot;classfile/classLoaderData.inline.hpp&quot;
+  28 #include &quot;classfile/symbolTable.hpp&quot;
+  29 #include &quot;classfile/systemDictionary.hpp&quot;
+  30 #include &quot;classfile/systemDictionaryShared.hpp&quot;
+  31 #include &quot;logging/log.hpp&quot;
+  32 #include &quot;memory/archiveUtils.inline.hpp&quot;
+  33 #include &quot;memory/dynamicArchive.hpp&quot;
+  34 #include &quot;memory/metadataFactory.hpp&quot;
+  35 #include &quot;memory/metaspace.hpp&quot;
+  36 #include &quot;memory/metaspaceClosure.hpp&quot;
+  37 #include &quot;memory/metaspaceShared.hpp&quot;
+  38 #include &quot;memory/resourceArea.hpp&quot;
+  39 #include &quot;oops/compressedOops.hpp&quot;
+  40 #include &quot;oops/objArrayKlass.hpp&quot;
+  41 #include &quot;prims/jvmtiRedefineClasses.hpp&quot;
+  42 #include &quot;runtime/handles.inline.hpp&quot;
+  43 #include &quot;runtime/os.inline.hpp&quot;
+  44 #include &quot;runtime/sharedRuntime.hpp&quot;
+  45 #include &quot;runtime/vmThread.hpp&quot;
+  46 #include &quot;runtime/vmOperations.hpp&quot;
+  47 #include &quot;utilities/bitMap.inline.hpp&quot;
+  48 
+  49 #ifndef O_BINARY       // if defined (Win32) use binary files.
+  50 #define O_BINARY 0     // otherwise do nothing.
+  51 #endif
+  52 
+  53 class DynamicArchiveBuilder : ResourceObj {
+  54   static unsigned my_hash(const address&amp; a) {
+  55     return primitive_hash&lt;address&gt;(a);
+  56   }
+  57   static bool my_equals(const address&amp; a0, const address&amp; a1) {
+  58     return primitive_equals&lt;address&gt;(a0, a1);
+  59   }
+  60   typedef ResourceHashtable&lt;
+  61       address, address,
+  62       DynamicArchiveBuilder::my_hash,   // solaris compiler doesn&#39;t like: primitive_hash&lt;address&gt;
+  63       DynamicArchiveBuilder::my_equals, // solaris compiler doesn&#39;t like: primitive_equals&lt;address&gt;
+  64       16384, ResourceObj::C_HEAP&gt; RelocationTable;
+  65   RelocationTable _new_loc_table;
+  66 
+  67   static intx _buffer_to_target_delta;
+  68 
+  69   DumpRegion* _current_dump_space;
+  70 
+  71   static size_t reserve_alignment() {
+  72     return Metaspace::reserve_alignment();
+  73   }
+  74 
+  75   static const int _total_dump_regions = 3;
+  76   int _num_dump_regions_used;
+  77 
+  78 public:
+  79   void mark_pointer(address* ptr_loc) {
+  80     ArchivePtrMarker::mark_pointer(ptr_loc);
+  81   }
+  82 
+  83   DumpRegion* current_dump_space() const {
+  84     return _current_dump_space;
+  85   }
+  86 
+  87   bool is_in_buffer_space(address p) const {
+  88     return (_alloc_bottom &lt;= p &amp;&amp; p &lt; (address)current_dump_space()-&gt;top());
+  89   }
+  90 
+  91   template &lt;typename T&gt; bool is_in_target_space(T target_obj) const {
+  92     address buff_obj = address(target_obj) - _buffer_to_target_delta;
+  93     return is_in_buffer_space(buff_obj);
+  94   }
+  95 
+  96   template &lt;typename T&gt; bool is_in_buffer_space(T obj) const {
+  97     return is_in_buffer_space(address(obj));
+  98   }
+  99 
+ 100   template &lt;typename T&gt; T to_target_no_check(T obj) const {
+ 101     return (T)(address(obj) + _buffer_to_target_delta);
+ 102   }
+ 103 
+ 104   template &lt;typename T&gt; T to_target(T obj) const {
+ 105     assert(is_in_buffer_space(obj), &quot;must be&quot;);
+ 106     return (T)(address(obj) + _buffer_to_target_delta);
+ 107   }
+ 108 
+ 109   template &lt;typename T&gt; T get_new_loc(T obj) {
+ 110     address* pp = _new_loc_table.get((address)obj);
+ 111     if (pp == NULL) {
+ 112       // Excluded klasses are not copied
+ 113       return NULL;
+ 114     } else {
+ 115       return (T)*pp;
+ 116     }
+ 117   }
+ 118 
+ 119   address get_new_loc(MetaspaceClosure::Ref* ref) {
+ 120     return get_new_loc(ref-&gt;obj());
+ 121   }
+ 122 
+ 123   template &lt;typename T&gt; bool has_new_loc(T obj) {
+ 124     address* pp = _new_loc_table.get((address)obj);
+ 125     return pp != NULL;
+ 126   }
+ 127 
+ 128   static int dynamic_dump_method_comparator(Method* a, Method* b) {
+ 129     Symbol* a_name = a-&gt;name();
+ 130     Symbol* b_name = b-&gt;name();
+ 131 
+ 132     if (a_name == b_name) {
+ 133       return 0;
+ 134     }
+ 135 
+ 136     if (!MetaspaceShared::is_in_shared_metaspace(a_name)) {
+ 137       // a_name points to a Symbol in the top archive.
+ 138       // When this method is called, a_name is still pointing to the output space.
+ 139       // Translate it to point to the output space, so that it can be compared with
+ 140       // Symbols in the base archive.
+ 141       a_name = (Symbol*)(address(a_name) + _buffer_to_target_delta);
+ 142     }
+ 143     if (!MetaspaceShared::is_in_shared_metaspace(b_name)) {
+ 144       b_name = (Symbol*)(address(b_name) + _buffer_to_target_delta);
+ 145     }
+ 146 
+ 147     return a_name-&gt;fast_compare(b_name);
+ 148   }
+ 149 
+ 150 protected:
+ 151   enum FollowMode {
+ 152     make_a_copy, point_to_it, set_to_null
+ 153   };
+ 154 
+ 155 public:
+ 156   void copy(MetaspaceClosure::Ref* ref, bool read_only) {
+ 157     int bytes = ref-&gt;size() * BytesPerWord;
+ 158     address old_obj = ref-&gt;obj();
+ 159     address new_obj = copy_impl(ref, read_only, bytes);
+ 160 
+ 161     assert(new_obj != NULL, &quot;must be&quot;);
+ 162     assert(new_obj != old_obj, &quot;must be&quot;);
+ 163     bool isnew = _new_loc_table.put(old_obj, new_obj);
+ 164     assert(isnew, &quot;must be&quot;);
+ 165   }
+ 166 
+ 167   // Make a shallow copy of each eligible MetaspaceObj into the buffer.
+ 168   class ShallowCopier: public UniqueMetaspaceClosure {
+ 169     DynamicArchiveBuilder* _builder;
+ 170     bool _read_only;
+ 171   public:
+ 172     ShallowCopier(DynamicArchiveBuilder* shuffler, bool read_only)
+ 173       : _builder(shuffler), _read_only(read_only) {}
+ 174 
+ 175     virtual bool do_unique_ref(Ref* orig_obj, bool read_only) {
+ 176       // This method gets called on each *original* object
+ 177       // reachable from _builder-&gt;iterate_roots(). Each orig_obj is
+ 178       // called exactly once.
+ 179       FollowMode mode = _builder-&gt;follow_ref(orig_obj);
+ 180 
+ 181       if (mode == point_to_it) {
+ 182         if (read_only == _read_only) {
+ 183           log_debug(cds, dynamic)(&quot;ptr : &quot; PTR_FORMAT &quot; %s&quot;, p2i(orig_obj-&gt;obj()),
+ 184                                   MetaspaceObj::type_name(orig_obj-&gt;msotype()));
+ 185           address p = orig_obj-&gt;obj();
+ 186           bool isnew = _builder-&gt;_new_loc_table.put(p, p);
+ 187           assert(isnew, &quot;must be&quot;);
+ 188         }
+ 189         return false;
+ 190       }
+ 191 
+ 192       if (mode == set_to_null) {
+ 193         log_debug(cds, dynamic)(&quot;nul : &quot; PTR_FORMAT &quot; %s&quot;, p2i(orig_obj-&gt;obj()),
+ 194                                 MetaspaceObj::type_name(orig_obj-&gt;msotype()));
+ 195         return false;
+ 196       }
+ 197 
+ 198       if (read_only == _read_only) {
+ 199         // Make a shallow copy of orig_obj in a buffer (maintained
+ 200         // by copy_impl in a subclass of DynamicArchiveBuilder).
+ 201         _builder-&gt;copy(orig_obj, read_only);
+ 202       }
+ 203       return true;
+ 204     }
+ 205   };
+ 206 
+ 207   // Relocate all embedded pointer fields within a MetaspaceObj&#39;s shallow copy
+ 208   class ShallowCopyEmbeddedRefRelocator: public UniqueMetaspaceClosure {
+ 209     DynamicArchiveBuilder* _builder;
+ 210   public:
+ 211     ShallowCopyEmbeddedRefRelocator(DynamicArchiveBuilder* shuffler)
+ 212       : _builder(shuffler) {}
+ 213 
+ 214     // This method gets called on each *original* object reachable
+ 215     // from _builder-&gt;iterate_roots(). Each orig_obj is
+ 216     // called exactly once.
+ 217     virtual bool do_unique_ref(Ref* orig_ref, bool read_only) {
+ 218       FollowMode mode = _builder-&gt;follow_ref(orig_ref);
+ 219 
+ 220       if (mode == point_to_it) {
+ 221         // We did not make a copy of this object
+ 222         // and we have nothing to update
+ 223         assert(_builder-&gt;get_new_loc(orig_ref) == NULL ||
+ 224                _builder-&gt;get_new_loc(orig_ref) == orig_ref-&gt;obj(), &quot;must be&quot;);
+ 225         return false;
+ 226       }
+ 227 
+ 228       if (mode == set_to_null) {
+ 229         // We did not make a copy of this object
+ 230         // and we have nothing to update
+ 231         assert(!_builder-&gt;has_new_loc(orig_ref-&gt;obj()), &quot;must not be copied or pointed to&quot;);
+ 232         return false;
+ 233       }
+ 234 
+ 235       // - orig_obj points to the original object.
+ 236       // - new_obj points to the shallow copy (created by ShallowCopier)
+ 237       //   of orig_obj. new_obj is NULL if the orig_obj is excluded
+ 238       address orig_obj = orig_ref-&gt;obj();
+ 239       address new_obj  = _builder-&gt;get_new_loc(orig_ref);
+ 240 
+ 241       assert(new_obj != orig_obj, &quot;must be&quot;);
+ 242 #ifdef ASSERT
+ 243       if (new_obj == NULL) {
+ 244         if (orig_ref-&gt;msotype() == MetaspaceObj::ClassType) {
+ 245           Klass* k = (Klass*)orig_obj;
+ 246           assert(k-&gt;is_instance_klass() &amp;&amp;
+ 247                  SystemDictionaryShared::is_excluded_class(InstanceKlass::cast(k)),
+ 248                  &quot;orig_obj must be excluded Class&quot;);
+ 249         }
+ 250       }
+ 251 #endif
+ 252 
+ 253       log_debug(cds, dynamic)(&quot;Relocating &quot; PTR_FORMAT &quot; %s&quot;, p2i(new_obj),
+ 254                               MetaspaceObj::type_name(orig_ref-&gt;msotype()));
+ 255       if (new_obj != NULL) {
+ 256         EmbeddedRefUpdater updater(_builder, orig_obj, new_obj);
+ 257         orig_ref-&gt;metaspace_pointers_do(&amp;updater);
+ 258       }
+ 259 
+ 260       return true; // keep recursing until every object is visited exactly once.
+ 261     }
+ 262 
+ 263     virtual void push_special(SpecialRef type, Ref* ref, intptr_t* p) {
+ 264       // TODO:CDS - JDK-8234693 will consolidate this with an almost identical method in metaspaceShared.cpp
+ 265       assert_valid(type);
+ 266       address obj = ref-&gt;obj();
+ 267       address new_obj = _builder-&gt;get_new_loc(ref);
+ 268       size_t offset = pointer_delta(p, obj,  sizeof(u1));
+ 269       intptr_t* new_p = (intptr_t*)(new_obj + offset);
+ 270       switch (type) {
+ 271       case _method_entry_ref:
+ 272         assert(*p == *new_p, &quot;must be a copy&quot;);
+ 273         break;
+ 274       case _internal_pointer_ref:
+ 275         {
+ 276           size_t off = pointer_delta(*((address*)p), obj, sizeof(u1));
+ 277           assert(0 &lt;= intx(off) &amp;&amp; intx(off) &lt; ref-&gt;size() * BytesPerWord, &quot;must point to internal address&quot;);
+ 278           *((address*)new_p) = new_obj + off;
+ 279         }
+ 280         break;
+ 281       default:
+ 282         ShouldNotReachHere();
+ 283       }
+ 284       ArchivePtrMarker::mark_pointer((address*)new_p);
+ 285     }
+ 286   };
+ 287 
+ 288   class EmbeddedRefUpdater: public MetaspaceClosure {
+ 289     DynamicArchiveBuilder* _builder;
+ 290     address _orig_obj;
+ 291     address _new_obj;
+ 292   public:
+ 293     EmbeddedRefUpdater(DynamicArchiveBuilder* shuffler, address orig_obj, address new_obj) :
+ 294       _builder(shuffler), _orig_obj(orig_obj), _new_obj(new_obj) {}
+ 295 
+ 296     // This method gets called once for each pointer field F of orig_obj.
+ 297     // We update new_obj-&gt;F to point to the new location of orig_obj-&gt;F.
+ 298     //
+ 299     // Example: Klass*  0x100 is copied to 0x400
+ 300     //          Symbol* 0x200 is copied to 0x500
+ 301     //
+ 302     // Let orig_obj == 0x100; and
+ 303     //     new_obj  == 0x400; and
+ 304     //     ((Klass*)orig_obj)-&gt;_name == 0x200;
+ 305     // Then this function effectively assigns
+ 306     //     ((Klass*)new_obj)-&gt;_name = 0x500;
+ 307     virtual bool do_ref(Ref* ref, bool read_only) {
+ 308       address new_pointee = NULL;
+ 309 
+ 310       if (ref-&gt;not_null()) {
+ 311         address old_pointee = ref-&gt;obj();
+ 312 
+ 313         FollowMode mode = _builder-&gt;follow_ref(ref);
+ 314         if (mode == point_to_it) {
+ 315           new_pointee = old_pointee;
+ 316         } else if (mode == set_to_null) {
+ 317           new_pointee = NULL;
+ 318         } else {
+ 319           new_pointee = _builder-&gt;get_new_loc(old_pointee);
+ 320         }
+ 321       }
+ 322 
+ 323       const char* kind = MetaspaceObj::type_name(ref-&gt;msotype());
+ 324       // offset of this field inside the original object
+ 325       intx offset = (address)ref-&gt;addr() - _orig_obj;
+ 326       _builder-&gt;update_pointer((address*)(_new_obj + offset), new_pointee, kind, offset);
+ 327 
+ 328       // We can&#39;t mark the pointer here, because DynamicArchiveBuilder::sort_methods
+ 329       // may re-layout the [iv]tables, which would change the offset(s) in an InstanceKlass
+ 330       // that would contain pointers. Therefore, we must mark the pointers after
+ 331       // sort_methods(), using PointerMarker.
+ 332       return false; // Do not recurse.
+ 333     }
+ 334   };
+ 335 
+ 336   class ExternalRefUpdater: public MetaspaceClosure {
+ 337     DynamicArchiveBuilder* _builder;
+ 338 
+ 339   public:
+ 340     ExternalRefUpdater(DynamicArchiveBuilder* shuffler) : _builder(shuffler) {}
+ 341 
+ 342     virtual bool do_ref(Ref* ref, bool read_only) {
+ 343       // ref is a pointer that lives OUTSIDE of the buffer, but points to an object inside the buffer
+ 344       if (ref-&gt;not_null()) {
+ 345         address new_loc = _builder-&gt;get_new_loc(ref);
+ 346         const char* kind = MetaspaceObj::type_name(ref-&gt;msotype());
+ 347         _builder-&gt;update_pointer(ref-&gt;addr(), new_loc, kind, 0);
+ 348         _builder-&gt;mark_pointer(ref-&gt;addr());
+ 349       }
+ 350       return false; // Do not recurse.
+ 351     }
+ 352   };
+ 353 
+ 354   class PointerMarker: public UniqueMetaspaceClosure {
+ 355     DynamicArchiveBuilder* _builder;
+ 356 
+ 357   public:
+ 358     PointerMarker(DynamicArchiveBuilder* shuffler) : _builder(shuffler) {}
+ 359 
+ 360     virtual bool do_unique_ref(Ref* ref, bool read_only) {
+ 361       if (_builder-&gt;is_in_buffer_space(ref-&gt;obj())) {
+ 362         EmbeddedRefMarker ref_marker(_builder);
+ 363         ref-&gt;metaspace_pointers_do(&amp;ref_marker);
+ 364         return true; // keep recursing until every buffered object is visited exactly once.
+ 365       } else {
+ 366         return false;
+ 367       }
+ 368     }
+ 369   };
+ 370 
+ 371   class EmbeddedRefMarker: public MetaspaceClosure {
+ 372     DynamicArchiveBuilder* _builder;
+ 373 
+ 374   public:
+ 375     EmbeddedRefMarker(DynamicArchiveBuilder* shuffler) : _builder(shuffler) {}
+ 376     virtual bool do_ref(Ref* ref, bool read_only) {
+ 377       if (ref-&gt;not_null()) {
+ 378         _builder-&gt;mark_pointer(ref-&gt;addr());
+ 379       }
+ 380       return false; // Do not recurse.
+ 381     }
+ 382   };
+ 383 
+ 384   void update_pointer(address* addr, address value, const char* kind, uintx offset, bool is_mso_pointer=true) {
+ 385     // Propagate the the mask bits to the new value -- see comments above MetaspaceClosure::obj()
+ 386     if (is_mso_pointer) {
+ 387       const uintx FLAG_MASK = 0x03;
+ 388       uintx mask_bits = uintx(*addr) &amp; FLAG_MASK;
+ 389       value = (address)(uintx(value) | mask_bits);
+ 390     }
+ 391 
+ 392     if (*addr != value) {
+ 393       log_debug(cds, dynamic)(&quot;Update (%18s*) %3d [&quot; PTR_FORMAT &quot;] &quot; PTR_FORMAT &quot; -&gt; &quot; PTR_FORMAT,
+ 394                               kind, int(offset), p2i(addr), p2i(*addr), p2i(value));
+ 395       *addr = value;
+ 396     }
+ 397   }
+ 398 
+ 399 private:
+ 400   GrowableArray&lt;Symbol*&gt;* _symbols; // symbols to dump
+ 401   GrowableArray&lt;InstanceKlass*&gt;* _klasses; // klasses to dump
+ 402 
+ 403   void append(InstanceKlass* k) { _klasses-&gt;append(k); }
+ 404   void append(Symbol* s)        { _symbols-&gt;append(s); }
+ 405 
+ 406   class GatherKlassesAndSymbols : public UniqueMetaspaceClosure {
+ 407     DynamicArchiveBuilder* _builder;
+ 408     bool _read_only;
+ 409 
+ 410   public:
+ 411     GatherKlassesAndSymbols(DynamicArchiveBuilder* builder)
+ 412       : _builder(builder) {}
+ 413 
+ 414     virtual bool do_unique_ref(Ref* ref, bool read_only) {
+ 415       if (_builder-&gt;follow_ref(ref) != make_a_copy) {
+ 416         return false;
+ 417       }
+ 418       if (ref-&gt;msotype() == MetaspaceObj::ClassType) {
+ 419         Klass* klass = (Klass*)ref-&gt;obj();
+ 420         assert(klass-&gt;is_klass(), &quot;must be&quot;);
+ 421         if (klass-&gt;is_instance_klass()) {
+ 422           InstanceKlass* ik = InstanceKlass::cast(klass);
+ 423           assert(!SystemDictionaryShared::is_excluded_class(ik), &quot;must be&quot;);
+ 424           _builder-&gt;append(ik);
+ 425           _builder-&gt;_estimated_metsapceobj_bytes += BytesPerWord; // See RunTimeSharedClassInfo::get_for()
+ 426         }
+ 427       } else if (ref-&gt;msotype() == MetaspaceObj::SymbolType) {
+ 428         _builder-&gt;append((Symbol*)ref-&gt;obj());
+ 429       }
+ 430 
+ 431       int bytes = ref-&gt;size() * BytesPerWord;
+ 432       _builder-&gt;_estimated_metsapceobj_bytes += bytes;
+ 433 
+ 434       return true;
+ 435     }
+ 436   };
+ 437 
+ 438   FollowMode follow_ref(MetaspaceClosure::Ref *ref) {
+ 439     address obj = ref-&gt;obj();
+ 440     if (MetaspaceShared::is_in_shared_metaspace(obj)) {
+ 441       // Don&#39;t dump existing shared metadata again.
+ 442       return point_to_it;
+ 443     } else if (ref-&gt;msotype() == MetaspaceObj::MethodDataType) {
+ 444       return set_to_null;
+ 445     } else {
+ 446       if (ref-&gt;msotype() == MetaspaceObj::ClassType) {
+ 447         Klass* klass = (Klass*)ref-&gt;obj();
+ 448         assert(klass-&gt;is_klass(), &quot;must be&quot;);
+ 449         if (klass-&gt;is_instance_klass()) {
+ 450           InstanceKlass* ik = InstanceKlass::cast(klass);
+ 451           if (SystemDictionaryShared::is_excluded_class(ik)) {
+ 452             ResourceMark rm;
+ 453             log_debug(cds, dynamic)(&quot;Skipping class (excluded): %s&quot;, klass-&gt;external_name());
+ 454             return set_to_null;
+ 455           }
+ 456         } else if (klass-&gt;is_array_klass()) {
+ 457           // Don&#39;t support archiving of array klasses for now.
+ 458           ResourceMark rm;
+ 459           log_debug(cds, dynamic)(&quot;Skipping class (array): %s&quot;, klass-&gt;external_name());
+ 460           return set_to_null;
+ 461         }
+ 462       }
+ 463 
+ 464       return make_a_copy;
+ 465     }
+ 466   }
+ 467 
+ 468   address copy_impl(MetaspaceClosure::Ref* ref, bool read_only, int bytes) {
+ 469     if (ref-&gt;msotype() == MetaspaceObj::ClassType) {
+ 470       // Save a pointer immediate in front of an InstanceKlass, so
+ 471       // we can do a quick lookup from InstanceKlass* -&gt; RunTimeSharedClassInfo*
+ 472       // without building another hashtable. See RunTimeSharedClassInfo::get_for()
+ 473       // in systemDictionaryShared.cpp.
+ 474       address obj = ref-&gt;obj();
+ 475       Klass* klass = (Klass*)obj;
+ 476       if (klass-&gt;is_instance_klass()) {
+ 477         SystemDictionaryShared::validate_before_archiving(InstanceKlass::cast(klass));
+ 478         current_dump_space()-&gt;allocate(sizeof(address), BytesPerWord);
+ 479       }
+ 480     }
+ 481     address p = (address)current_dump_space()-&gt;allocate(bytes);
+ 482     address obj = ref-&gt;obj();
+ 483     log_debug(cds, dynamic)(&quot;COPY: &quot; PTR_FORMAT &quot; ==&gt; &quot; PTR_FORMAT &quot; %5d %s&quot;,
+ 484                             p2i(obj), p2i(p), bytes,
+ 485                             MetaspaceObj::type_name(ref-&gt;msotype()));
+ 486     memcpy(p, obj, bytes);
+ 487     intptr_t* cloned_vtable = MetaspaceShared::fix_cpp_vtable_for_dynamic_archive(ref-&gt;msotype(), p);
+ 488     if (cloned_vtable != NULL) {
+ 489       update_pointer((address*)p, (address)cloned_vtable, &quot;vtb&quot;, 0, /*is_mso_pointer*/false);
+ 490       mark_pointer((address*)p);
+ 491     }
+ 492 
+ 493     return (address)p;
+ 494   }
+ 495 
+ 496   DynamicArchiveHeader *_header;
+ 497   address _alloc_bottom;
+ 498   address _last_verified_top;
+ 499   size_t _other_region_used_bytes;
+ 500 
+ 501   // Conservative estimate for number of bytes needed for:
+ 502   size_t _estimated_metsapceobj_bytes;   // all archived MetsapceObj&#39;s.
+ 503   size_t _estimated_hashtable_bytes;     // symbol table and dictionaries
+ 504   size_t _estimated_trampoline_bytes;    // method entry trampolines
+ 505 
+ 506   size_t estimate_archive_size();
+ 507   size_t estimate_trampoline_size();
+ 508   size_t estimate_class_file_size();
+ 509   address reserve_space_and_init_buffer_to_target_delta();
+ 510   void init_header(address addr);
+ 511   void release_header();
+ 512   void make_trampolines();
+ 513   void make_klasses_shareable();
+ 514   void sort_methods(InstanceKlass* ik) const;
+ 515   void set_symbols_permanent();
+ 516   void relocate_buffer_to_target();
+ 517   void write_archive(char* serialized_data);
+ 518 
+ 519   void init_first_dump_space(address reserved_bottom) {
+ 520     address first_space_base = reserved_bottom;
+ 521     DumpRegion* mc_space = MetaspaceShared::misc_code_dump_space();
+ 522     DumpRegion* rw_space = MetaspaceShared::read_write_dump_space();
+ 523 
+ 524     // Use the same MC-&gt;RW-&gt;RO ordering as in the base archive.
+ 525     MetaspaceShared::init_shared_dump_space(mc_space, first_space_base);
+ 526     _current_dump_space = mc_space;
+ 527     _last_verified_top = first_space_base;
+ 528     _num_dump_regions_used = 1;
+ 529   }
+ 530 
+ 531   void reserve_buffers_for_trampolines() {
+ 532     size_t n = _estimated_trampoline_bytes;
+ 533     assert(n &gt;= SharedRuntime::trampoline_size(), &quot;dont want to be empty&quot;);
+ 534     MetaspaceShared::misc_code_space_alloc(n);
+ 535   }
+ 536 
+ 537 public:
+ 538   DynamicArchiveBuilder() {
+ 539     _klasses = new (ResourceObj::C_HEAP, mtClass) GrowableArray&lt;InstanceKlass*&gt;(100, true, mtInternal);
+ 540     _symbols = new (ResourceObj::C_HEAP, mtClass) GrowableArray&lt;Symbol*&gt;(1000, true, mtInternal);
+ 541 
+ 542     _estimated_metsapceobj_bytes = 0;
+ 543     _estimated_hashtable_bytes = 0;
+ 544     _estimated_trampoline_bytes = 0;
+ 545 
+ 546     _num_dump_regions_used = 0;
+ 547   }
+ 548 
+ 549   void start_dump_space(DumpRegion* next) {
+ 550     address bottom = _last_verified_top;
+ 551     address top = (address)(current_dump_space()-&gt;top());
+ 552     _other_region_used_bytes += size_t(top - bottom);
+ 553 
+ 554     MetaspaceShared::pack_dump_space(current_dump_space(), next, MetaspaceShared::shared_rs());
+ 555     _current_dump_space = next;
+ 556     _num_dump_regions_used ++;
+ 557 
+ 558     _last_verified_top = (address)(current_dump_space()-&gt;top());
+ 559   }
+ 560 
+ 561   void verify_estimate_size(size_t estimate, const char* which) {
+ 562     address bottom = _last_verified_top;
+ 563     address top = (address)(current_dump_space()-&gt;top());
+ 564     size_t used = size_t(top - bottom) + _other_region_used_bytes;
+ 565     int diff = int(estimate) - int(used);
+ 566 
+ 567     log_info(cds)(&quot;%s estimate = &quot; SIZE_FORMAT &quot; used = &quot; SIZE_FORMAT &quot;; diff = %d bytes&quot;, which, estimate, used, diff);
+ 568     assert(diff &gt;= 0, &quot;Estimate is too small&quot;);
+ 569 
+ 570     _last_verified_top = top;
+ 571     _other_region_used_bytes = 0;
+ 572   }
+ 573 
+ 574   // Do this before and after the archive dump to see if any corruption
+ 575   // is caused by dynamic dumping.
+ 576   void verify_universe(const char* info) {
+ 577     if (VerifyBeforeExit) {
+ 578       log_info(cds)(&quot;Verify %s&quot;, info);
+ 579       HandleMark hm;
+ 580       // Among other things, this ensures that Eden top is correct.
+ 581       Universe::heap()-&gt;prepare_for_verify();
+ 582       Universe::verify(info);
+ 583     }
+ 584   }
+ 585 
+ 586   void doit() {
+ 587     verify_universe(&quot;Before CDS dynamic dump&quot;);
+ 588     DEBUG_ONLY(SystemDictionaryShared::NoClassLoadingMark nclm);
+ 589     SystemDictionaryShared::check_excluded_classes();
+ 590 
+ 591     {
+ 592       ResourceMark rm;
+ 593       GatherKlassesAndSymbols gatherer(this);
+ 594 
+ 595       SystemDictionaryShared::dumptime_classes_do(&amp;gatherer);
+ 596       SymbolTable::metaspace_pointers_do(&amp;gatherer);
+ 597       FileMapInfo::metaspace_pointers_do(&amp;gatherer);
+ 598 
+ 599       gatherer.finish();
+ 600     }
+ 601 
+ 602     // rw space starts ...
+ 603     address reserved_bottom = reserve_space_and_init_buffer_to_target_delta();
+ 604     init_header(reserved_bottom);
+ 605 
+ 606     CHeapBitMap ptrmap;
+ 607     ArchivePtrMarker::initialize(&amp;ptrmap, (address*)reserved_bottom, (address*)current_dump_space()-&gt;top());
+ 608 
+ 609     reserve_buffers_for_trampolines();
+ 610     verify_estimate_size(_estimated_trampoline_bytes, &quot;Trampolines&quot;);
+ 611 
+ 612     start_dump_space(MetaspaceShared::read_write_dump_space());
+ 613 
+ 614     log_info(cds, dynamic)(&quot;Copying %d klasses and %d symbols&quot;,
+ 615                            _klasses-&gt;length(), _symbols-&gt;length());
+ 616 
+ 617     {
+ 618       assert(current_dump_space() == MetaspaceShared::read_write_dump_space(),
+ 619              &quot;Current dump space is not rw space&quot;);
+ 620       // shallow-copy RW objects, if necessary
+ 621       ResourceMark rm;
+ 622       ShallowCopier rw_copier(this, false);
+ 623       iterate_roots(&amp;rw_copier);
+ 624     }
+ 625 
+ 626     // ro space starts ...
+ 627     DumpRegion* ro_space = MetaspaceShared::read_only_dump_space();
+ 628     {
+ 629       start_dump_space(ro_space);
+ 630 
+ 631       // shallow-copy RO objects, if necessary
+ 632       ResourceMark rm;
+ 633       ShallowCopier ro_copier(this, true);
+ 634       iterate_roots(&amp;ro_copier);
+ 635     }
+ 636 
+ 637     {
+ 638       log_info(cds)(&quot;Relocating embedded pointers ... &quot;);
+ 639       ResourceMark rm;
+ 640       ShallowCopyEmbeddedRefRelocator emb_reloc(this);
+ 641       iterate_roots(&amp;emb_reloc);
+ 642     }
+ 643 
+ 644     {
+ 645       log_info(cds)(&quot;Relocating external roots ... &quot;);
+ 646       ResourceMark rm;
+ 647       ExternalRefUpdater ext_reloc(this);
+ 648       iterate_roots(&amp;ext_reloc);
+ 649     }
+ 650 
+ 651     verify_estimate_size(_estimated_metsapceobj_bytes, &quot;MetaspaceObjs&quot;);
+ 652 
+ 653     char* serialized_data;
+ 654     {
+ 655       set_symbols_permanent();
+ 656 
+ 657       // Write the symbol table and system dictionaries to the RO space.
+ 658       // Note that these tables still point to the *original* objects
+ 659       // (because they were not processed by ExternalRefUpdater), so
+ 660       // they would need to call DynamicArchive::original_to_target() to
+ 661       // get the correct addresses.
+ 662       assert(current_dump_space() == ro_space, &quot;Must be RO space&quot;);
+ 663       SymbolTable::write_to_archive(false);
+ 664       SystemDictionaryShared::write_to_archive(false);
+ 665 
+ 666       serialized_data = ro_space-&gt;top();
+ 667       WriteClosure wc(ro_space);
+ 668       SymbolTable::serialize_shared_table_header(&amp;wc, false);
+ 669       SystemDictionaryShared::serialize_dictionary_headers(&amp;wc, false);
+ 670     }
+ 671 
+ 672     verify_estimate_size(_estimated_hashtable_bytes, &quot;Hashtables&quot;);
+ 673 
+ 674     make_trampolines();
+ 675     make_klasses_shareable();
+ 676 
+ 677     {
+ 678       log_info(cds)(&quot;Final relocation of pointers ... &quot;);
+ 679       ResourceMark rm;
+ 680       PointerMarker marker(this);
+ 681       iterate_roots(&amp;marker);
+ 682       relocate_buffer_to_target();
+ 683     }
+ 684 
+ 685     write_archive(serialized_data);
+ 686     release_header();
+ 687 
+ 688     assert(_num_dump_regions_used == _total_dump_regions, &quot;must be&quot;);
+ 689     verify_universe(&quot;After CDS dynamic dump&quot;);
+ 690   }
+ 691 
+ 692   void iterate_roots(MetaspaceClosure* it) {
+ 693     int i;
+ 694     int num_klasses = _klasses-&gt;length();
+ 695     for (i = 0; i &lt; num_klasses; i++) {
+ 696       it-&gt;push(&amp;_klasses-&gt;at(i));
+ 697     }
+ 698 
+ 699     int num_symbols = _symbols-&gt;length();
+ 700     for (i = 0; i &lt; num_symbols; i++) {
+ 701       it-&gt;push(&amp;_symbols-&gt;at(i));
+ 702     }
+ 703 
+ 704     FileMapInfo::metaspace_pointers_do(it);
+ 705 
+ 706     // Do not call these again, as we have already collected all the classes and symbols
+ 707     // that we want to archive. Also, these calls would corrupt the tables when
+ 708     // ExternalRefUpdater is used.
+ 709     //
+ 710     // SystemDictionaryShared::dumptime_classes_do(it);
+ 711     // SymbolTable::metaspace_pointers_do(it);
+ 712 
+ 713     it-&gt;finish();
+ 714   }
+ 715 };
+ 716 
+ 717 intx DynamicArchiveBuilder::_buffer_to_target_delta;
+ 718 
+ 719 
+ 720 size_t DynamicArchiveBuilder::estimate_archive_size() {
+ 721   // size of the symbol table and two dictionaries, plus the RunTimeSharedClassInfo&#39;s
+ 722   _estimated_hashtable_bytes = 0;
+ 723   _estimated_hashtable_bytes += SymbolTable::estimate_size_for_archive();
+ 724   _estimated_hashtable_bytes += SystemDictionaryShared::estimate_size_for_archive();
+ 725 
+ 726   _estimated_trampoline_bytes = estimate_trampoline_size();
+ 727 
+ 728   size_t total = 0;
+ 729 
+ 730   total += _estimated_metsapceobj_bytes;
+ 731   total += _estimated_hashtable_bytes;
+ 732   total += _estimated_trampoline_bytes;
+ 733 
+ 734   // allow fragmentation at the end of each dump region
+ 735   total += _total_dump_regions * reserve_alignment();
+ 736 
+ 737   return align_up(total, reserve_alignment());
+ 738 }
+ 739 
+ 740 address DynamicArchiveBuilder::reserve_space_and_init_buffer_to_target_delta() {
+ 741   size_t total = estimate_archive_size();
+ 742   ReservedSpace rs = MetaspaceShared::reserve_shared_space(total);
+ 743   if (!rs.is_reserved()) {
+ 744     log_error(cds, dynamic)(&quot;Failed to reserve %d bytes of output buffer.&quot;, (int)total);
+ 745     vm_direct_exit(0);
+ 746   }
+ 747 
+ 748   address buffer_base = (address)rs.base();
+ 749   log_info(cds, dynamic)(&quot;Reserved output buffer space at    : &quot; PTR_FORMAT &quot; [%d bytes]&quot;,
+ 750                          p2i(buffer_base), (int)total);
+ 751   MetaspaceShared::set_shared_rs(rs);
+ 752 
+ 753   // At run time, we will mmap the dynamic archive at target_space_bottom.
+ 754   // However, at dump time, we may not be able to write into the target_space,
+ 755   // as it&#39;s occupied by dynamically loaded Klasses. So we allocate a buffer
+ 756   // at an arbitrary location chosen by the OS. We will write all the dynamically
+ 757   // archived classes into this buffer. At the final stage of dumping, we relocate
+ 758   // all pointers that are inside the buffer_space to point to their (runtime)
+ 759   // target location inside thetarget_space.
+ 760   address target_space_bottom =
+ 761     (address)align_up(MetaspaceShared::shared_metaspace_top(), reserve_alignment());
+ 762   _buffer_to_target_delta = intx(target_space_bottom) - intx(buffer_base);
+ 763 
+ 764   log_info(cds, dynamic)(&quot;Target archive space at            : &quot; PTR_FORMAT, p2i(target_space_bottom));
+ 765   log_info(cds, dynamic)(&quot;Buffer-space to target-space delta : &quot; PTR_FORMAT, p2i((address)_buffer_to_target_delta));
+ 766 
+ 767   return buffer_base;
+ 768 }
+ 769 
+ 770 void DynamicArchiveBuilder::init_header(address reserved_bottom) {
+ 771   _alloc_bottom = reserved_bottom;
+ 772   _last_verified_top = reserved_bottom;
+ 773   _other_region_used_bytes = 0;
+ 774 
+ 775   init_first_dump_space(reserved_bottom);
+ 776 
+ 777   FileMapInfo* mapinfo = new FileMapInfo(false);
+ 778   assert(FileMapInfo::dynamic_info() == mapinfo, &quot;must be&quot;);
+ 779   _header = mapinfo-&gt;dynamic_header();
+ 780 
+ 781   Thread* THREAD = Thread::current();
+ 782   FileMapInfo* base_info = FileMapInfo::current_info();
+ 783   _header-&gt;set_base_header_crc(base_info-&gt;crc());
+ 784   for (int i = 0; i &lt; MetaspaceShared::n_regions; i++) {
+ 785     _header-&gt;set_base_region_crc(i, base_info-&gt;space_crc(i));
+ 786   }
+ 787   _header-&gt;populate(base_info, os::vm_allocation_granularity());
+ 788 }
+ 789 
+ 790 void DynamicArchiveBuilder::release_header() {
+ 791   // We temporarily allocated a dynamic FileMapInfo for dumping, which makes it appear we
+ 792   // have mapped a dynamic archive, but we actually have not. We are in a safepoint now.
+ 793   // Let&#39;s free it so that if class loading happens after we leave the safepoint, nothing
+ 794   // bad will happen.
+ 795   assert(SafepointSynchronize::is_at_safepoint(), &quot;must be&quot;);
+ 796   FileMapInfo *mapinfo = FileMapInfo::dynamic_info();
+ 797   assert(mapinfo != NULL &amp;&amp; _header == mapinfo-&gt;dynamic_header(), &quot;must be&quot;);
+ 798   delete mapinfo;
+ 799   assert(!DynamicArchive::is_mapped(), &quot;must be&quot;);
+ 800   _header = NULL;
+ 801 }
+ 802 
+ 803 size_t DynamicArchiveBuilder::estimate_trampoline_size() {
+ 804   size_t total = 0;
+ 805   size_t each_method_bytes =
+ 806     align_up(SharedRuntime::trampoline_size(), BytesPerWord) * 3 +
+ 807     align_up(sizeof(AdapterHandlerEntry*), BytesPerWord);
+ 808 
+ 809   for (int i = 0; i &lt; _klasses-&gt;length(); i++) {
+ 810     InstanceKlass* ik = _klasses-&gt;at(i);
+ 811     Array&lt;Method*&gt;* methods = ik-&gt;methods();
+ 812     total += each_method_bytes * methods-&gt;length();
+ 813   }
+ 814   if (total == 0) {
+ 815     // We have nothing to archive, but let&#39;s avoid having an empty region.
+ 816     total = SharedRuntime::trampoline_size();
+ 817   }
+ 818   return total;
+ 819 }
+ 820 
+ 821 void DynamicArchiveBuilder::make_trampolines() {
+ 822   DumpRegion* mc_space = MetaspaceShared::misc_code_dump_space();
+ 823   char* p = mc_space-&gt;base();
+ 824   for (int i = 0; i &lt; _klasses-&gt;length(); i++) {
+ 825     InstanceKlass* ik = _klasses-&gt;at(i);
+ 826     Array&lt;Method*&gt;* methods = ik-&gt;methods();
+ 827     for (int j = 0; j &lt; methods-&gt;length(); j++) {
+ 828       Method* m = methods-&gt;at(j);
+ 829 
+ 830       // TODO:CDS - JDK-8234693 will consolidate this with Method::unlink()
+ 831       address c2i_entry_trampoline = (address)p;
+ 832       p += SharedRuntime::trampoline_size();
+ 833       assert(p &gt;= mc_space-&gt;base() &amp;&amp; p &lt;= mc_space-&gt;top(), &quot;must be&quot;);
+ 834       m-&gt;set_from_compiled_entry(to_target(c2i_entry_trampoline));
+ 835 
+ 836       address c2i_value_ro_entry_trampoline = (address)p;
+ 837       p += SharedRuntime::trampoline_size();
+ 838       assert(p &gt;= mc_space-&gt;base() &amp;&amp; p &lt;= mc_space-&gt;top(), &quot;must be&quot;);
+ 839       m-&gt;set_from_compiled_value_ro_entry(to_target(c2i_value_ro_entry_trampoline));
+ 840 
+ 841       address c2i_value_entry_trampoline = (address)p;
+ 842       p +=  SharedRuntime::trampoline_size();
+ 843       assert(p &gt;= mc_space-&gt;base() &amp;&amp; p &lt;= mc_space-&gt;top(), &quot;must be&quot;);
+ 844       m-&gt;set_from_compiled_value_entry(to_target(c2i_value_entry_trampoline));
+ 845 
+ 846       AdapterHandlerEntry** adapter_trampoline =(AdapterHandlerEntry**)p;
+ 847       p += sizeof(AdapterHandlerEntry*);
+ 848       assert(p &gt;= mc_space-&gt;base() &amp;&amp; p &lt;= mc_space-&gt;top(), &quot;must be&quot;);
+ 849       *adapter_trampoline = NULL;
+ 850       m-&gt;set_adapter_trampoline(to_target(adapter_trampoline));
+ 851     }
+ 852   }
+ 853 
+ 854   guarantee(p &lt;= mc_space-&gt;top(), &quot;Estimate of trampoline size is insufficient&quot;);
+ 855 }
+ 856 
+ 857 void DynamicArchiveBuilder::make_klasses_shareable() {
+ 858   int i, count = _klasses-&gt;length();
+ 859 
+ 860   InstanceKlass::disable_method_binary_search();
+ 861   for (i = 0; i &lt; count; i++) {
+ 862     InstanceKlass* ik = _klasses-&gt;at(i);
+ 863     sort_methods(ik);
+ 864   }
+ 865 
+ 866   for (i = 0; i &lt; count; i++) {
+ 867     InstanceKlass* ik = _klasses-&gt;at(i);
+ 868     ClassLoaderData *cld = ik-&gt;class_loader_data();
+ 869     if (cld-&gt;is_boot_class_loader_data()) {
+ 870       ik-&gt;set_shared_class_loader_type(ClassLoader::BOOT_LOADER);
+ 871     }
+ 872     else if (cld-&gt;is_platform_class_loader_data()) {
+ 873       ik-&gt;set_shared_class_loader_type(ClassLoader::PLATFORM_LOADER);
+ 874     }
+ 875     else if (cld-&gt;is_system_class_loader_data()) {
+ 876       ik-&gt;set_shared_class_loader_type(ClassLoader::APP_LOADER);
+ 877     }
+ 878 
+ 879     MetaspaceShared::rewrite_nofast_bytecodes_and_calculate_fingerprints(Thread::current(), ik);
+ 880     ik-&gt;remove_unshareable_info();
+ 881 
+ 882     assert(ik-&gt;array_klasses() == NULL, &quot;sanity&quot;);
+ 883 
+ 884     if (log_is_enabled(Debug, cds, dynamic)) {
+ 885       ResourceMark rm;
+ 886       log_debug(cds, dynamic)(&quot;klasses[%4i] = &quot; PTR_FORMAT &quot; %s&quot;, i, p2i(to_target(ik)), ik-&gt;external_name());
+ 887     }
+ 888   }
+ 889 }
+ 890 
+ 891 // The address order of the copied Symbols may be different than when the original
+ 892 // klasses were created. Re-sort all the tables. See Method::sort_methods().
+ 893 void DynamicArchiveBuilder::sort_methods(InstanceKlass* ik) const {
+ 894   assert(ik != NULL, &quot;DynamicArchiveBuilder currently doesn&#39;t support dumping the base archive&quot;);
+ 895   if (MetaspaceShared::is_in_shared_metaspace(ik)) {
+ 896     // We have reached a supertype that&#39;s already in the base archive
+ 897     return;
+ 898   }
+ 899 
+ 900   if (ik-&gt;java_mirror() == NULL) {
+ 901     // NULL mirror means this class has already been visited and methods are already sorted
+ 902     return;
+ 903   }
+ 904   ik-&gt;remove_java_mirror();
+ 905 
+ 906   if (log_is_enabled(Debug, cds, dynamic)) {
+ 907     ResourceMark rm;
+ 908     log_debug(cds, dynamic)(&quot;sorting methods for &quot; PTR_FORMAT &quot; %s&quot;, p2i(to_target(ik)), ik-&gt;external_name());
+ 909   }
+ 910 
+ 911   // Make sure all supertypes have been sorted
+ 912   sort_methods(ik-&gt;java_super());
+ 913   Array&lt;InstanceKlass*&gt;* interfaces = ik-&gt;local_interfaces();
+ 914   int len = interfaces-&gt;length();
+ 915   for (int i = 0; i &lt; len; i++) {
+ 916     sort_methods(interfaces-&gt;at(i));
+ 917   }
+ 918 
+ 919 #ifdef ASSERT
+ 920   if (ik-&gt;methods() != NULL) {
+ 921     for (int m = 0; m &lt; ik-&gt;methods()-&gt;length(); m++) {
+ 922       Symbol* name = ik-&gt;methods()-&gt;at(m)-&gt;name();
+ 923       assert(MetaspaceShared::is_in_shared_metaspace(name) || is_in_buffer_space(name), &quot;must be&quot;);
+ 924     }
+ 925   }
+ 926   if (ik-&gt;default_methods() != NULL) {
+ 927     for (int m = 0; m &lt; ik-&gt;default_methods()-&gt;length(); m++) {
+ 928       Symbol* name = ik-&gt;default_methods()-&gt;at(m)-&gt;name();
+ 929       assert(MetaspaceShared::is_in_shared_metaspace(name) || is_in_buffer_space(name), &quot;must be&quot;);
+ 930     }
+ 931   }
+ 932 #endif
+ 933 
+ 934   Thread* THREAD = Thread::current();
+ 935   Method::sort_methods(ik-&gt;methods(), /*set_idnums=*/true, dynamic_dump_method_comparator);
+ 936   if (ik-&gt;default_methods() != NULL) {
+ 937     Method::sort_methods(ik-&gt;default_methods(), /*set_idnums=*/false, dynamic_dump_method_comparator);
+ 938   }
+ 939   ik-&gt;vtable().initialize_vtable(true, THREAD); assert(!HAS_PENDING_EXCEPTION, &quot;cannot fail&quot;);
+ 940   ik-&gt;itable().initialize_itable(true, THREAD); assert(!HAS_PENDING_EXCEPTION, &quot;cannot fail&quot;);
+ 941 }
+ 942 
+ 943 void DynamicArchiveBuilder::set_symbols_permanent() {
+ 944   int count = _symbols-&gt;length();
+ 945   for (int i=0; i&lt;count; i++) {
+ 946     Symbol* s = _symbols-&gt;at(i);
+ 947     s-&gt;set_permanent();
+ 948 
+ 949     if (log_is_enabled(Trace, cds, dynamic)) {
+ 950       ResourceMark rm;
+ 951       log_trace(cds, dynamic)(&quot;symbols[%4i] = &quot; PTR_FORMAT &quot; %s&quot;, i, p2i(to_target(s)), s-&gt;as_quoted_ascii());
+ 952     }
+ 953   }
+ 954 }
+ 955 
+ 956 class RelocateBufferToTarget: public BitMapClosure {
+ 957   DynamicArchiveBuilder *_builder;
+ 958   address* _buffer_bottom;
+ 959   intx _buffer_to_target_delta;
+ 960  public:
+ 961   RelocateBufferToTarget(DynamicArchiveBuilder* builder, address* bottom, intx delta) :
+ 962     _builder(builder), _buffer_bottom(bottom), _buffer_to_target_delta(delta) {}
+ 963 
+ 964   bool do_bit(size_t offset) {
+ 965     address* p = _buffer_bottom + offset;
+ 966     assert(_builder-&gt;is_in_buffer_space(p), &quot;pointer must live in buffer space&quot;);
+ 967 
+ 968     address old_ptr = *p;
+ 969     if (_builder-&gt;is_in_buffer_space(old_ptr)) {
+ 970       address new_ptr = old_ptr + _buffer_to_target_delta;
+ 971       log_trace(cds, dynamic)(&quot;Final patch: @%6d [&quot; PTR_FORMAT &quot; -&gt; &quot; PTR_FORMAT &quot;] &quot; PTR_FORMAT &quot; =&gt; &quot; PTR_FORMAT,
+ 972                               (int)offset, p2i(p), p2i(_builder-&gt;to_target(p)),
+ 973                               p2i(old_ptr), p2i(new_ptr));
+ 974       *p = new_ptr;
+ 975     }
+ 976 
+ 977     return true; // keep iterating
+ 978   }
+ 979 };
+ 980 
+ 981 void DynamicArchiveBuilder::relocate_buffer_to_target() {
+ 982   RelocateBufferToTarget patcher(this, (address*)_alloc_bottom, _buffer_to_target_delta);
+ 983   ArchivePtrMarker::ptrmap()-&gt;iterate(&amp;patcher);
+ 984 
+ 985   Array&lt;u8&gt;* table = FileMapInfo::saved_shared_path_table().table();
+ 986   SharedPathTable runtime_table(to_target(table), FileMapInfo::shared_path_table().size());
+ 987   _header-&gt;set_shared_path_table(runtime_table);
+ 988 
+ 989   address relocatable_base = (address)SharedBaseAddress;
+ 990   address relocatable_end = (address)(current_dump_space()-&gt;top()) + _buffer_to_target_delta;
+ 991 
+ 992   intx addr_delta = MetaspaceShared::final_delta();
+ 993   if (addr_delta == 0) {
+ 994     ArchivePtrMarker::compact(relocatable_base, relocatable_end);
+ 995   } else {
+ 996     // The base archive is NOT mapped at Arguments::default_SharedBaseAddress() (due to ASLR).
+ 997     // This means that the current content of the dynamic archive is based on a random
+ 998     // address. Let&#39;s relocate all the pointers, so that it can be mapped to
+ 999     // Arguments::default_SharedBaseAddress() without runtime relocation.
+1000     //
+1001     // Note: both the base and dynamic archive are written with
+1002     // FileMapHeader::_shared_base_address == Arguments::default_SharedBaseAddress()
+1003 
+1004     // Patch all pointers that are marked by ptrmap within this region,
+1005     // where we have just dumped all the metaspace data.
+1006     address patch_base = (address)_alloc_bottom;
+1007     address patch_end  = (address)current_dump_space()-&gt;top();
+1008 
+1009     // the current value of the pointers to be patched must be within this
+1010     // range (i.e., must point to either the top archive (as currently mapped), or to the
+1011     // (targeted address of) the top archive)
+1012     address valid_old_base = relocatable_base;
+1013     address valid_old_end  = relocatable_end;
+1014     size_t base_plus_top_size = valid_old_end - valid_old_base;
+1015     size_t top_size = patch_end - patch_base;
+1016     size_t base_size = base_plus_top_size - top_size;
+1017     assert(base_plus_top_size &gt; base_size, &quot;no overflow&quot;);
+1018     assert(base_plus_top_size &gt; top_size, &quot;no overflow&quot;);
+1019 
+1020     // after patching, the pointers must point inside this range
+1021     // (the requested location of the archive, as mapped at runtime).
+1022     address valid_new_base = (address)Arguments::default_SharedBaseAddress();
+1023     address valid_new_end  = valid_new_base + base_plus_top_size;
+1024 
+1025     log_debug(cds)(&quot;Relocating archive from [&quot; INTPTR_FORMAT &quot; - &quot; INTPTR_FORMAT &quot;] to &quot;
+1026                    &quot;[&quot; INTPTR_FORMAT &quot; - &quot; INTPTR_FORMAT &quot;], delta = &quot; INTX_FORMAT &quot; bytes&quot;,
+1027                    p2i(patch_base + base_size), p2i(patch_end),
+1028                    p2i(valid_new_base + base_size), p2i(valid_new_end), addr_delta);
+1029 
+1030     SharedDataRelocator&lt;true&gt; patcher((address*)patch_base, (address*)patch_end, valid_old_base, valid_old_end,
+1031                                       valid_new_base, valid_new_end, addr_delta, ArchivePtrMarker::ptrmap());
+1032     ArchivePtrMarker::ptrmap()-&gt;iterate(&amp;patcher);
+1033     ArchivePtrMarker::compact(patcher.max_non_null_offset());
+1034   }
+1035 }
+1036 
+1037 void DynamicArchiveBuilder::write_archive(char* serialized_data) {
+1038   int num_klasses = _klasses-&gt;length();
+1039   int num_symbols = _symbols-&gt;length();
+1040 
+1041   _header-&gt;set_serialized_data(to_target(serialized_data));
+1042 
+1043   FileMapInfo* dynamic_info = FileMapInfo::dynamic_info();
+1044   assert(dynamic_info != NULL, &quot;Sanity&quot;);
+1045 
+1046   // Now write the archived data including the file offsets.
+1047   const char* archive_name = Arguments::GetSharedDynamicArchivePath();
+1048   dynamic_info-&gt;open_for_write(archive_name);
+1049   MetaspaceShared::write_core_archive_regions(dynamic_info, NULL, NULL);
+1050   dynamic_info-&gt;set_final_requested_base((char*)Arguments::default_SharedBaseAddress());
+1051   dynamic_info-&gt;set_header_crc(dynamic_info-&gt;compute_header_crc());
+1052   dynamic_info-&gt;write_header();
+1053   dynamic_info-&gt;close();
+1054 
+1055   address base = to_target(_alloc_bottom);
+1056   address top  = address(current_dump_space()-&gt;top()) + _buffer_to_target_delta;
+1057   size_t file_size = pointer_delta(top, base, sizeof(char));
+1058 
+1059   base += MetaspaceShared::final_delta();
+1060   top += MetaspaceShared::final_delta();
+1061   log_info(cds, dynamic)(&quot;Written dynamic archive &quot; PTR_FORMAT &quot; - &quot; PTR_FORMAT
+1062                          &quot; [&quot; SIZE_FORMAT &quot; bytes header, &quot; SIZE_FORMAT &quot; bytes total]&quot;,
+1063                          p2i(base), p2i(top), _header-&gt;header_size(), file_size);
+1064   log_info(cds, dynamic)(&quot;%d klasses; %d symbols&quot;, num_klasses, num_symbols);
+1065 }
+1066 
+1067 
+1068 class VM_PopulateDynamicDumpSharedSpace: public VM_Operation {
+1069   DynamicArchiveBuilder* _builder;
+1070 public:
+1071   VM_PopulateDynamicDumpSharedSpace(DynamicArchiveBuilder* builder) : _builder(builder) {}
+1072   VMOp_Type type() const { return VMOp_PopulateDumpSharedSpace; }
+1073   void doit() {
+1074     ResourceMark rm;
+1075     if (SystemDictionaryShared::empty_dumptime_table()) {
+1076       log_warning(cds, dynamic)(&quot;There is no class to be included in the dynamic archive.&quot;);
+1077       return;
+1078     }
+1079     if (AllowArchivingWithJavaAgent) {
+1080       warning(&quot;This archive was created with AllowArchivingWithJavaAgent. It should be used &quot;
+1081               &quot;for testing purposes only and should not be used in a production environment&quot;);
+1082     }
+1083     FileMapInfo::check_nonempty_dir_in_shared_path_table();
+1084 
+1085     _builder-&gt;doit();
+1086   }
+1087 };
+1088 
+1089 
+1090 void DynamicArchive::dump() {
+1091   if (Arguments::GetSharedDynamicArchivePath() == NULL) {
+1092     log_warning(cds, dynamic)(&quot;SharedDynamicArchivePath is not specified&quot;);
+1093     return;
+1094   }
+1095 
+1096   DynamicArchiveBuilder builder;
+1097   _builder = &amp;builder;
+1098   VM_PopulateDynamicDumpSharedSpace op(&amp;builder);
+1099   VMThread::execute(&amp;op);
+1100   _builder = NULL;
+1101 }
+1102 
+1103 address DynamicArchive::original_to_buffer_impl(address orig_obj) {
+1104   assert(DynamicDumpSharedSpaces, &quot;must be&quot;);
+1105   address buff_obj = _builder-&gt;get_new_loc(orig_obj);
+1106   assert(buff_obj != NULL, &quot;orig_obj must be used by the dynamic archive&quot;);
+1107   assert(buff_obj != orig_obj, &quot;call this only when you know orig_obj must be copied and not just referenced&quot;);
+1108   assert(_builder-&gt;is_in_buffer_space(buff_obj), &quot;must be&quot;);
+1109   return buff_obj;
+1110 }
+1111 
+1112 address DynamicArchive::buffer_to_target_impl(address buff_obj) {
+1113   assert(DynamicDumpSharedSpaces, &quot;must be&quot;);
+1114   assert(_builder-&gt;is_in_buffer_space(buff_obj), &quot;must be&quot;);
+1115   return _builder-&gt;to_target(buff_obj);
+1116 }
+1117 
+1118 address DynamicArchive::original_to_target_impl(address orig_obj) {
+1119   assert(DynamicDumpSharedSpaces, &quot;must be&quot;);
+1120   if (MetaspaceShared::is_in_shared_metaspace(orig_obj)) {
+1121     // This happens when the top archive points to a Symbol* in the base archive.
+1122     return orig_obj;
+1123   }
+1124   address buff_obj = _builder-&gt;get_new_loc(orig_obj);
+1125   assert(buff_obj != NULL, &quot;orig_obj must be used by the dynamic archive&quot;);
+1126   if (buff_obj == orig_obj) {
+1127     // We are storing a pointer to an original object into the dynamic buffer. E.g.,
+1128     // a Symbol* that used by both the base and top archives.
+1129     assert(MetaspaceShared::is_in_shared_metaspace(orig_obj), &quot;must be&quot;);
+1130     return orig_obj;
+1131   } else {
+1132     return _builder-&gt;to_target(buff_obj);
+1133   }
+1134 }
+1135 
+1136 uintx DynamicArchive::object_delta_uintx(void* buff_obj) {
+1137   assert(DynamicDumpSharedSpaces, &quot;must be&quot;);
+1138   address target_obj = _builder-&gt;to_target_no_check(address(buff_obj));
+1139   assert(uintx(target_obj) &gt;= SharedBaseAddress, &quot;must be&quot;);
+1140   return uintx(target_obj) - SharedBaseAddress;
+1141 }
+1142 
+1143 bool DynamicArchive::is_in_target_space(void *obj) {
+1144   assert(DynamicDumpSharedSpaces, &quot;must be&quot;);
+1145   return _builder-&gt;is_in_target_space(obj);
+1146 }
+1147 
+1148 
+1149 DynamicArchiveBuilder* DynamicArchive::_builder = NULL;
+1150 
+1151 
+1152 bool DynamicArchive::validate(FileMapInfo* dynamic_info) {
+1153   // Check if the recorded base archive matches with the current one
+1154   FileMapInfo* base_info = FileMapInfo::current_info();
+1155   DynamicArchiveHeader* dynamic_header = dynamic_info-&gt;dynamic_header();
+1156 
+1157   // Check the header crc
+1158   if (dynamic_header-&gt;base_header_crc() != base_info-&gt;crc()) {
+1159     FileMapInfo::fail_continue(&quot;Archive header checksum verification failed.&quot;);
+1160     return false;
+1161   }
+1162 
+1163   // Check each space&#39;s crc
+1164   for (int i = 0; i &lt; MetaspaceShared::n_regions; i++) {
+1165     if (dynamic_header-&gt;base_region_crc(i) != base_info-&gt;space_crc(i)) {
+1166       FileMapInfo::fail_continue(&quot;Archive region #%d checksum verification failed.&quot;, i);
+1167       return false;
+1168     }
+1169   }
+1170 
+1171   // Validate the dynamic archived shared path table, and set the global
+1172   // _shared_path_table to that.
+1173   if (!dynamic_info-&gt;validate_shared_path_table()) {
+1174     return false;
+1175   }
+1176   return true;
+1177 }
+    </pre>
+  </body>
+</html>
