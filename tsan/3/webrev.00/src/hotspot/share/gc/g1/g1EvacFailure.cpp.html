@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>New src/hotspot/share/gc/g1/g1EvacFailure.cpp</title>
+    <link rel="stylesheet" href="../../../../../style.css" />
+  </head>
+  <body>
+    <pre>
+  1 /*
+  2  * Copyright (c) 2012, 2019, Oracle and/or its affiliates. All rights reserved.
+  3  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  4  *
+  5  * This code is free software; you can redistribute it and/or modify it
+  6  * under the terms of the GNU General Public License version 2 only, as
+  7  * published by the Free Software Foundation.
+  8  *
+  9  * This code is distributed in the hope that it will be useful, but WITHOUT
+ 10  * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ 11  * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ 12  * version 2 for more details (a copy is included in the LICENSE file that
+ 13  * accompanied this code).
+ 14  *
+ 15  * You should have received a copy of the GNU General Public License version
+ 16  * 2 along with this work; if not, write to the Free Software Foundation,
+ 17  * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ 18  *
+ 19  * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ 20  * or visit www.oracle.com if you need additional information or have any
+ 21  * questions.
+ 22  *
+ 23  */
+ 24 
+ 25 #include &quot;precompiled.hpp&quot;
+ 26 #include &quot;gc/g1/g1CollectedHeap.inline.hpp&quot;
+ 27 #include &quot;gc/g1/g1CollectorState.hpp&quot;
+ 28 #include &quot;gc/g1/g1ConcurrentMark.inline.hpp&quot;
+ 29 #include &quot;gc/g1/g1EvacFailure.hpp&quot;
+ 30 #include &quot;gc/g1/g1HeapVerifier.hpp&quot;
+ 31 #include &quot;gc/g1/g1OopClosures.inline.hpp&quot;
+ 32 #include &quot;gc/g1/g1RedirtyCardsQueue.hpp&quot;
+ 33 #include &quot;gc/g1/heapRegion.hpp&quot;
+ 34 #include &quot;gc/g1/heapRegionRemSet.hpp&quot;
+ 35 #include &quot;gc/shared/preservedMarks.inline.hpp&quot;
+ 36 #include &quot;oops/access.inline.hpp&quot;
+ 37 #include &quot;oops/compressedOops.inline.hpp&quot;
+ 38 #include &quot;oops/oop.inline.hpp&quot;
+ 39 
+ 40 class UpdateLogBuffersDeferred : public BasicOopIterateClosure {
+ 41 private:
+ 42   G1CollectedHeap* _g1h;
+ 43   G1RedirtyCardsQueue* _rdcq;
+ 44   G1CardTable*    _ct;
+ 45 
+ 46   // Remember the last enqueued card to avoid enqueuing the same card over and over;
+ 47   // since we only ever handle a card once, this is sufficient.
+ 48   size_t _last_enqueued_card;
+ 49 
+ 50 public:
+ 51   UpdateLogBuffersDeferred(G1RedirtyCardsQueue* rdcq) :
+ 52     _g1h(G1CollectedHeap::heap()), _rdcq(rdcq), _ct(_g1h-&gt;card_table()), _last_enqueued_card(SIZE_MAX) {}
+ 53 
+ 54   virtual void do_oop(narrowOop* p) { do_oop_work(p); }
+ 55   virtual void do_oop(      oop* p) { do_oop_work(p); }
+ 56   template &lt;class T&gt; void do_oop_work(T* p) {
+ 57     assert(_g1h-&gt;heap_region_containing(p)-&gt;is_in_reserved(p), &quot;paranoia&quot;);
+ 58     assert(!_g1h-&gt;heap_region_containing(p)-&gt;is_survivor(), &quot;Unexpected evac failure in survivor region&quot;);
+ 59 
+ 60     T const o = RawAccess&lt;&gt;::oop_load(p);
+ 61     if (CompressedOops::is_null(o)) {
+ 62       return;
+ 63     }
+ 64 
+ 65     if (HeapRegion::is_in_same_region(p, CompressedOops::decode(o))) {
+ 66       return;
+ 67     }
+ 68     size_t card_index = _ct-&gt;index_for(p);
+ 69     if (card_index != _last_enqueued_card) {
+ 70       _rdcq-&gt;enqueue(_ct-&gt;byte_for_index(card_index));
+ 71       _last_enqueued_card = card_index;
+ 72     }
+ 73   }
+ 74 };
+ 75 
+ 76 class RemoveSelfForwardPtrObjClosure: public ObjectClosure {
+ 77   G1CollectedHeap* _g1h;
+ 78   G1ConcurrentMark* _cm;
+ 79   HeapRegion* _hr;
+ 80   size_t _marked_bytes;
+ 81   UpdateLogBuffersDeferred* _log_buffer_cl;
+ 82   bool _during_initial_mark;
+ 83   uint _worker_id;
+ 84   HeapWord* _last_forwarded_object_end;
+ 85 
+ 86 public:
+ 87   RemoveSelfForwardPtrObjClosure(HeapRegion* hr,
+ 88                                  UpdateLogBuffersDeferred* log_buffer_cl,
+ 89                                  bool during_initial_mark,
+ 90                                  uint worker_id) :
+ 91     _g1h(G1CollectedHeap::heap()),
+ 92     _cm(_g1h-&gt;concurrent_mark()),
+ 93     _hr(hr),
+ 94     _marked_bytes(0),
+ 95     _log_buffer_cl(log_buffer_cl),
+ 96     _during_initial_mark(during_initial_mark),
+ 97     _worker_id(worker_id),
+ 98     _last_forwarded_object_end(hr-&gt;bottom()) { }
+ 99 
+100   size_t marked_bytes() { return _marked_bytes; }
+101 
+102   // Iterate over the live objects in the region to find self-forwarded objects
+103   // that need to be kept live. We need to update the remembered sets of these
+104   // objects. Further update the BOT and marks.
+105   // We can coalesce and overwrite the remaining heap contents with dummy objects
+106   // as they have either been dead or evacuated (which are unreferenced now, i.e.
+107   // dead too) already.
+108   void do_object(oop obj) {
+109     HeapWord* obj_addr = cast_from_oop&lt;HeapWord*&gt;(obj);
+110     assert(_hr-&gt;is_in(obj_addr), &quot;sanity&quot;);
+111 
+112     if (obj-&gt;is_forwarded() &amp;&amp; obj-&gt;forwardee() == obj) {
+113       // The object failed to move.
+114 
+115       zap_dead_objects(_last_forwarded_object_end, obj_addr);
+116       // We consider all objects that we find self-forwarded to be
+117       // live. What we&#39;ll do is that we&#39;ll update the prev marking
+118       // info so that they are all under PTAMS and explicitly marked.
+119       if (!_cm-&gt;is_marked_in_prev_bitmap(obj)) {
+120         _cm-&gt;mark_in_prev_bitmap(obj);
+121       }
+122       if (_during_initial_mark) {
+123         // For the next marking info we&#39;ll only mark the
+124         // self-forwarded objects explicitly if we are during
+125         // initial-mark (since, normally, we only mark objects pointed
+126         // to by roots if we succeed in copying them). By marking all
+127         // self-forwarded objects we ensure that we mark any that are
+128         // still pointed to be roots. During concurrent marking, and
+129         // after initial-mark, we don&#39;t need to mark any objects
+130         // explicitly and all objects in the CSet are considered
+131         // (implicitly) live. So, we won&#39;t mark them explicitly and
+132         // we&#39;ll leave them over NTAMS.
+133         _cm-&gt;mark_in_next_bitmap(_worker_id, _hr, obj);
+134       }
+135       size_t obj_size = obj-&gt;size();
+136 
+137       _marked_bytes += (obj_size * HeapWordSize);
+138       PreservedMarks::init_forwarded_mark(obj);
+139 
+140       // While we were processing RSet buffers during the collection,
+141       // we actually didn&#39;t scan any cards on the collection set,
+142       // since we didn&#39;t want to update remembered sets with entries
+143       // that point into the collection set, given that live objects
+144       // from the collection set are about to move and such entries
+145       // will be stale very soon.
+146       // This change also dealt with a reliability issue which
+147       // involved scanning a card in the collection set and coming
+148       // across an array that was being chunked and looking malformed.
+149       // The problem is that, if evacuation fails, we might have
+150       // remembered set entries missing given that we skipped cards on
+151       // the collection set. So, we&#39;ll recreate such entries now.
+152       obj-&gt;oop_iterate(_log_buffer_cl);
+153 
+154       HeapWord* obj_end = obj_addr + obj_size;
+155       _last_forwarded_object_end = obj_end;
+156       _hr-&gt;cross_threshold(obj_addr, obj_end);
+157     }
+158   }
+159 
+160   // Fill the memory area from start to end with filler objects, and update the BOT
+161   // and the mark bitmap accordingly.
+162   void zap_dead_objects(HeapWord* start, HeapWord* end) {
+163     if (start == end) {
+164       return;
+165     }
+166 
+167     size_t gap_size = pointer_delta(end, start);
+168     MemRegion mr(start, gap_size);
+169     if (gap_size &gt;= CollectedHeap::min_fill_size()) {
+170       CollectedHeap::fill_with_objects(start, gap_size);
+171 
+172       HeapWord* end_first_obj = start + ((oop)start)-&gt;size();
+173       _hr-&gt;cross_threshold(start, end_first_obj);
+174       // Fill_with_objects() may have created multiple (i.e. two)
+175       // objects, as the max_fill_size() is half a region.
+176       // After updating the BOT for the first object, also update the
+177       // BOT for the second object to make the BOT complete.
+178       if (end_first_obj != end) {
+179         _hr-&gt;cross_threshold(end_first_obj, end);
+180 #ifdef ASSERT
+181         size_t size_second_obj = ((oop)end_first_obj)-&gt;size();
+182         HeapWord* end_of_second_obj = end_first_obj + size_second_obj;
+183         assert(end == end_of_second_obj,
+184                &quot;More than two objects were used to fill the area from &quot; PTR_FORMAT &quot; to &quot; PTR_FORMAT &quot;, &quot;
+185                &quot;second objects size &quot; SIZE_FORMAT &quot; ends at &quot; PTR_FORMAT,
+186                p2i(start), p2i(end), size_second_obj, p2i(end_of_second_obj));
+187 #endif
+188       }
+189     }
+190     _cm-&gt;clear_range_in_prev_bitmap(mr);
+191   }
+192 
+193   void zap_remainder() {
+194     zap_dead_objects(_last_forwarded_object_end, _hr-&gt;top());
+195   }
+196 };
+197 
+198 class RemoveSelfForwardPtrHRClosure: public HeapRegionClosure {
+199   G1CollectedHeap* _g1h;
+200   uint _worker_id;
+201 
+202   G1RedirtyCardsQueue _rdcq;
+203   UpdateLogBuffersDeferred _log_buffer_cl;
+204 
+205 public:
+206   RemoveSelfForwardPtrHRClosure(G1RedirtyCardsQueueSet* rdcqs, uint worker_id) :
+207     _g1h(G1CollectedHeap::heap()),
+208     _worker_id(worker_id),
+209     _rdcq(rdcqs),
+210     _log_buffer_cl(&amp;_rdcq) {
+211   }
+212 
+213   size_t remove_self_forward_ptr_by_walking_hr(HeapRegion* hr,
+214                                                bool during_initial_mark) {
+215     RemoveSelfForwardPtrObjClosure rspc(hr,
+216                                         &amp;_log_buffer_cl,
+217                                         during_initial_mark,
+218                                         _worker_id);
+219     hr-&gt;object_iterate(&amp;rspc);
+220     // Need to zap the remainder area of the processed region.
+221     rspc.zap_remainder();
+222 
+223     return rspc.marked_bytes();
+224   }
+225 
+226   bool do_heap_region(HeapRegion *hr) {
+227     assert(!hr-&gt;is_pinned(), &quot;Unexpected pinned region at index %u&quot;, hr-&gt;hrm_index());
+228     assert(hr-&gt;in_collection_set(), &quot;bad CS&quot;);
+229 
+230     if (hr-&gt;evacuation_failed()) {
+231       hr-&gt;clear_index_in_opt_cset();
+232 
+233       bool during_initial_mark = _g1h-&gt;collector_state()-&gt;in_initial_mark_gc();
+234       bool during_conc_mark = _g1h-&gt;collector_state()-&gt;mark_or_rebuild_in_progress();
+235 
+236       hr-&gt;note_self_forwarding_removal_start(during_initial_mark,
+237                                                during_conc_mark);
+238       _g1h-&gt;verifier()-&gt;check_bitmaps(&quot;Self-Forwarding Ptr Removal&quot;, hr);
+239 
+240       hr-&gt;reset_bot();
+241 
+242       size_t live_bytes = remove_self_forward_ptr_by_walking_hr(hr, during_initial_mark);
+243 
+244       hr-&gt;rem_set()-&gt;clean_strong_code_roots(hr);
+245       hr-&gt;rem_set()-&gt;clear_locked(true);
+246 
+247       hr-&gt;note_self_forwarding_removal_end(live_bytes);
+248     }
+249     return false;
+250   }
+251 };
+252 
+253 G1ParRemoveSelfForwardPtrsTask::G1ParRemoveSelfForwardPtrsTask(G1RedirtyCardsQueueSet* rdcqs) :
+254   AbstractGangTask(&quot;G1 Remove Self-forwarding Pointers&quot;),
+255   _g1h(G1CollectedHeap::heap()),
+256   _rdcqs(rdcqs),
+257   _hrclaimer(_g1h-&gt;workers()-&gt;active_workers()) { }
+258 
+259 void G1ParRemoveSelfForwardPtrsTask::work(uint worker_id) {
+260   RemoveSelfForwardPtrHRClosure rsfp_cl(_rdcqs, worker_id);
+261 
+262   _g1h-&gt;collection_set_iterate_increment_from(&amp;rsfp_cl, &amp;_hrclaimer, worker_id);
+263 }
+    </pre>
+  </body>
+</html>

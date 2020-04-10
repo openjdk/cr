@@ -1,0 +1,302 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Old src/hotspot/share/gc/g1/g1RootProcessor.cpp</title>
+    <link rel="stylesheet" href="../../../../../style.css" />
+  </head>
+  <body>
+    <pre>
+  1 /*
+  2  * Copyright (c) 2015, 2019, Oracle and/or its affiliates. All rights reserved.
+  3  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  4  *
+  5  * This code is free software; you can redistribute it and/or modify it
+  6  * under the terms of the GNU General Public License version 2 only, as
+  7  * published by the Free Software Foundation.
+  8  *
+  9  * This code is distributed in the hope that it will be useful, but WITHOUT
+ 10  * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ 11  * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ 12  * version 2 for more details (a copy is included in the LICENSE file that
+ 13  * accompanied this code).
+ 14  *
+ 15  * You should have received a copy of the GNU General Public License version
+ 16  * 2 along with this work; if not, write to the Free Software Foundation,
+ 17  * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ 18  *
+ 19  * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ 20  * or visit www.oracle.com if you need additional information or have any
+ 21  * questions.
+ 22  *
+ 23  */
+ 24 
+ 25 #include &quot;precompiled.hpp&quot;
+ 26 #include &quot;aot/aotLoader.hpp&quot;
+ 27 #include &quot;classfile/classLoaderDataGraph.hpp&quot;
+ 28 #include &quot;classfile/stringTable.hpp&quot;
+ 29 #include &quot;classfile/systemDictionary.hpp&quot;
+ 30 #include &quot;code/codeCache.hpp&quot;
+ 31 #include &quot;gc/g1/g1BarrierSet.hpp&quot;
+ 32 #include &quot;gc/g1/g1CodeBlobClosure.hpp&quot;
+ 33 #include &quot;gc/g1/g1CollectedHeap.inline.hpp&quot;
+ 34 #include &quot;gc/g1/g1CollectorState.hpp&quot;
+ 35 #include &quot;gc/g1/g1GCPhaseTimes.hpp&quot;
+ 36 #include &quot;gc/g1/g1ParScanThreadState.inline.hpp&quot;
+ 37 #include &quot;gc/g1/g1Policy.hpp&quot;
+ 38 #include &quot;gc/g1/g1RootClosures.hpp&quot;
+ 39 #include &quot;gc/g1/g1RootProcessor.hpp&quot;
+ 40 #include &quot;gc/g1/heapRegion.inline.hpp&quot;
+ 41 #include &quot;gc/shared/oopStorageParState.hpp&quot;
+ 42 #include &quot;gc/shared/referenceProcessor.hpp&quot;
+ 43 #include &quot;memory/allocation.inline.hpp&quot;
+ 44 #include &quot;runtime/mutex.hpp&quot;
+ 45 #include &quot;services/management.hpp&quot;
+ 46 #include &quot;utilities/macros.hpp&quot;
+ 47 
+ 48 void G1RootProcessor::worker_has_discovered_all_strong_classes() {
+ 49   assert(ClassUnloadingWithConcurrentMark, &quot;Currently only needed when doing G1 Class Unloading&quot;);
+ 50 
+ 51   uint new_value = (uint)Atomic::add(1, &amp;_n_workers_discovered_strong_classes);
+ 52   if (new_value == n_workers()) {
+ 53     // This thread is last. Notify the others.
+ 54     MonitorLockerEx ml(&amp;_lock, Mutex::_no_safepoint_check_flag);
+ 55     _lock.notify_all();
+ 56   }
+ 57 }
+ 58 
+ 59 void G1RootProcessor::wait_until_all_strong_classes_discovered() {
+ 60   assert(ClassUnloadingWithConcurrentMark, &quot;Currently only needed when doing G1 Class Unloading&quot;);
+ 61 
+ 62   if ((uint)_n_workers_discovered_strong_classes != n_workers()) {
+ 63     MonitorLockerEx ml(&amp;_lock, Mutex::_no_safepoint_check_flag);
+ 64     while ((uint)_n_workers_discovered_strong_classes != n_workers()) {
+ 65       _lock.wait(Mutex::_no_safepoint_check_flag, 0, false);
+ 66     }
+ 67   }
+ 68 }
+ 69 
+ 70 G1RootProcessor::G1RootProcessor(G1CollectedHeap* g1h, uint n_workers) :
+ 71     _g1h(g1h),
+ 72     _process_strong_tasks(G1RP_PS_NumElements),
+ 73     _srs(n_workers),
+ 74     _par_state_string(StringTable::weak_storage()),
+ 75     _lock(Mutex::leaf, &quot;G1 Root Scanning barrier lock&quot;, false, Monitor::_safepoint_check_never),
+ 76     _n_workers_discovered_strong_classes(0) {}
+ 77 
+ 78 void G1RootProcessor::evacuate_roots(G1ParScanThreadState* pss, uint worker_i) {
+ 79   G1GCPhaseTimes* phase_times = _g1h-&gt;phase_times();
+ 80 
+ 81   G1EvacPhaseTimesTracker timer(phase_times, pss, G1GCPhaseTimes::ExtRootScan, worker_i);
+ 82 
+ 83   G1EvacuationRootClosures* closures = pss-&gt;closures();
+ 84   process_java_roots(closures, phase_times, worker_i);
+ 85 
+ 86   // This is the point where this worker thread will not find more strong CLDs/nmethods.
+ 87   // Report this so G1 can synchronize the strong and weak CLDs/nmethods processing.
+ 88   if (closures-&gt;trace_metadata()) {
+ 89     worker_has_discovered_all_strong_classes();
+ 90   }
+ 91 
+ 92   process_vm_roots(closures, phase_times, worker_i);
+ 93 
+ 94   {
+ 95     // Now the CM ref_processor roots.
+ 96     G1GCParPhaseTimesTracker x(phase_times, G1GCPhaseTimes::CMRefRoots, worker_i);
+ 97     if (_process_strong_tasks.try_claim_task(G1RP_PS_refProcessor_oops_do)) {
+ 98       // We need to treat the discovered reference lists of the
+ 99       // concurrent mark ref processor as roots and keep entries
+100       // (which are added by the marking threads) on them live
+101       // until they can be processed at the end of marking.
+102       _g1h-&gt;ref_processor_cm()-&gt;weak_oops_do(closures-&gt;strong_oops());
+103     }
+104   }
+105 
+106   if (closures-&gt;trace_metadata()) {
+107     {
+108       G1GCParPhaseTimesTracker x(phase_times, G1GCPhaseTimes::WaitForStrongCLD, worker_i);
+109       // Barrier to make sure all workers passed
+110       // the strong CLD and strong nmethods phases.
+111       wait_until_all_strong_classes_discovered();
+112     }
+113 
+114     // Now take the complement of the strong CLDs.
+115     G1GCParPhaseTimesTracker x(phase_times, G1GCPhaseTimes::WeakCLDRoots, worker_i);
+116     assert(closures-&gt;second_pass_weak_clds() != NULL, &quot;Should be non-null if we are tracing metadata.&quot;);
+117     ClassLoaderDataGraph::roots_cld_do(NULL, closures-&gt;second_pass_weak_clds());
+118   } else {
+119     phase_times-&gt;record_time_secs(G1GCPhaseTimes::WaitForStrongCLD, worker_i, 0.0);
+120     phase_times-&gt;record_time_secs(G1GCPhaseTimes::WeakCLDRoots, worker_i, 0.0);
+121     assert(closures-&gt;second_pass_weak_clds() == NULL, &quot;Should be null if not tracing metadata.&quot;);
+122   }
+123 
+124   // During conc marking we have to filter the per-thread SATB buffers
+125   // to make sure we remove any oops into the CSet (which will show up
+126   // as implicitly live).
+127   {
+128     G1GCParPhaseTimesTracker x(phase_times, G1GCPhaseTimes::SATBFiltering, worker_i);
+129     if (_process_strong_tasks.try_claim_task(G1RP_PS_filter_satb_buffers) &amp;&amp; _g1h-&gt;collector_state()-&gt;mark_or_rebuild_in_progress()) {
+130       G1BarrierSet::satb_mark_queue_set().filter_thread_buffers();
+131     }
+132   }
+133 
+134   _process_strong_tasks.all_tasks_completed(n_workers());
+135 }
+136 
+137 // Adaptor to pass the closures to the strong roots in the VM.
+138 class StrongRootsClosures : public G1RootClosures {
+139   OopClosure* _roots;
+140   CLDClosure* _clds;
+141   CodeBlobClosure* _blobs;
+142 public:
+143   StrongRootsClosures(OopClosure* roots, CLDClosure* clds, CodeBlobClosure* blobs) :
+144       _roots(roots), _clds(clds), _blobs(blobs) {}
+145 
+146   OopClosure* weak_oops()   { return NULL; }
+147   OopClosure* strong_oops() { return _roots; }
+148 
+149   CLDClosure* weak_clds()        { return NULL; }
+150   CLDClosure* strong_clds()      { return _clds; }
+151 
+152   CodeBlobClosure* strong_codeblobs() { return _blobs; }
+153 };
+154 
+155 void G1RootProcessor::process_strong_roots(OopClosure* oops,
+156                                            CLDClosure* clds,
+157                                            CodeBlobClosure* blobs) {
+158   StrongRootsClosures closures(oops, clds, blobs);
+159 
+160   process_java_roots(&amp;closures, NULL, 0);
+161   process_vm_roots(&amp;closures, NULL, 0);
+162 
+163   _process_strong_tasks.all_tasks_completed(n_workers());
+164 }
+165 
+166 // Adaptor to pass the closures to all the roots in the VM.
+167 class AllRootsClosures : public G1RootClosures {
+168   OopClosure* _roots;
+169   CLDClosure* _clds;
+170 public:
+171   AllRootsClosures(OopClosure* roots, CLDClosure* clds) :
+172       _roots(roots), _clds(clds) {}
+173 
+174   OopClosure* weak_oops() { return _roots; }
+175   OopClosure* strong_oops() { return _roots; }
+176 
+177   // By returning the same CLDClosure for both weak and strong CLDs we ensure
+178   // that a single walk of the CLDG will invoke the closure on all CLDs i the
+179   // system.
+180   CLDClosure* weak_clds() { return _clds; }
+181   CLDClosure* strong_clds() { return _clds; }
+182 
+183   // We don&#39;t want to visit code blobs more than once, so we return NULL for the
+184   // strong case and walk the entire code cache as a separate step.
+185   CodeBlobClosure* strong_codeblobs() { return NULL; }
+186 };
+187 
+188 void G1RootProcessor::process_all_roots(OopClosure* oops,
+189                                         CLDClosure* clds,
+190                                         CodeBlobClosure* blobs) {
+191   AllRootsClosures closures(oops, clds);
+192 
+193   process_java_roots(&amp;closures, NULL, 0);
+194   process_vm_roots(&amp;closures, NULL, 0);
+195 
+196   process_code_cache_roots(blobs, NULL, 0);
+197 
+198   _process_strong_tasks.all_tasks_completed(n_workers());
+199 }
+200 
+201 void G1RootProcessor::process_java_roots(G1RootClosures* closures,
+202                                          G1GCPhaseTimes* phase_times,
+203                                          uint worker_i) {
+204   // Iterating over the CLDG and the Threads are done early to allow us to
+205   // first process the strong CLDs and nmethods and then, after a barrier,
+206   // let the thread process the weak CLDs and nmethods.
+207   {
+208     G1GCParPhaseTimesTracker x(phase_times, G1GCPhaseTimes::CLDGRoots, worker_i);
+209     if (_process_strong_tasks.try_claim_task(G1RP_PS_ClassLoaderDataGraph_oops_do)) {
+210       ClassLoaderDataGraph::roots_cld_do(closures-&gt;strong_clds(), closures-&gt;weak_clds());
+211     }
+212   }
+213 
+214   {
+215     G1GCParPhaseTimesTracker x(phase_times, G1GCPhaseTimes::ThreadRoots, worker_i);
+216     bool is_par = n_workers() &gt; 1;
+217     Threads::possibly_parallel_oops_do(is_par,
+218                                        closures-&gt;strong_oops(),
+219                                        closures-&gt;strong_codeblobs());
+220   }
+221 }
+222 
+223 void G1RootProcessor::process_vm_roots(G1RootClosures* closures,
+224                                        G1GCPhaseTimes* phase_times,
+225                                        uint worker_i) {
+226   OopClosure* strong_roots = closures-&gt;strong_oops();
+227 
+228   {
+229     G1GCParPhaseTimesTracker x(phase_times, G1GCPhaseTimes::UniverseRoots, worker_i);
+230     if (_process_strong_tasks.try_claim_task(G1RP_PS_Universe_oops_do)) {
+231       Universe::oops_do(strong_roots);
+232     }
+233   }
+234 
+235   {
+236     G1GCParPhaseTimesTracker x(phase_times, G1GCPhaseTimes::JNIRoots, worker_i);
+237     if (_process_strong_tasks.try_claim_task(G1RP_PS_JNIHandles_oops_do)) {
+238       JNIHandles::oops_do(strong_roots);
+239     }
+240   }
+241 
+242   {
+243     G1GCParPhaseTimesTracker x(phase_times, G1GCPhaseTimes::ObjectSynchronizerRoots, worker_i);
+244     if (_process_strong_tasks.try_claim_task(G1RP_PS_ObjectSynchronizer_oops_do)) {
+245       ObjectSynchronizer::oops_do(strong_roots);
+246     }
+247   }
+248 
+249   {
+250     G1GCParPhaseTimesTracker x(phase_times, G1GCPhaseTimes::ManagementRoots, worker_i);
+251     if (_process_strong_tasks.try_claim_task(G1RP_PS_Management_oops_do)) {
+252       Management::oops_do(strong_roots);
+253     }
+254   }
+255 
+256   {
+257     G1GCParPhaseTimesTracker x(phase_times, G1GCPhaseTimes::JVMTIRoots, worker_i);
+258     if (_process_strong_tasks.try_claim_task(G1RP_PS_jvmti_oops_do)) {
+259       JvmtiExport::oops_do(strong_roots);
+260     }
+261   }
+262 
+263 #if INCLUDE_AOT
+264   if (UseAOT) {
+265     G1GCParPhaseTimesTracker x(phase_times, G1GCPhaseTimes::AOTCodeRoots, worker_i);
+266     if (_process_strong_tasks.try_claim_task(G1RP_PS_aot_oops_do)) {
+267         AOTLoader::oops_do(strong_roots);
+268     }
+269   }
+270 #endif
+271 
+272   {
+273     G1GCParPhaseTimesTracker x(phase_times, G1GCPhaseTimes::SystemDictionaryRoots, worker_i);
+274     if (_process_strong_tasks.try_claim_task(G1RP_PS_SystemDictionary_oops_do)) {
+275       SystemDictionary::oops_do(strong_roots);
+276     }
+277   }
+278 }
+279 
+280 void G1RootProcessor::process_code_cache_roots(CodeBlobClosure* code_closure,
+281                                                G1GCPhaseTimes* phase_times,
+282                                                uint worker_i) {
+283   if (_process_strong_tasks.try_claim_task(G1RP_PS_CodeCache_oops_do)) {
+284     CodeCache::blobs_do(code_closure);
+285   }
+286 }
+287 
+288 uint G1RootProcessor::n_workers() const {
+289   return _srs.n_threads();
+290 }
+    </pre>
+  </body>
+</html>
