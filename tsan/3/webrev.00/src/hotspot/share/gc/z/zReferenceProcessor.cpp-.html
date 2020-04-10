@@ -1,0 +1,477 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Old src/hotspot/share/gc/z/zReferenceProcessor.cpp</title>
+    <link rel="stylesheet" href="../../../../../style.css" />
+  </head>
+  <body>
+    <pre>
+  1 /*
+  2  * Copyright (c) 2015, 2019, Oracle and/or its affiliates. All rights reserved.
+  3  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  4  *
+  5  * This code is free software; you can redistribute it and/or modify it
+  6  * under the terms of the GNU General Public License version 2 only, as
+  7  * published by the Free Software Foundation.
+  8  *
+  9  * This code is distributed in the hope that it will be useful, but WITHOUT
+ 10  * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ 11  * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ 12  * version 2 for more details (a copy is included in the LICENSE file that
+ 13  * accompanied this code).
+ 14  *
+ 15  * You should have received a copy of the GNU General Public License version
+ 16  * 2 along with this work; if not, write to the Free Software Foundation,
+ 17  * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ 18  *
+ 19  * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ 20  * or visit www.oracle.com if you need additional information or have any
+ 21  * questions.
+ 22  */
+ 23 
+ 24 #include &quot;precompiled.hpp&quot;
+ 25 #include &quot;classfile/javaClasses.inline.hpp&quot;
+ 26 #include &quot;gc/shared/referencePolicy.hpp&quot;
+ 27 #include &quot;gc/shared/referenceProcessorStats.hpp&quot;
+ 28 #include &quot;gc/z/zHeap.inline.hpp&quot;
+ 29 #include &quot;gc/z/zOopClosures.inline.hpp&quot;
+ 30 #include &quot;gc/z/zReferenceProcessor.hpp&quot;
+ 31 #include &quot;gc/z/zStat.hpp&quot;
+ 32 #include &quot;gc/z/zTask.hpp&quot;
+ 33 #include &quot;gc/z/zTracer.inline.hpp&quot;
+ 34 #include &quot;gc/z/zUtils.inline.hpp&quot;
+ 35 #include &quot;memory/universe.hpp&quot;
+ 36 #include &quot;runtime/mutexLocker.hpp&quot;
+ 37 #include &quot;runtime/os.hpp&quot;
+ 38 
+ 39 static const ZStatSubPhase ZSubPhaseConcurrentReferencesProcess(&quot;Concurrent References Process&quot;);
+ 40 static const ZStatSubPhase ZSubPhaseConcurrentReferencesEnqueue(&quot;Concurrent References Enqueue&quot;);
+ 41 
+ 42 static ReferenceType reference_type(oop reference) {
+ 43   return InstanceKlass::cast(reference-&gt;klass())-&gt;reference_type();
+ 44 }
+ 45 
+ 46 static const char* reference_type_name(ReferenceType type) {
+ 47   switch (type) {
+ 48   case REF_SOFT:
+ 49     return &quot;Soft&quot;;
+ 50 
+ 51   case REF_WEAK:
+ 52     return &quot;Weak&quot;;
+ 53 
+ 54   case REF_FINAL:
+ 55     return &quot;Final&quot;;
+ 56 
+ 57   case REF_PHANTOM:
+ 58     return &quot;Phantom&quot;;
+ 59 
+ 60   default:
+ 61     ShouldNotReachHere();
+ 62     return NULL;
+ 63   }
+ 64 }
+ 65 
+ 66 static volatile oop* reference_referent_addr(oop reference) {
+ 67   return (volatile oop*)java_lang_ref_Reference::referent_addr_raw(reference);
+ 68 }
+ 69 
+ 70 static oop reference_referent(oop reference) {
+ 71   return *reference_referent_addr(reference);
+ 72 }
+ 73 
+ 74 static void reference_set_referent(oop reference, oop referent) {
+ 75   java_lang_ref_Reference::set_referent_raw(reference, referent);
+ 76 }
+ 77 
+ 78 static oop* reference_discovered_addr(oop reference) {
+ 79   return (oop*)java_lang_ref_Reference::discovered_addr_raw(reference);
+ 80 }
+ 81 
+ 82 static oop reference_discovered(oop reference) {
+ 83   return *reference_discovered_addr(reference);
+ 84 }
+ 85 
+ 86 static void reference_set_discovered(oop reference, oop discovered) {
+ 87   java_lang_ref_Reference::set_discovered_raw(reference, discovered);
+ 88 }
+ 89 
+ 90 static oop* reference_next_addr(oop reference) {
+ 91   return (oop*)java_lang_ref_Reference::next_addr_raw(reference);
+ 92 }
+ 93 
+ 94 static oop reference_next(oop reference) {
+ 95   return *reference_next_addr(reference);
+ 96 }
+ 97 
+ 98 static void reference_set_next(oop reference, oop next) {
+ 99   java_lang_ref_Reference::set_next_raw(reference, next);
+100 }
+101 
+102 static void soft_reference_update_clock() {
+103   const jlong now = os::javaTimeNanos() / NANOSECS_PER_MILLISEC;
+104   java_lang_ref_SoftReference::set_clock(now);
+105 }
+106 
+107 ZReferenceProcessor::ZReferenceProcessor(ZWorkers* workers) :
+108     _workers(workers),
+109     _soft_reference_policy(NULL),
+110     _encountered_count(),
+111     _discovered_count(),
+112     _enqueued_count(),
+113     _discovered_list(NULL),
+114     _pending_list(NULL),
+115     _pending_list_tail(_pending_list.addr()) {}
+116 
+117 void ZReferenceProcessor::set_soft_reference_policy(bool clear) {
+118   static AlwaysClearPolicy always_clear_policy;
+119   static LRUMaxHeapPolicy lru_max_heap_policy;
+120 
+121   if (clear) {
+122     log_info(gc, ref)(&quot;Clearing All SoftReferences&quot;);
+123     _soft_reference_policy = &amp;always_clear_policy;
+124   } else {
+125     _soft_reference_policy = &amp;lru_max_heap_policy;
+126   }
+127 
+128   _soft_reference_policy-&gt;setup();
+129 }
+130 
+131 bool ZReferenceProcessor::is_inactive(oop reference, oop referent, ReferenceType type) const {
+132   if (type == REF_FINAL) {
+133     // A FinalReference is inactive if its next field is non-null. An application can&#39;t
+134     // call enqueue() or clear() on a FinalReference.
+135     return reference_next(reference) != NULL;
+136   } else {
+137     // A non-FinalReference is inactive if the referent is null. The referent can only
+138     // be null if the application called Reference.enqueue() or Reference.clear().
+139     return referent == NULL;
+140   }
+141 }
+142 
+143 bool ZReferenceProcessor::is_strongly_live(oop referent) const {
+144   return ZHeap::heap()-&gt;is_object_strongly_live(ZOop::to_address(referent));
+145 }
+146 
+147 bool ZReferenceProcessor::is_softly_live(oop reference, ReferenceType type) const {
+148   if (type != REF_SOFT) {
+149     // Not a SoftReference
+150     return false;
+151   }
+152 
+153   // Ask SoftReference policy
+154   const jlong clock = java_lang_ref_SoftReference::clock();
+155   assert(clock != 0, &quot;Clock not initialized&quot;);
+156   assert(_soft_reference_policy != NULL, &quot;Policy not initialized&quot;);
+157   return !_soft_reference_policy-&gt;should_clear_reference(reference, clock);
+158 }
+159 
+160 bool ZReferenceProcessor::should_discover(oop reference, ReferenceType type) const {
+161   volatile oop* const referent_addr = reference_referent_addr(reference);
+162   const oop referent = ZBarrier::weak_load_barrier_on_oop_field(referent_addr);
+163 
+164   if (is_inactive(reference, referent, type)) {
+165     return false;
+166   }
+167 
+168   if (is_strongly_live(referent)) {
+169     return false;
+170   }
+171 
+172   if (is_softly_live(reference, type)) {
+173     return false;
+174   }
+175 
+176   // PhantomReferences with finalizable marked referents should technically not have
+177   // to be discovered. However, InstanceRefKlass::oop_oop_iterate_ref_processing()
+178   // does not know about the finalizable mark concept, and will therefore mark
+179   // referents in non-discovered PhantomReferences as strongly live. To prevent
+180   // this, we always discover PhantomReferences with finalizable marked referents.
+181   // They will automatically be dropped during the reference processing phase.
+182   return true;
+183 }
+184 
+185 bool ZReferenceProcessor::should_drop(oop reference, ReferenceType type) const {
+186   // This check is racing with a call to Reference.clear() from the application.
+187   // If the application clears the reference after this check it will still end
+188   // up on the pending list, and there&#39;s nothing we can do about that without
+189   // changing the Reference.clear() API. This check is also racing with a call
+190   // to Reference.enqueue() from the application, which is unproblematic, since
+191   // the application wants the reference to be enqueued anyway.
+192   const oop referent = reference_referent(reference);
+193   if (referent == NULL) {
+194     // Reference has been cleared, by a call to Reference.enqueue()
+195     // or Reference.clear() from the application, which means we
+196     // should drop the reference.
+197     return true;
+198   }
+199 
+200   // Check if the referent is still alive, in which case we should
+201   // drop the reference.
+202   if (type == REF_PHANTOM) {
+203     return ZBarrier::is_alive_barrier_on_phantom_oop(referent);
+204   } else {
+205     return ZBarrier::is_alive_barrier_on_weak_oop(referent);
+206   }
+207 }
+208 
+209 void ZReferenceProcessor::keep_alive(oop reference, ReferenceType type) const {
+210   volatile oop* const p = reference_referent_addr(reference);
+211   if (type == REF_PHANTOM) {
+212     ZBarrier::keep_alive_barrier_on_phantom_oop_field(p);
+213   } else {
+214     ZBarrier::keep_alive_barrier_on_weak_oop_field(p);
+215   }
+216 }
+217 
+218 void ZReferenceProcessor::make_inactive(oop reference, ReferenceType type) const {
+219   if (type == REF_FINAL) {
+220     // Don&#39;t clear referent. It is needed by the Finalizer thread to make the call
+221     // to finalize(). A FinalReference is instead made inactive by self-looping the
+222     // next field. An application can&#39;t call FinalReference.enqueue(), so there is
+223     // no race to worry about when setting the next field.
+224     assert(reference_next(reference) == NULL, &quot;Already inactive&quot;);
+225     reference_set_next(reference, reference);
+226   } else {
+227     // Clear referent
+228     reference_set_referent(reference, NULL);
+229   }
+230 }
+231 
+232 void ZReferenceProcessor::discover(oop reference, ReferenceType type) {
+233   log_trace(gc, ref)(&quot;Discovered Reference: &quot; PTR_FORMAT &quot; (%s)&quot;, p2i(reference), reference_type_name(type));
+234 
+235   // Update statistics
+236   _discovered_count.get()[type]++;
+237 
+238   if (type == REF_FINAL) {
+239     // Mark referent (and its reachable subgraph) finalizable. This avoids
+240     // the problem of later having to mark those objects if the referent is
+241     // still final reachable during processing.
+242     volatile oop* const referent_addr = reference_referent_addr(reference);
+243     ZBarrier::mark_barrier_on_oop_field(referent_addr, true /* finalizable */);
+244   }
+245 
+246   // Add reference to discovered list
+247   assert(reference_discovered(reference) == NULL, &quot;Already discovered&quot;);
+248   oop* const list = _discovered_list.addr();
+249   reference_set_discovered(reference, *list);
+250   *list = reference;
+251 }
+252 
+253 bool ZReferenceProcessor::discover_reference(oop reference, ReferenceType type) {
+254   if (!RegisterReferences) {
+255     // Reference processing disabled
+256     return false;
+257   }
+258 
+259   log_trace(gc, ref)(&quot;Encountered Reference: &quot; PTR_FORMAT &quot; (%s)&quot;, p2i(reference), reference_type_name(type));
+260 
+261   // Update statistics
+262   _encountered_count.get()[type]++;
+263 
+264   if (!should_discover(reference, type)) {
+265     // Not discovered
+266     return false;
+267   }
+268 
+269   discover(reference, type);
+270 
+271   // Discovered
+272   return true;
+273 }
+274 
+275 oop ZReferenceProcessor::drop(oop reference, ReferenceType type) {
+276   log_trace(gc, ref)(&quot;Dropped Reference: &quot; PTR_FORMAT &quot; (%s)&quot;, p2i(reference), reference_type_name(type));
+277 
+278   // Keep referent alive
+279   keep_alive(reference, type);
+280 
+281   // Unlink and return next in list
+282   const oop next = reference_discovered(reference);
+283   reference_set_discovered(reference, NULL);
+284   return next;
+285 }
+286 
+287 oop* ZReferenceProcessor::keep(oop reference, ReferenceType type) {
+288   log_trace(gc, ref)(&quot;Enqueued Reference: &quot; PTR_FORMAT &quot; (%s)&quot;, p2i(reference), reference_type_name(type));
+289 
+290   // Update statistics
+291   _enqueued_count.get()[type]++;
+292 
+293   // Make reference inactive
+294   make_inactive(reference, type);
+295 
+296   // Return next in list
+297   return reference_discovered_addr(reference);
+298 }
+299 
+300 void ZReferenceProcessor::work() {
+301   // Process discovered references
+302   oop* const list = _discovered_list.addr();
+303   oop* p = list;
+304 
+305   while (*p != NULL) {
+306     const oop reference = *p;
+307     const ReferenceType type = reference_type(reference);
+308 
+309     if (should_drop(reference, type)) {
+310       *p = drop(reference, type);
+311     } else {
+312       p = keep(reference, type);
+313     }
+314   }
+315 
+316   // Prepend discovered references to internal pending list
+317   if (*list != NULL) {
+318     *p = Atomic::xchg(*list, _pending_list.addr());
+319     if (*p == NULL) {
+320       // First to prepend to list, record tail
+321       _pending_list_tail = p;
+322     }
+323 
+324     // Clear discovered list
+325     *list = NULL;
+326   }
+327 }
+328 
+329 bool ZReferenceProcessor::is_empty() const {
+330   ZPerWorkerConstIterator&lt;oop&gt; iter(&amp;_discovered_list);
+331   for (const oop* list; iter.next(&amp;list);) {
+332     if (*list != NULL) {
+333       return false;
+334     }
+335   }
+336 
+337   if (_pending_list.get() != NULL) {
+338     return false;
+339   }
+340 
+341   return true;
+342 }
+343 
+344 void ZReferenceProcessor::reset_statistics() {
+345   assert(is_empty(), &quot;Should be empty&quot;);
+346 
+347   // Reset encountered
+348   ZPerWorkerIterator&lt;Counters&gt; iter_encountered(&amp;_encountered_count);
+349   for (Counters* counters; iter_encountered.next(&amp;counters);) {
+350     for (int i = REF_SOFT; i &lt;= REF_PHANTOM; i++) {
+351       (*counters)[i] = 0;
+352     }
+353   }
+354 
+355   // Reset discovered
+356   ZPerWorkerIterator&lt;Counters&gt; iter_discovered(&amp;_discovered_count);
+357   for (Counters* counters; iter_discovered.next(&amp;counters);) {
+358     for (int i = REF_SOFT; i &lt;= REF_PHANTOM; i++) {
+359       (*counters)[i] = 0;
+360     }
+361   }
+362 
+363   // Reset enqueued
+364   ZPerWorkerIterator&lt;Counters&gt; iter_enqueued(&amp;_enqueued_count);
+365   for (Counters* counters; iter_enqueued.next(&amp;counters);) {
+366     for (int i = REF_SOFT; i &lt;= REF_PHANTOM; i++) {
+367       (*counters)[i] = 0;
+368     }
+369   }
+370 }
+371 
+372 void ZReferenceProcessor::collect_statistics() {
+373   Counters encountered = {};
+374   Counters discovered = {};
+375   Counters enqueued = {};
+376 
+377   // Sum encountered
+378   ZPerWorkerConstIterator&lt;Counters&gt; iter_encountered(&amp;_encountered_count);
+379   for (const Counters* counters; iter_encountered.next(&amp;counters);) {
+380     for (int i = REF_SOFT; i &lt;= REF_PHANTOM; i++) {
+381       encountered[i] += (*counters)[i];
+382     }
+383   }
+384 
+385   // Sum discovered
+386   ZPerWorkerConstIterator&lt;Counters&gt; iter_discovered(&amp;_discovered_count);
+387   for (const Counters* counters; iter_discovered.next(&amp;counters);) {
+388     for (int i = REF_SOFT; i &lt;= REF_PHANTOM; i++) {
+389       discovered[i] += (*counters)[i];
+390     }
+391   }
+392 
+393   // Sum enqueued
+394   ZPerWorkerConstIterator&lt;Counters&gt; iter_enqueued(&amp;_enqueued_count);
+395   for (const Counters* counters; iter_enqueued.next(&amp;counters);) {
+396     for (int i = REF_SOFT; i &lt;= REF_PHANTOM; i++) {
+397       enqueued[i] += (*counters)[i];
+398     }
+399   }
+400 
+401   // Update statistics
+402   ZStatReferences::set_soft(encountered[REF_SOFT], discovered[REF_SOFT], enqueued[REF_SOFT]);
+403   ZStatReferences::set_weak(encountered[REF_WEAK], discovered[REF_WEAK], enqueued[REF_WEAK]);
+404   ZStatReferences::set_final(encountered[REF_FINAL], discovered[REF_FINAL], enqueued[REF_FINAL]);
+405   ZStatReferences::set_phantom(encountered[REF_PHANTOM], discovered[REF_PHANTOM], enqueued[REF_PHANTOM]);
+406 
+407   // Trace statistics
+408   const ReferenceProcessorStats stats(discovered[REF_SOFT],
+409                                       discovered[REF_WEAK],
+410                                       discovered[REF_FINAL],
+411                                       discovered[REF_PHANTOM]);
+412   ZTracer::tracer()-&gt;report_gc_reference_stats(stats);
+413 }
+414 
+415 class ZReferenceProcessorTask : public ZTask {
+416 private:
+417   ZReferenceProcessor* const _reference_processor;
+418 
+419 public:
+420   ZReferenceProcessorTask(ZReferenceProcessor* reference_processor) :
+421       ZTask(&quot;ZReferenceProcessorTask&quot;),
+422       _reference_processor(reference_processor) {}
+423 
+424   virtual void work() {
+425     _reference_processor-&gt;work();
+426   }
+427 };
+428 
+429 void ZReferenceProcessor::process_references() {
+430   ZStatTimer timer(ZSubPhaseConcurrentReferencesProcess);
+431 
+432   // Process discovered lists
+433   ZReferenceProcessorTask task(this);
+434   _workers-&gt;run_concurrent(&amp;task);
+435 
+436   // Update SoftReference clock
+437   soft_reference_update_clock();
+438 
+439   // Collect, log and trace statistics
+440   collect_statistics();
+441 }
+442 
+443 void ZReferenceProcessor::enqueue_references() {
+444   ZStatTimer timer(ZSubPhaseConcurrentReferencesEnqueue);
+445 
+446   if (_pending_list.get() == NULL) {
+447     // Nothing to enqueue
+448     return;
+449   }
+450 
+451   {
+452     // Heap_lock protects external pending list
+453     MonitorLockerEx ml(Heap_lock);
+454 
+455     // Prepend internal pending list to external pending list
+456     *_pending_list_tail = Universe::swap_reference_pending_list(_pending_list.get());
+457 
+458     // Notify ReferenceHandler thread
+459     ml.notify_all();
+460   }
+461 
+462   // Reset internal pending list
+463   _pending_list.set(NULL);
+464   _pending_list_tail = _pending_list.addr();
+465 }
+    </pre>
+  </body>
+</html>
