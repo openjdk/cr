@@ -1,0 +1,284 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>New src/hotspot/share/jfr/leakprofiler/sampling/objectSampler.cpp</title>
+    <link rel="stylesheet" href="../../../../../../style.css" />
+  </head>
+  <body>
+    <pre>
+  1 /*
+  2  * Copyright (c) 2017, 2019, Oracle and/or its affiliates. All rights reserved.
+  3  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  4  *
+  5  * This code is free software; you can redistribute it and/or modify it
+  6  * under the terms of the GNU General Public License version 2 only, as
+  7  * published by the Free Software Foundation.
+  8  *
+  9  * This code is distributed in the hope that it will be useful, but WITHOUT
+ 10  * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ 11  * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ 12  * version 2 for more details (a copy is included in the LICENSE file that
+ 13  * accompanied this code).
+ 14  *
+ 15  * You should have received a copy of the GNU General Public License version
+ 16  * 2 along with this work; if not, write to the Free Software Foundation,
+ 17  * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ 18  *
+ 19  * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ 20  * or visit www.oracle.com if you need additional information or have any
+ 21  * questions.
+ 22  *
+ 23  */
+ 24 
+ 25 #include &quot;precompiled.hpp&quot;
+ 26 #include &quot;jfr/jfrEvents.hpp&quot;
+ 27 #include &quot;jfr/leakprofiler/sampling/objectSample.hpp&quot;
+ 28 #include &quot;jfr/leakprofiler/sampling/objectSampler.hpp&quot;
+ 29 #include &quot;jfr/leakprofiler/sampling/sampleList.hpp&quot;
+ 30 #include &quot;jfr/leakprofiler/sampling/samplePriorityQueue.hpp&quot;
+ 31 #include &quot;jfr/recorder/jfrEventSetting.inline.hpp&quot;
+ 32 #include &quot;jfr/recorder/checkpoint/jfrCheckpointManager.hpp&quot;
+ 33 #include &quot;jfr/recorder/stacktrace/jfrStackTraceRepository.hpp&quot;
+ 34 #include &quot;jfr/support/jfrThreadLocal.hpp&quot;
+ 35 #include &quot;jfr/utilities/jfrTryLock.hpp&quot;
+ 36 #include &quot;logging/log.hpp&quot;
+ 37 #include &quot;memory/universe.hpp&quot;
+ 38 #include &quot;oops/oop.inline.hpp&quot;
+ 39 #include &quot;runtime/atomic.hpp&quot;
+ 40 #include &quot;runtime/orderAccess.hpp&quot;
+ 41 #include &quot;runtime/safepoint.hpp&quot;
+ 42 #include &quot;runtime/thread.hpp&quot;
+ 43 
+ 44 static ObjectSampler* _instance = NULL;
+ 45 
+ 46 static ObjectSampler&amp; instance() {
+ 47   assert(_instance != NULL, &quot;invariant&quot;);
+ 48   return *_instance;
+ 49 }
+ 50 
+ 51 ObjectSampler::ObjectSampler(size_t size) :
+ 52   _priority_queue(new SamplePriorityQueue(size)),
+ 53   _list(new SampleList(size)),
+ 54   _last_sweep(JfrTicks::now()),
+ 55   _total_allocated(0),
+ 56   _threshold(0),
+ 57   _size(size),
+ 58   _dead_samples(false) {}
+ 59 
+ 60 ObjectSampler::~ObjectSampler() {
+ 61   delete _priority_queue;
+ 62   _priority_queue = NULL;
+ 63   delete _list;
+ 64   _list = NULL;
+ 65 }
+ 66 
+ 67 bool ObjectSampler::create(size_t size) {
+ 68   assert(SafepointSynchronize::is_at_safepoint(), &quot;invariant&quot;);
+ 69   assert(_instance == NULL, &quot;invariant&quot;);
+ 70   _instance = new ObjectSampler(size);
+ 71   return _instance != NULL;
+ 72 }
+ 73 
+ 74 bool ObjectSampler::is_created() {
+ 75   return _instance != NULL;
+ 76 }
+ 77 
+ 78 ObjectSampler* ObjectSampler::sampler() {
+ 79   assert(is_created(), &quot;invariant&quot;);
+ 80   return _instance;
+ 81 }
+ 82 
+ 83 void ObjectSampler::destroy() {
+ 84   assert(SafepointSynchronize::is_at_safepoint(), &quot;invariant&quot;);
+ 85   if (_instance != NULL) {
+ 86     ObjectSampler* const sampler = _instance;
+ 87     _instance = NULL;
+ 88     delete sampler;
+ 89   }
+ 90 }
+ 91 
+ 92 static volatile int _lock = 0;
+ 93 
+ 94 ObjectSampler* ObjectSampler::acquire() {
+ 95   assert(is_created(), &quot;invariant&quot;);
+ 96   while (Atomic::cmpxchg(&amp;_lock, 0, 1) == 1) {}
+ 97   return _instance;
+ 98 }
+ 99 
+100 void ObjectSampler::release() {
+101   assert(is_created(), &quot;invariant&quot;);
+102   OrderAccess::fence();
+103   _lock = 0;
+104 }
+105 
+106 static traceid get_thread_id(JavaThread* thread) {
+107   assert(thread != NULL, &quot;invariant&quot;);
+108   if (thread-&gt;threadObj() == NULL) {
+109     return 0;
+110   }
+111   const JfrThreadLocal* const tl = thread-&gt;jfr_thread_local();
+112   assert(tl != NULL, &quot;invariant&quot;);
+113   if (tl-&gt;is_excluded()) {
+114     return 0;
+115   }
+116   if (!tl-&gt;has_thread_blob()) {
+117     JfrCheckpointManager::create_thread_blob(thread);
+118   }
+119   assert(tl-&gt;has_thread_blob(), &quot;invariant&quot;);
+120   return tl-&gt;thread_id();
+121 }
+122 
+123 static void record_stacktrace(JavaThread* thread) {
+124   assert(thread != NULL, &quot;invariant&quot;);
+125   if (JfrEventSetting::has_stacktrace(EventOldObjectSample::eventId)) {
+126     JfrStackTraceRepository::record_and_cache(thread);
+127   }
+128 }
+129 
+130 void ObjectSampler::sample(HeapWord* obj, size_t allocated, JavaThread* thread) {
+131   assert(thread != NULL, &quot;invariant&quot;);
+132   assert(is_created(), &quot;invariant&quot;);
+133   const traceid thread_id = get_thread_id(thread);
+134   if (thread_id == 0) {
+135     return;
+136   }
+137   record_stacktrace(thread);
+138   // try enter critical section
+139   JfrTryLock tryLock(&amp;_lock);
+140   if (!tryLock.has_lock()) {
+141     log_trace(jfr, oldobject, sampling)(&quot;Skipping old object sample due to lock contention&quot;);
+142     return;
+143   }
+144   instance().add(obj, allocated, thread_id, thread);
+145 }
+146 
+147 void ObjectSampler::add(HeapWord* obj, size_t allocated, traceid thread_id, JavaThread* thread) {
+148   assert(obj != NULL, &quot;invariant&quot;);
+149   assert(thread_id != 0, &quot;invariant&quot;);
+150   assert(thread != NULL, &quot;invariant&quot;);
+151   assert(thread-&gt;jfr_thread_local()-&gt;has_thread_blob(), &quot;invariant&quot;);
+152 
+153   if (_dead_samples) {
+154     scavenge();
+155     assert(!_dead_samples, &quot;invariant&quot;);
+156   }
+157 
+158   _total_allocated += allocated;
+159   const size_t span = _total_allocated - _priority_queue-&gt;total();
+160   ObjectSample* sample;
+161   if ((size_t)_priority_queue-&gt;count() == _size) {
+162     assert(_list-&gt;count() == _size, &quot;invariant&quot;);
+163     const ObjectSample* peek = _priority_queue-&gt;peek();
+164     if (peek-&gt;span() &gt; span) {
+165       // quick reject, will not fit
+166       return;
+167     }
+168     sample = _list-&gt;reuse(_priority_queue-&gt;pop());
+169   } else {
+170     sample = _list-&gt;get();
+171   }
+172 
+173   assert(sample != NULL, &quot;invariant&quot;);
+174   sample-&gt;set_thread_id(thread_id);
+175 
+176   const JfrThreadLocal* const tl = thread-&gt;jfr_thread_local();
+177   sample-&gt;set_thread(tl-&gt;thread_blob());
+178 
+179   const unsigned int stacktrace_hash = tl-&gt;cached_stack_trace_hash();
+180   if (stacktrace_hash != 0) {
+181     sample-&gt;set_stack_trace_id(tl-&gt;cached_stack_trace_id());
+182     sample-&gt;set_stack_trace_hash(stacktrace_hash);
+183   }
+184 
+185   sample-&gt;set_span(allocated);
+186   sample-&gt;set_object((oop)obj);
+187   sample-&gt;set_allocated(allocated);
+188   sample-&gt;set_allocation_time(JfrTicks::now());
+189   sample-&gt;set_heap_used_at_last_gc(Universe::get_heap_used_at_last_gc());
+190   _priority_queue-&gt;push(sample);
+191 }
+192 
+193 void ObjectSampler::scavenge() {
+194   ObjectSample* current = _list-&gt;last();
+195   while (current != NULL) {
+196     ObjectSample* next = current-&gt;next();
+197     if (current-&gt;is_dead()) {
+198       remove_dead(current);
+199     }
+200     current = next;
+201   }
+202   _dead_samples = false;
+203 }
+204 
+205 void ObjectSampler::remove_dead(ObjectSample* sample) {
+206   assert(sample != NULL, &quot;invariant&quot;);
+207   assert(sample-&gt;is_dead(), &quot;invariant&quot;);
+208   ObjectSample* const previous = sample-&gt;prev();
+209   // push span onto previous
+210   if (previous != NULL) {
+211     _priority_queue-&gt;remove(previous);
+212     previous-&gt;add_span(sample-&gt;span());
+213     _priority_queue-&gt;push(previous);
+214   }
+215   _priority_queue-&gt;remove(sample);
+216   _list-&gt;release(sample);
+217 }
+218 
+219 void ObjectSampler::weak_oops_do(BoolObjectClosure* is_alive, OopClosure* f) {
+220   assert(is_created(), &quot;invariant&quot;);
+221   assert(SafepointSynchronize::is_at_safepoint(), &quot;invariant&quot;);
+222   ObjectSampler&amp; sampler = instance();
+223   ObjectSample* current = sampler._list-&gt;last();
+224   while (current != NULL) {
+225     if (current-&gt;_object != NULL) {
+226       if (is_alive-&gt;do_object_b(current-&gt;object())) {
+227         // The weakly referenced object is alive, update pointer
+228         f-&gt;do_oop(const_cast&lt;oop*&gt;(current-&gt;object_addr()));
+229       } else {
+230         // clear existing field to assist GC barriers
+231         current-&gt;_object = NULL;
+232         sampler._dead_samples = true;
+233       }
+234     }
+235     current = current-&gt;next();
+236   }
+237   sampler._last_sweep = JfrTicks::now();
+238 }
+239 
+240 ObjectSample* ObjectSampler::last() const {
+241   return _list-&gt;last();
+242 }
+243 
+244 const ObjectSample* ObjectSampler::first() const {
+245   return _list-&gt;first();
+246 }
+247 
+248 const ObjectSample* ObjectSampler::last_resolved() const {
+249   return _list-&gt;last_resolved();
+250 }
+251 
+252 void ObjectSampler::set_last_resolved(const ObjectSample* sample) {
+253   _list-&gt;set_last_resolved(sample);
+254 }
+255 
+256 int ObjectSampler::item_count() const {
+257   return _priority_queue-&gt;count();
+258 }
+259 
+260 const ObjectSample* ObjectSampler::item_at(int index) const {
+261   return _priority_queue-&gt;item_at(index);
+262 }
+263 
+264 ObjectSample* ObjectSampler::item_at(int index) {
+265   return const_cast&lt;ObjectSample*&gt;(
+266     const_cast&lt;const ObjectSampler*&gt;(this)-&gt;item_at(index)
+267                                   );
+268 }
+269 
+270 const JfrTicks&amp; ObjectSampler::last_sweep() const {
+271   return _last_sweep;
+272 }
+    </pre>
+  </body>
+</html>
