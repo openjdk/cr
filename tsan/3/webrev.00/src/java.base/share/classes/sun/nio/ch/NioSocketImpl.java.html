@@ -1,0 +1,1271 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>New src/java.base/share/classes/sun/nio/ch/NioSocketImpl.java</title>
+    <link rel="stylesheet" href="../../../../../../../style.css" />
+  </head>
+  <body>
+    <pre>
+   1 /*
+   2  * Copyright (c) 2019, Oracle and/or its affiliates. All rights reserved.
+   3  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+   4  *
+   5  * This code is free software; you can redistribute it and/or modify it
+   6  * under the terms of the GNU General Public License version 2 only, as
+   7  * published by the Free Software Foundation.  Oracle designates this
+   8  * particular file as subject to the &quot;Classpath&quot; exception as provided
+   9  * by Oracle in the LICENSE file that accompanied this code.
+  10  *
+  11  * This code is distributed in the hope that it will be useful, but WITHOUT
+  12  * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+  13  * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+  14  * version 2 for more details (a copy is included in the LICENSE file that
+  15  * accompanied this code).
+  16  *
+  17  * You should have received a copy of the GNU General Public License version
+  18  * 2 along with this work; if not, write to the Free Software Foundation,
+  19  * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+  20  *
+  21  * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+  22  * or visit www.oracle.com if you need additional information or have any
+  23  * questions.
+  24  */
+  25 
+  26 package sun.nio.ch;
+  27 
+  28 import java.io.FileDescriptor;
+  29 import java.io.IOException;
+  30 import java.io.InputStream;
+  31 import java.io.OutputStream;
+  32 import java.io.UncheckedIOException;
+  33 import java.lang.ref.Cleaner.Cleanable;
+  34 import java.net.InetAddress;
+  35 import java.net.InetSocketAddress;
+  36 import java.net.ProtocolFamily;
+  37 import java.net.SocketAddress;
+  38 import java.net.SocketException;
+  39 import java.net.SocketImpl;
+  40 import java.net.SocketOption;
+  41 import java.net.SocketTimeoutException;
+  42 import java.net.StandardProtocolFamily;
+  43 import java.net.StandardSocketOptions;
+  44 import java.net.UnknownHostException;
+  45 import java.nio.ByteBuffer;
+  46 import java.util.Collections;
+  47 import java.util.HashSet;
+  48 import java.util.Objects;
+  49 import java.util.Set;
+  50 import java.util.concurrent.TimeUnit;
+  51 import java.util.concurrent.locks.ReentrantLock;
+  52 
+  53 import jdk.internal.ref.CleanerFactory;
+  54 import sun.net.ConnectionResetException;
+  55 import sun.net.NetHooks;
+  56 import sun.net.PlatformSocketImpl;
+  57 import sun.net.ResourceManager;
+  58 import sun.net.ext.ExtendedSocketOptions;
+  59 import sun.net.util.SocketExceptions;
+  60 
+  61 import static java.util.concurrent.TimeUnit.MILLISECONDS;
+  62 import static java.util.concurrent.TimeUnit.NANOSECONDS;
+  63 
+  64 /**
+  65  * NIO based SocketImpl.
+  66  *
+  67  * This implementation attempts to be compatible with legacy PlainSocketImpl,
+  68  * including behavior and exceptions that are not specified by SocketImpl.
+  69  *
+  70  * The underlying socket used by this SocketImpl is initially configured
+  71  * blocking. If the connect method is used to establish a connection with a
+  72  * timeout then the socket is configured non-blocking for the connect attempt,
+  73  * and then restored to blocking mode when the connection is established.
+  74  * If the accept or read methods are used with a timeout then the socket is
+  75  * configured non-blocking and is never restored. When in non-blocking mode,
+  76  * operations that don&#39;t complete immediately will poll the socket and preserve
+  77  * the semantics of blocking operations.
+  78  */
+  79 
+  80 public final class NioSocketImpl extends SocketImpl implements PlatformSocketImpl {
+  81     private static final NativeDispatcher nd = new SocketDispatcher();
+  82 
+  83     // The maximum number of bytes to read/write per syscall to avoid needing
+  84     // a huge buffer from the temporary buffer cache
+  85     private static final int MAX_BUFFER_SIZE = 128 * 1024;
+  86 
+  87     // true if this is a SocketImpl for a ServerSocket
+  88     private final boolean server;
+  89 
+  90     // Lock held when reading (also used when accepting or connecting)
+  91     private final ReentrantLock readLock = new ReentrantLock();
+  92 
+  93     // Lock held when writing
+  94     private final ReentrantLock writeLock = new ReentrantLock();
+  95 
+  96     // The stateLock for read/changing state
+  97     private final Object stateLock = new Object();
+  98     private static final int ST_NEW = 0;
+  99     private static final int ST_UNCONNECTED = 1;
+ 100     private static final int ST_CONNECTING = 2;
+ 101     private static final int ST_CONNECTED = 3;
+ 102     private static final int ST_CLOSING = 4;
+ 103     private static final int ST_CLOSED = 5;
+ 104     private volatile int state;  // need stateLock to change
+ 105 
+ 106     // set by SocketImpl.create, protected by stateLock
+ 107     private boolean stream;
+ 108     private Cleanable cleaner;
+ 109 
+ 110     // set to true when the socket is in non-blocking mode
+ 111     private volatile boolean nonBlocking;
+ 112 
+ 113     // used by connect/read/write/accept, protected by stateLock
+ 114     private long readerThread;
+ 115     private long writerThread;
+ 116 
+ 117     // used when SO_REUSEADDR is emulated, protected by stateLock
+ 118     private boolean isReuseAddress;
+ 119 
+ 120     // read or accept timeout in millis
+ 121     private volatile int timeout;
+ 122 
+ 123     // flags to indicate if the connection is shutdown for input and output
+ 124     private volatile boolean isInputClosed;
+ 125     private volatile boolean isOutputClosed;
+ 126 
+ 127     // used by read to emulate legacy behavior, protected by readLock
+ 128     private boolean readEOF;
+ 129     private boolean connectionReset;
+ 130 
+ 131     /**
+ 132      * Creates an instance of this SocketImpl.
+ 133      * @param server true if this is a SocketImpl for a ServerSocket
+ 134      */
+ 135     public NioSocketImpl(boolean server) {
+ 136         this.server = server;
+ 137     }
+ 138 
+ 139     /**
+ 140      * Returns true if the socket is open.
+ 141      */
+ 142     private boolean isOpen() {
+ 143         return state &lt; ST_CLOSING;
+ 144     }
+ 145 
+ 146     /**
+ 147      * Throws SocketException if the socket is not open.
+ 148      */
+ 149     private void ensureOpen() throws SocketException {
+ 150         int state = this.state;
+ 151         if (state == ST_NEW)
+ 152             throw new SocketException(&quot;Socket not created&quot;);
+ 153         if (state &gt;= ST_CLOSING)
+ 154             throw new SocketException(&quot;Socket closed&quot;);
+ 155     }
+ 156 
+ 157     /**
+ 158      * Throws SocketException if the socket is not open and connected.
+ 159      */
+ 160     private void ensureOpenAndConnected() throws SocketException {
+ 161         int state = this.state;
+ 162         if (state &lt; ST_CONNECTED)
+ 163             throw new SocketException(&quot;Not connected&quot;);
+ 164         if (state &gt; ST_CONNECTED)
+ 165             throw new SocketException(&quot;Socket closed&quot;);
+ 166     }
+ 167 
+ 168     /**
+ 169      * Disables the current thread for scheduling purposes until the socket is
+ 170      * ready for I/O, or is asynchronously closed, for up to the specified
+ 171      * waiting time.
+ 172      * @throws IOException if an I/O error occurs
+ 173      */
+ 174     private void park(FileDescriptor fd, int event, long nanos) throws IOException {
+ 175         long millis;
+ 176         if (nanos == 0) {
+ 177             millis = -1;
+ 178         } else {
+ 179             millis = NANOSECONDS.toMillis(nanos);
+ 180         }
+ 181         Net.poll(fd, event, millis);
+ 182     }
+ 183 
+ 184     /**
+ 185      * Disables the current thread for scheduling purposes until the socket is
+ 186      * ready for I/O or is asynchronously closed.
+ 187      * @throws IOException if an I/O error occurs
+ 188      */
+ 189     private void park(FileDescriptor fd, int event) throws IOException {
+ 190         park(fd, event, 0);
+ 191     }
+ 192 
+ 193     /**
+ 194      * Configures the socket to blocking mode. This method is a no-op if the
+ 195      * socket is already in blocking mode.
+ 196      * @throws IOException if closed or there is an I/O error changing the mode
+ 197      */
+ 198     private void configureBlocking(FileDescriptor fd) throws IOException {
+ 199         assert readLock.isHeldByCurrentThread();
+ 200         if (nonBlocking) {
+ 201             synchronized (stateLock) {
+ 202                 ensureOpen();
+ 203                 IOUtil.configureBlocking(fd, true);
+ 204                 nonBlocking = false;
+ 205             }
+ 206         }
+ 207     }
+ 208 
+ 209     /**
+ 210      * Configures the socket to non-blocking mode. This method is a no-op if the
+ 211      * socket is already in non-blocking mode.
+ 212      * @throws IOException if closed or there is an I/O error changing the mode
+ 213      */
+ 214     private void configureNonBlocking(FileDescriptor fd) throws IOException {
+ 215         assert readLock.isHeldByCurrentThread();
+ 216         if (!nonBlocking) {
+ 217             synchronized (stateLock) {
+ 218                 ensureOpen();
+ 219                 IOUtil.configureBlocking(fd, false);
+ 220                 nonBlocking = true;
+ 221             }
+ 222         }
+ 223     }
+ 224 
+ 225     /**
+ 226      * Marks the beginning of a read operation that might block.
+ 227      * @throws SocketException if the socket is closed or not connected
+ 228      */
+ 229     private FileDescriptor beginRead() throws SocketException {
+ 230         synchronized (stateLock) {
+ 231             ensureOpenAndConnected();
+ 232             readerThread = NativeThread.current();
+ 233             return fd;
+ 234         }
+ 235     }
+ 236 
+ 237     /**
+ 238      * Marks the end of a read operation that may have blocked.
+ 239      * @throws SocketException is the socket is closed
+ 240      */
+ 241     private void endRead(boolean completed) throws SocketException {
+ 242         synchronized (stateLock) {
+ 243             readerThread = 0;
+ 244             int state = this.state;
+ 245             if (state == ST_CLOSING)
+ 246                 tryFinishClose();
+ 247             if (!completed &amp;&amp; state &gt;= ST_CLOSING)
+ 248                 throw new SocketException(&quot;Socket closed&quot;);
+ 249         }
+ 250     }
+ 251 
+ 252     /**
+ 253      * Attempts to read bytes from the socket into the given byte array.
+ 254      */
+ 255     private int tryRead(FileDescriptor fd, byte[] b, int off, int len)
+ 256         throws IOException
+ 257     {
+ 258         ByteBuffer dst = Util.getTemporaryDirectBuffer(len);
+ 259         assert dst.position() == 0;
+ 260         try {
+ 261             int n = nd.read(fd, ((DirectBuffer)dst).address(), len);
+ 262             if (n &gt; 0) {
+ 263                 dst.get(b, off, n);
+ 264             }
+ 265             return n;
+ 266         } finally {
+ 267             Util.offerFirstTemporaryDirectBuffer(dst);
+ 268         }
+ 269     }
+ 270 
+ 271     /**
+ 272      * Reads bytes from the socket into the given byte array with a timeout.
+ 273      * @throws SocketTimeoutException if the read timeout elapses
+ 274      */
+ 275     private int timedRead(FileDescriptor fd, byte[] b, int off, int len, long nanos)
+ 276         throws IOException
+ 277     {
+ 278         long startNanos = System.nanoTime();
+ 279         int n = tryRead(fd, b, off, len);
+ 280         while (n == IOStatus.UNAVAILABLE &amp;&amp; isOpen()) {
+ 281             long remainingNanos = nanos - (System.nanoTime() - startNanos);
+ 282             if (remainingNanos &lt;= 0) {
+ 283                 throw new SocketTimeoutException(&quot;Read timed out&quot;);
+ 284             }
+ 285             park(fd, Net.POLLIN, remainingNanos);
+ 286             n = tryRead(fd, b, off, len);
+ 287         }
+ 288         return n;
+ 289     }
+ 290 
+ 291     /**
+ 292      * Reads bytes from the socket into the given byte array.
+ 293      * @return the number of bytes read or -1 at EOF
+ 294      * @throws SocketException if the socket is closed or a socket I/O error occurs
+ 295      * @throws SocketTimeoutException if the read timeout elapses
+ 296      */
+ 297     private int implRead(byte[] b, int off, int len) throws IOException {
+ 298         int n = 0;
+ 299         FileDescriptor fd = beginRead();
+ 300         try {
+ 301             if (connectionReset)
+ 302                 throw new SocketException(&quot;Connection reset&quot;);
+ 303             if (isInputClosed)
+ 304                 return -1;
+ 305             int timeout = this.timeout;
+ 306             if (timeout &gt; 0) {
+ 307                 // read with timeout
+ 308                 configureNonBlocking(fd);
+ 309                 n = timedRead(fd, b, off, len, MILLISECONDS.toNanos(timeout));
+ 310             } else {
+ 311                 // read, no timeout
+ 312                 n = tryRead(fd, b, off, len);
+ 313                 while (IOStatus.okayToRetry(n) &amp;&amp; isOpen()) {
+ 314                     park(fd, Net.POLLIN);
+ 315                     n = tryRead(fd, b, off, len);
+ 316                 }
+ 317             }
+ 318             return n;
+ 319         } catch (SocketTimeoutException e) {
+ 320             throw e;
+ 321         } catch (ConnectionResetException e) {
+ 322             connectionReset = true;
+ 323             throw new SocketException(&quot;Connection reset&quot;);
+ 324         } catch (IOException ioe) {
+ 325             throw new SocketException(ioe.getMessage());
+ 326         } finally {
+ 327             endRead(n &gt; 0);
+ 328         }
+ 329     }
+ 330 
+ 331     /**
+ 332      * Reads bytes from the socket into the given byte array.
+ 333      * @return the number of bytes read or -1 at EOF
+ 334      * @throws IndexOutOfBoundsException if the bound checks fail
+ 335      * @throws SocketException if the socket is closed or a socket I/O error occurs
+ 336      * @throws SocketTimeoutException if the read timeout elapses
+ 337      */
+ 338     private int read(byte[] b, int off, int len) throws IOException {
+ 339         Objects.checkFromIndexSize(off, len, b.length);
+ 340         if (len == 0) {
+ 341             return 0;
+ 342         } else {
+ 343             readLock.lock();
+ 344             try {
+ 345                 // emulate legacy behavior to return -1, even if socket is closed
+ 346                 if (readEOF)
+ 347                     return -1;
+ 348                 // read up to MAX_BUFFER_SIZE bytes
+ 349                 int size = Math.min(len, MAX_BUFFER_SIZE);
+ 350                 int n = implRead(b, off, size);
+ 351                 if (n == -1)
+ 352                     readEOF = true;
+ 353                 return n;
+ 354             } finally {
+ 355                 readLock.unlock();
+ 356             }
+ 357         }
+ 358     }
+ 359 
+ 360     /**
+ 361      * Marks the beginning of a write operation that might block.
+ 362      * @throws SocketException if the socket is closed or not connected
+ 363      */
+ 364     private FileDescriptor beginWrite() throws SocketException {
+ 365         synchronized (stateLock) {
+ 366             ensureOpenAndConnected();
+ 367             writerThread = NativeThread.current();
+ 368             return fd;
+ 369         }
+ 370     }
+ 371 
+ 372     /**
+ 373      * Marks the end of a write operation that may have blocked.
+ 374      * @throws SocketException is the socket is closed
+ 375      */
+ 376     private void endWrite(boolean completed) throws SocketException {
+ 377         synchronized (stateLock) {
+ 378             writerThread = 0;
+ 379             int state = this.state;
+ 380             if (state == ST_CLOSING)
+ 381                 tryFinishClose();
+ 382             if (!completed &amp;&amp; state &gt;= ST_CLOSING)
+ 383                 throw new SocketException(&quot;Socket closed&quot;);
+ 384         }
+ 385     }
+ 386 
+ 387     /**
+ 388      * Attempts to write a sequence of bytes to the socket from the given
+ 389      * byte array.
+ 390      */
+ 391     private int tryWrite(FileDescriptor fd, byte[] b, int off, int len)
+ 392         throws IOException
+ 393     {
+ 394         ByteBuffer src = Util.getTemporaryDirectBuffer(len);
+ 395         assert src.position() == 0;
+ 396         try {
+ 397             src.put(b, off, len);
+ 398             return nd.write(fd, ((DirectBuffer)src).address(), len);
+ 399         } finally {
+ 400             Util.offerFirstTemporaryDirectBuffer(src);
+ 401         }
+ 402     }
+ 403 
+ 404     /**
+ 405      * Writes a sequence of bytes to the socket from the given byte array.
+ 406      * @return the number of bytes written
+ 407      * @throws SocketException if the socket is closed or a socket I/O error occurs
+ 408      */
+ 409     private int implWrite(byte[] b, int off, int len) throws IOException {
+ 410         int n = 0;
+ 411         FileDescriptor fd = beginWrite();
+ 412         try {
+ 413             n = tryWrite(fd, b, off, len);
+ 414             while (IOStatus.okayToRetry(n) &amp;&amp; isOpen()) {
+ 415                 park(fd, Net.POLLOUT);
+ 416                 n = tryWrite(fd, b, off, len);
+ 417             }
+ 418             return n;
+ 419         } catch (IOException ioe) {
+ 420             throw new SocketException(ioe.getMessage());
+ 421         } finally {
+ 422             endWrite(n &gt; 0);
+ 423         }
+ 424     }
+ 425 
+ 426     /**
+ 427      * Writes a sequence of bytes to the socket from the given byte array.
+ 428      * @throws SocketException if the socket is closed or a socket I/O error occurs
+ 429      */
+ 430     private void write(byte[] b, int off, int len) throws IOException {
+ 431         Objects.checkFromIndexSize(off, len, b.length);
+ 432         if (len &gt; 0) {
+ 433             writeLock.lock();
+ 434             try {
+ 435                 int pos = off;
+ 436                 int end = off + len;
+ 437                 while (pos &lt; end) {
+ 438                     // write up to MAX_BUFFER_SIZE bytes
+ 439                     int size = Math.min((end - pos), MAX_BUFFER_SIZE);
+ 440                     int n = implWrite(b, pos, size);
+ 441                     pos += n;
+ 442                 }
+ 443             } finally {
+ 444                 writeLock.unlock();
+ 445             }
+ 446         }
+ 447     }
+ 448 
+ 449     /**
+ 450      * Creates the socket.
+ 451      * @param stream {@code true} for a streams socket
+ 452      */
+ 453     @Override
+ 454     protected void create(boolean stream) throws IOException {
+ 455         synchronized (stateLock) {
+ 456             if (state != ST_NEW)
+ 457                 throw new IOException(&quot;Already created&quot;);
+ 458             if (!stream)
+ 459                 ResourceManager.beforeUdpCreate();
+ 460             FileDescriptor fd;
+ 461             try {
+ 462                 if (server) {
+ 463                     assert stream;
+ 464                     fd = Net.serverSocket(true);
+ 465                 } else {
+ 466                     fd = Net.socket(stream);
+ 467                 }
+ 468             } catch (IOException ioe) {
+ 469                 if (!stream)
+ 470                     ResourceManager.afterUdpClose();
+ 471                 throw ioe;
+ 472             }
+ 473             Runnable closer = closerFor(fd, stream);
+ 474             this.fd = fd;
+ 475             this.stream = stream;
+ 476             this.cleaner = CleanerFactory.cleaner().register(this, closer);
+ 477             this.state = ST_UNCONNECTED;
+ 478         }
+ 479     }
+ 480 
+ 481     /**
+ 482      * Marks the beginning of a connect operation that might block.
+ 483      * @throws SocketException if the socket is closed or already connected
+ 484      */
+ 485     private FileDescriptor beginConnect(InetAddress address, int port)
+ 486         throws IOException
+ 487     {
+ 488         synchronized (stateLock) {
+ 489             int state = this.state;
+ 490             if (state != ST_UNCONNECTED) {
+ 491                 if (state == ST_NEW)
+ 492                     throw new SocketException(&quot;Not created&quot;);
+ 493                 if (state == ST_CONNECTING)
+ 494                     throw new SocketException(&quot;Connection in progress&quot;);
+ 495                 if (state == ST_CONNECTED)
+ 496                     throw new SocketException(&quot;Already connected&quot;);
+ 497                 if (state &gt;= ST_CLOSING)
+ 498                     throw new SocketException(&quot;Socket closed&quot;);
+ 499                 assert false;
+ 500             }
+ 501             this.state = ST_CONNECTING;
+ 502 
+ 503             // invoke beforeTcpConnect hook if not already bound
+ 504             if (localport == 0) {
+ 505                 NetHooks.beforeTcpConnect(fd, address, port);
+ 506             }
+ 507 
+ 508             // save the remote address/port
+ 509             this.address = address;
+ 510             this.port = port;
+ 511 
+ 512             readerThread = NativeThread.current();
+ 513             return fd;
+ 514         }
+ 515     }
+ 516 
+ 517     /**
+ 518      * Marks the end of a connect operation that may have blocked.
+ 519      * @throws SocketException is the socket is closed
+ 520      */
+ 521     private void endConnect(FileDescriptor fd, boolean completed) throws IOException {
+ 522         synchronized (stateLock) {
+ 523             readerThread = 0;
+ 524             int state = this.state;
+ 525             if (state == ST_CLOSING)
+ 526                 tryFinishClose();
+ 527             if (completed &amp;&amp; state == ST_CONNECTING) {
+ 528                 this.state = ST_CONNECTED;
+ 529                 localport = Net.localAddress(fd).getPort();
+ 530             } else if (!completed &amp;&amp; state &gt;= ST_CLOSING) {
+ 531                 throw new SocketException(&quot;Socket closed&quot;);
+ 532             }
+ 533         }
+ 534     }
+ 535 
+ 536     /**
+ 537      * Waits for a connection attempt to finish with a timeout
+ 538      * @throws SocketTimeoutException if the connect timeout elapses
+ 539      */
+ 540     private boolean timedFinishConnect(FileDescriptor fd, long nanos) throws IOException {
+ 541         long startNanos = System.nanoTime();
+ 542         boolean polled = Net.pollConnectNow(fd);
+ 543         while (!polled &amp;&amp; isOpen()) {
+ 544             long remainingNanos = nanos - (System.nanoTime() - startNanos);
+ 545             if (remainingNanos &lt;= 0) {
+ 546                 throw new SocketTimeoutException(&quot;Connect timed out&quot;);
+ 547             }
+ 548             park(fd, Net.POLLOUT, remainingNanos);
+ 549             polled = Net.pollConnectNow(fd);
+ 550         }
+ 551         return polled &amp;&amp; isOpen();
+ 552     }
+ 553 
+ 554     /**
+ 555      * Attempts to establish a connection to the given socket address with a
+ 556      * timeout. Closes the socket if connection cannot be established.
+ 557      * @throws IOException if the address is not a resolved InetSocketAddress or
+ 558      *         the connection cannot be established
+ 559      */
+ 560     @Override
+ 561     protected void connect(SocketAddress remote, int millis) throws IOException {
+ 562         // SocketImpl connect only specifies IOException
+ 563         if (!(remote instanceof InetSocketAddress))
+ 564             throw new IOException(&quot;Unsupported address type&quot;);
+ 565         InetSocketAddress isa = (InetSocketAddress) remote;
+ 566         if (isa.isUnresolved()) {
+ 567             throw new UnknownHostException(isa.getHostName());
+ 568         }
+ 569 
+ 570         InetAddress address = isa.getAddress();
+ 571         if (address.isAnyLocalAddress())
+ 572             address = InetAddress.getLocalHost();
+ 573         int port = isa.getPort();
+ 574 
+ 575         ReentrantLock connectLock = readLock;
+ 576         try {
+ 577             connectLock.lock();
+ 578             try {
+ 579                 boolean connected = false;
+ 580                 FileDescriptor fd = beginConnect(address, port);
+ 581                 try {
+ 582 
+ 583                     // configure socket to non-blocking mode when there is a timeout
+ 584                     if (millis &gt; 0) {
+ 585                         configureNonBlocking(fd);
+ 586                     }
+ 587 
+ 588                     int n = Net.connect(fd, address, port);
+ 589                     if (n &gt; 0) {
+ 590                         // connection established
+ 591                         connected = true;
+ 592                     } else {
+ 593                         assert IOStatus.okayToRetry(n);
+ 594                         if (millis &gt; 0) {
+ 595                             // finish connect with timeout
+ 596                             long nanos = MILLISECONDS.toNanos(millis);
+ 597                             connected = timedFinishConnect(fd, nanos);
+ 598                         } else {
+ 599                             // finish connect, no timeout
+ 600                             boolean polled = false;
+ 601                             while (!polled &amp;&amp; isOpen()) {
+ 602                                 park(fd, Net.POLLOUT);
+ 603                                 polled = Net.pollConnectNow(fd);
+ 604                             }
+ 605                             connected = polled &amp;&amp; isOpen();
+ 606                         }
+ 607                     }
+ 608 
+ 609                     // restore socket to blocking mode
+ 610                     if (connected &amp;&amp; millis &gt; 0) {
+ 611                         configureBlocking(fd);
+ 612                     }
+ 613 
+ 614                 } finally {
+ 615                     endConnect(fd, connected);
+ 616                 }
+ 617             } finally {
+ 618                 connectLock.unlock();
+ 619             }
+ 620         } catch (IOException ioe) {
+ 621             close();
+ 622             throw SocketExceptions.of(ioe, isa);
+ 623         }
+ 624     }
+ 625 
+ 626     @Override
+ 627     protected void connect(String host, int port) throws IOException {
+ 628         connect(new InetSocketAddress(host, port), 0);
+ 629     }
+ 630 
+ 631     @Override
+ 632     protected void connect(InetAddress address, int port) throws IOException {
+ 633         connect(new InetSocketAddress(address, port), 0);
+ 634     }
+ 635 
+ 636     @Override
+ 637     protected void bind(InetAddress host, int port) throws IOException {
+ 638         synchronized (stateLock) {
+ 639             ensureOpen();
+ 640             if (localport != 0)
+ 641                 throw new SocketException(&quot;Already bound&quot;);
+ 642             NetHooks.beforeTcpBind(fd, host, port);
+ 643             Net.bind(fd, host, port);
+ 644             // set the address field to the given host address to keep
+ 645             // compatibility with PlainSocketImpl. When binding to 0.0.0.0
+ 646             // then the actual local address will be ::0 when IPv6 is enabled.
+ 647             address = host;
+ 648             localport = Net.localAddress(fd).getPort();
+ 649         }
+ 650     }
+ 651 
+ 652     @Override
+ 653     protected void listen(int backlog) throws IOException {
+ 654         synchronized (stateLock) {
+ 655             ensureOpen();
+ 656             if (localport == 0)
+ 657                 throw new SocketException(&quot;Not bound&quot;);
+ 658             Net.listen(fd, backlog &lt; 1 ? 50 : backlog);
+ 659         }
+ 660     }
+ 661 
+ 662     /**
+ 663      * Marks the beginning of an accept operation that might block.
+ 664      * @throws SocketException if the socket is closed
+ 665      */
+ 666     private FileDescriptor beginAccept() throws SocketException {
+ 667         synchronized (stateLock) {
+ 668             ensureOpen();
+ 669             if (!stream)
+ 670                 throw new SocketException(&quot;Not a stream socket&quot;);
+ 671             if (localport == 0)
+ 672                 throw new SocketException(&quot;Not bound&quot;);
+ 673             readerThread = NativeThread.current();
+ 674             return fd;
+ 675         }
+ 676     }
+ 677 
+ 678     /**
+ 679      * Marks the end of an accept operation that may have blocked.
+ 680      * @throws SocketException is the socket is closed
+ 681      */
+ 682     private void endAccept(boolean completed) throws SocketException {
+ 683         synchronized (stateLock) {
+ 684             int state = this.state;
+ 685             readerThread = 0;
+ 686             if (state == ST_CLOSING)
+ 687                 tryFinishClose();
+ 688             if (!completed &amp;&amp; state &gt;= ST_CLOSING)
+ 689                 throw new SocketException(&quot;Socket closed&quot;);
+ 690         }
+ 691     }
+ 692 
+ 693     /**
+ 694      * Accepts a new connection with a timeout.
+ 695      * @throws SocketTimeoutException if the accept timeout elapses
+ 696      */
+ 697     private int timedAccept(FileDescriptor fd,
+ 698                             FileDescriptor newfd,
+ 699                             InetSocketAddress[] isaa,
+ 700                             long nanos)
+ 701         throws IOException
+ 702     {
+ 703         long startNanos = System.nanoTime();
+ 704         int n = Net.accept(fd, newfd, isaa);
+ 705         while (n == IOStatus.UNAVAILABLE &amp;&amp; isOpen()) {
+ 706             long remainingNanos = nanos - (System.nanoTime() - startNanos);
+ 707             if (remainingNanos &lt;= 0) {
+ 708                 throw new SocketTimeoutException(&quot;Accept timed out&quot;);
+ 709             }
+ 710             park(fd, Net.POLLIN, remainingNanos);
+ 711             n = Net.accept(fd, newfd, isaa);
+ 712         }
+ 713         return n;
+ 714     }
+ 715 
+ 716     /**
+ 717      * Accepts a new connection so that the given SocketImpl is connected to
+ 718      * the peer. The SocketImpl must be a newly created NioSocketImpl.
+ 719      */
+ 720     @Override
+ 721     protected void accept(SocketImpl si) throws IOException {
+ 722         NioSocketImpl nsi = (NioSocketImpl) si;
+ 723         if (nsi.state != ST_NEW)
+ 724             throw new SocketException(&quot;Not a newly created SocketImpl&quot;);
+ 725 
+ 726         FileDescriptor newfd = new FileDescriptor();
+ 727         InetSocketAddress[] isaa = new InetSocketAddress[1];
+ 728 
+ 729         // acquire the lock, adjusting the timeout for cases where several
+ 730         // threads are accepting connections and there is a timeout set
+ 731         ReentrantLock acceptLock = readLock;
+ 732         int timeout = this.timeout;
+ 733         long remainingNanos = 0;
+ 734         if (timeout &gt; 0) {
+ 735             remainingNanos = tryLock(acceptLock, timeout, MILLISECONDS);
+ 736             if (remainingNanos &lt;= 0) {
+ 737                 assert !acceptLock.isHeldByCurrentThread();
+ 738                 throw new SocketTimeoutException(&quot;Accept timed out&quot;);
+ 739             }
+ 740         } else {
+ 741             acceptLock.lock();
+ 742         }
+ 743 
+ 744         // accept a connection
+ 745         try {
+ 746             int n = 0;
+ 747             FileDescriptor fd = beginAccept();
+ 748             try {
+ 749                 if (remainingNanos &gt; 0) {
+ 750                     // accept with timeout
+ 751                     configureNonBlocking(fd);
+ 752                     n = timedAccept(fd, newfd, isaa, remainingNanos);
+ 753                 } else {
+ 754                     // accept, no timeout
+ 755                     n = Net.accept(fd, newfd, isaa);
+ 756                     while (IOStatus.okayToRetry(n) &amp;&amp; isOpen()) {
+ 757                         park(fd, Net.POLLIN);
+ 758                         n = Net.accept(fd, newfd, isaa);
+ 759                     }
+ 760                 }
+ 761             } finally {
+ 762                 endAccept(n &gt; 0);
+ 763                 assert IOStatus.check(n);
+ 764             }
+ 765         } finally {
+ 766             acceptLock.unlock();
+ 767         }
+ 768 
+ 769         // get local address and configure accepted socket to blocking mode
+ 770         InetSocketAddress localAddress;
+ 771         try {
+ 772             localAddress = Net.localAddress(newfd);
+ 773             IOUtil.configureBlocking(newfd, true);
+ 774         } catch (IOException ioe) {
+ 775             nd.close(newfd);
+ 776             throw ioe;
+ 777         }
+ 778 
+ 779         // set the fields
+ 780         Runnable closer = closerFor(newfd, true);
+ 781         synchronized (nsi.stateLock) {
+ 782             nsi.fd = newfd;
+ 783             nsi.stream = true;
+ 784             nsi.cleaner = CleanerFactory.cleaner().register(nsi, closer);
+ 785             nsi.localport = localAddress.getPort();
+ 786             nsi.address = isaa[0].getAddress();
+ 787             nsi.port = isaa[0].getPort();
+ 788             nsi.state = ST_CONNECTED;
+ 789         }
+ 790     }
+ 791 
+ 792     @Override
+ 793     protected InputStream getInputStream() {
+ 794         return new InputStream() {
+ 795             @Override
+ 796             public int read() throws IOException {
+ 797                 byte[] a = new byte[1];
+ 798                 int n = read(a, 0, 1);
+ 799                 return (n &gt; 0) ? (a[0] &amp; 0xff) : -1;
+ 800             }
+ 801             @Override
+ 802             public int read(byte[] b, int off, int len) throws IOException {
+ 803                 return NioSocketImpl.this.read(b, off, len);
+ 804             }
+ 805             @Override
+ 806             public int available() throws IOException {
+ 807                 return NioSocketImpl.this.available();
+ 808             }
+ 809             @Override
+ 810             public void close() throws IOException {
+ 811                 NioSocketImpl.this.close();
+ 812             }
+ 813         };
+ 814     }
+ 815 
+ 816     @Override
+ 817     protected OutputStream getOutputStream() {
+ 818         return new OutputStream() {
+ 819             @Override
+ 820             public void write(int b) throws IOException {
+ 821                 byte[] a = new byte[]{(byte) b};
+ 822                 write(a, 0, 1);
+ 823             }
+ 824             @Override
+ 825             public void write(byte[] b, int off, int len) throws IOException {
+ 826                 NioSocketImpl.this.write(b, off, len);
+ 827             }
+ 828             @Override
+ 829             public void close() throws IOException {
+ 830                 NioSocketImpl.this.close();
+ 831             }
+ 832         };
+ 833     }
+ 834 
+ 835     @Override
+ 836     protected int available() throws IOException {
+ 837         synchronized (stateLock) {
+ 838             ensureOpenAndConnected();
+ 839             if (isInputClosed) {
+ 840                 return 0;
+ 841             } else {
+ 842                 return Net.available(fd);
+ 843             }
+ 844         }
+ 845     }
+ 846 
+ 847     /**
+ 848      * Closes the socket if there are no I/O operations in progress.
+ 849      */
+ 850     private boolean tryClose() throws IOException {
+ 851         assert Thread.holdsLock(stateLock) &amp;&amp; state == ST_CLOSING;
+ 852         if (readerThread == 0 &amp;&amp; writerThread == 0) {
+ 853             try {
+ 854                 cleaner.clean();
+ 855             } catch (UncheckedIOException ioe) {
+ 856                 throw ioe.getCause();
+ 857             } finally {
+ 858                 state = ST_CLOSED;
+ 859             }
+ 860             return true;
+ 861         } else {
+ 862             return false;
+ 863         }
+ 864     }
+ 865 
+ 866     /**
+ 867      * Invokes tryClose to attempt to close the socket.
+ 868      *
+ 869      * This method is used for deferred closing by I/O operations.
+ 870      */
+ 871     private void tryFinishClose() {
+ 872         try {
+ 873             tryClose();
+ 874         } catch (IOException ignore) { }
+ 875     }
+ 876 
+ 877     /**
+ 878      * Closes the socket. If there are I/O operations in progress then the
+ 879      * socket is pre-closed and the threads are signalled. The socket will be
+ 880      * closed when the last I/O operation aborts.
+ 881      */
+ 882     @Override
+ 883     protected void close() throws IOException {
+ 884         synchronized (stateLock) {
+ 885             int state = this.state;
+ 886             if (state &gt;= ST_CLOSING)
+ 887                 return;
+ 888             if (state == ST_NEW) {
+ 889                 // stillborn
+ 890                 this.state = ST_CLOSED;
+ 891                 return;
+ 892             }
+ 893             this.state = ST_CLOSING;
+ 894 
+ 895             // shutdown output when linger interval not set to 0
+ 896             try {
+ 897                 var SO_LINGER = StandardSocketOptions.SO_LINGER;
+ 898                 if ((int) Net.getSocketOption(fd, SO_LINGER) != 0) {
+ 899                     Net.shutdown(fd, Net.SHUT_WR);
+ 900                 }
+ 901             } catch (IOException ignore) { }
+ 902 
+ 903             // attempt to close the socket. If there are I/O operations in progress
+ 904             // then the socket is pre-closed and the thread(s) signalled. The
+ 905             // last thread will close the file descriptor.
+ 906             if (!tryClose()) {
+ 907                 nd.preClose(fd);
+ 908                 long reader = readerThread;
+ 909                 if (reader != 0)
+ 910                     NativeThread.signal(reader);
+ 911                 long writer = writerThread;
+ 912                 if (writer != 0)
+ 913                     NativeThread.signal(writer);
+ 914             }
+ 915         }
+ 916     }
+ 917 
+ 918     // the socket options supported by client and server sockets
+ 919     private static volatile Set&lt;SocketOption&lt;?&gt;&gt; clientSocketOptions;
+ 920     private static volatile Set&lt;SocketOption&lt;?&gt;&gt; serverSocketOptions;
+ 921 
+ 922     @Override
+ 923     protected Set&lt;SocketOption&lt;?&gt;&gt; supportedOptions() {
+ 924         Set&lt;SocketOption&lt;?&gt;&gt; options = (server) ? serverSocketOptions : clientSocketOptions;
+ 925         if (options == null) {
+ 926             options = new HashSet&lt;&gt;();
+ 927             options.add(StandardSocketOptions.SO_RCVBUF);
+ 928             options.add(StandardSocketOptions.SO_REUSEADDR);
+ 929             if (server) {
+ 930                 // IP_TOS added for server socket to maintain compatibility
+ 931                 options.add(StandardSocketOptions.IP_TOS);
+ 932                 options.addAll(ExtendedSocketOptions.serverSocketOptions());
+ 933             } else {
+ 934                 options.add(StandardSocketOptions.IP_TOS);
+ 935                 options.add(StandardSocketOptions.SO_KEEPALIVE);
+ 936                 options.add(StandardSocketOptions.SO_SNDBUF);
+ 937                 options.add(StandardSocketOptions.SO_LINGER);
+ 938                 options.add(StandardSocketOptions.TCP_NODELAY);
+ 939                 options.addAll(ExtendedSocketOptions.clientSocketOptions());
+ 940             }
+ 941             if (Net.isReusePortAvailable())
+ 942                 options.add(StandardSocketOptions.SO_REUSEPORT);
+ 943             options = Collections.unmodifiableSet(options);
+ 944             if (server) {
+ 945                 serverSocketOptions = options;
+ 946             } else {
+ 947                 clientSocketOptions = options;
+ 948             }
+ 949         }
+ 950         return options;
+ 951     }
+ 952 
+ 953     @Override
+ 954     protected &lt;T&gt; void setOption(SocketOption&lt;T&gt; opt, T value) throws IOException {
+ 955         if (!supportedOptions().contains(opt))
+ 956             throw new UnsupportedOperationException(&quot;&#39;&quot; + opt + &quot;&#39; not supported&quot;);
+ 957         if (!opt.type().isInstance(value))
+ 958             throw new IllegalArgumentException(&quot;Invalid value &#39;&quot; + value + &quot;&#39;&quot;);
+ 959         synchronized (stateLock) {
+ 960             ensureOpen();
+ 961             if (opt == StandardSocketOptions.IP_TOS) {
+ 962                 // maps to IP_TOS or IPV6_TCLASS
+ 963                 Net.setSocketOption(fd, family(), opt, value);
+ 964             } else if (opt == StandardSocketOptions.SO_REUSEADDR) {
+ 965                 boolean b = (boolean) value;
+ 966                 if (Net.useExclusiveBind()) {
+ 967                     isReuseAddress = b;
+ 968                 } else {
+ 969                     Net.setSocketOption(fd, opt, b);
+ 970                 }
+ 971             } else {
+ 972                 // option does not need special handling
+ 973                 Net.setSocketOption(fd, opt, value);
+ 974             }
+ 975         }
+ 976     }
+ 977 
+ 978     @SuppressWarnings(&quot;unchecked&quot;)
+ 979     protected &lt;T&gt; T getOption(SocketOption&lt;T&gt; opt) throws IOException {
+ 980         if (!supportedOptions().contains(opt))
+ 981             throw new UnsupportedOperationException(&quot;&#39;&quot; + opt + &quot;&#39; not supported&quot;);
+ 982         synchronized (stateLock) {
+ 983             ensureOpen();
+ 984             if (opt == StandardSocketOptions.IP_TOS) {
+ 985                 return (T) Net.getSocketOption(fd, family(), opt);
+ 986             } else if (opt == StandardSocketOptions.SO_REUSEADDR) {
+ 987                 if (Net.useExclusiveBind()) {
+ 988                     return (T) Boolean.valueOf(isReuseAddress);
+ 989                 } else {
+ 990                     return (T) Net.getSocketOption(fd, opt);
+ 991                 }
+ 992             } else {
+ 993                 // option does not need special handling
+ 994                 return (T) Net.getSocketOption(fd, opt);
+ 995             }
+ 996         }
+ 997     }
+ 998 
+ 999     private boolean booleanValue(Object value, String desc) throws SocketException {
+1000         if (!(value instanceof Boolean))
+1001             throw new SocketException(&quot;Bad value for &quot; + desc);
+1002         return (boolean) value;
+1003     }
+1004 
+1005     private int intValue(Object value, String desc) throws SocketException {
+1006         if (!(value instanceof Integer))
+1007             throw new SocketException(&quot;Bad value for &quot; + desc);
+1008         return (int) value;
+1009     }
+1010 
+1011     @Override
+1012     public void setOption(int opt, Object value) throws SocketException {
+1013         synchronized (stateLock) {
+1014             ensureOpen();
+1015             try {
+1016                 switch (opt) {
+1017                 case SO_LINGER: {
+1018                     // the value is &quot;false&quot; to disable, or linger interval to enable
+1019                     int i;
+1020                     if (value instanceof Boolean &amp;&amp; ((boolean) value) == false) {
+1021                         i = -1;
+1022                     } else {
+1023                         i = intValue(value, &quot;SO_LINGER&quot;);
+1024                     }
+1025                     Net.setSocketOption(fd, StandardSocketOptions.SO_LINGER, i);
+1026                     break;
+1027                 }
+1028                 case SO_TIMEOUT: {
+1029                     int i = intValue(value, &quot;SO_TIMEOUT&quot;);
+1030                     if (i &lt; 0)
+1031                         throw new IllegalArgumentException(&quot;timeout &lt; 0&quot;);
+1032                     timeout = i;
+1033                     break;
+1034                 }
+1035                 case IP_TOS: {
+1036                     int i = intValue(value, &quot;IP_TOS&quot;);
+1037                     Net.setSocketOption(fd, family(), StandardSocketOptions.IP_TOS, i);
+1038                     break;
+1039                 }
+1040                 case TCP_NODELAY: {
+1041                     boolean b = booleanValue(value, &quot;TCP_NODELAY&quot;);
+1042                     Net.setSocketOption(fd, StandardSocketOptions.TCP_NODELAY, b);
+1043                     break;
+1044                 }
+1045                 case SO_SNDBUF: {
+1046                     int i = intValue(value, &quot;SO_SNDBUF&quot;);
+1047                     if (i &lt;= 0)
+1048                         throw new SocketException(&quot;SO_SNDBUF &lt;= 0&quot;);
+1049                     Net.setSocketOption(fd, StandardSocketOptions.SO_SNDBUF, i);
+1050                     break;
+1051                 }
+1052                 case SO_RCVBUF: {
+1053                     int i = intValue(value, &quot;SO_RCVBUF&quot;);
+1054                     if (i &lt;= 0)
+1055                         throw new SocketException(&quot;SO_RCVBUF &lt;= 0&quot;);
+1056                     Net.setSocketOption(fd, StandardSocketOptions.SO_RCVBUF, i);
+1057                     break;
+1058                 }
+1059                 case SO_KEEPALIVE: {
+1060                     boolean b = booleanValue(value, &quot;SO_KEEPALIVE&quot;);
+1061                     Net.setSocketOption(fd, StandardSocketOptions.SO_KEEPALIVE, b);
+1062                     break;
+1063                 }
+1064                 case SO_OOBINLINE: {
+1065                     boolean b = booleanValue(value, &quot;SO_OOBINLINE&quot;);
+1066                     Net.setSocketOption(fd, ExtendedSocketOption.SO_OOBINLINE, b);
+1067                     break;
+1068                 }
+1069                 case SO_REUSEADDR: {
+1070                     boolean b = booleanValue(value, &quot;SO_REUSEADDR&quot;);
+1071                     if (Net.useExclusiveBind()) {
+1072                         isReuseAddress = b;
+1073                     } else {
+1074                         Net.setSocketOption(fd, StandardSocketOptions.SO_REUSEADDR, b);
+1075                     }
+1076                     break;
+1077                 }
+1078                 case SO_REUSEPORT: {
+1079                     if (!Net.isReusePortAvailable())
+1080                         throw new SocketException(&quot;SO_REUSEPORT not supported&quot;);
+1081                     boolean b = booleanValue(value, &quot;SO_REUSEPORT&quot;);
+1082                     Net.setSocketOption(fd, StandardSocketOptions.SO_REUSEPORT, b);
+1083                     break;
+1084                 }
+1085                 default:
+1086                     throw new SocketException(&quot;Unknown option &quot; + opt);
+1087                 }
+1088             } catch (SocketException e) {
+1089                 throw e;
+1090             } catch (IllegalArgumentException | IOException e) {
+1091                 throw new SocketException(e.getMessage());
+1092             }
+1093         }
+1094     }
+1095 
+1096     @Override
+1097     public Object getOption(int opt) throws SocketException {
+1098         synchronized (stateLock) {
+1099             ensureOpen();
+1100             try {
+1101                 switch (opt) {
+1102                 case SO_TIMEOUT:
+1103                     return timeout;
+1104                 case TCP_NODELAY:
+1105                     return Net.getSocketOption(fd, StandardSocketOptions.TCP_NODELAY);
+1106                 case SO_OOBINLINE:
+1107                     return Net.getSocketOption(fd, ExtendedSocketOption.SO_OOBINLINE);
+1108                 case SO_LINGER: {
+1109                     // return &quot;false&quot; when disabled, linger interval when enabled
+1110                     int i = (int) Net.getSocketOption(fd, StandardSocketOptions.SO_LINGER);
+1111                     if (i == -1) {
+1112                         return Boolean.FALSE;
+1113                     } else {
+1114                         return i;
+1115                     }
+1116                 }
+1117                 case SO_REUSEADDR:
+1118                     if (Net.useExclusiveBind()) {
+1119                         return isReuseAddress;
+1120                     } else {
+1121                         return Net.getSocketOption(fd, StandardSocketOptions.SO_REUSEADDR);
+1122                     }
+1123                 case SO_BINDADDR:
+1124                     return Net.localAddress(fd).getAddress();
+1125                 case SO_SNDBUF:
+1126                     return Net.getSocketOption(fd, StandardSocketOptions.SO_SNDBUF);
+1127                 case SO_RCVBUF:
+1128                     return Net.getSocketOption(fd, StandardSocketOptions.SO_RCVBUF);
+1129                 case IP_TOS:
+1130                     return Net.getSocketOption(fd, family(), StandardSocketOptions.IP_TOS);
+1131                 case SO_KEEPALIVE:
+1132                     return Net.getSocketOption(fd, StandardSocketOptions.SO_KEEPALIVE);
+1133                 case SO_REUSEPORT:
+1134                     if (!Net.isReusePortAvailable())
+1135                         throw new SocketException(&quot;SO_REUSEPORT not supported&quot;);
+1136                     return Net.getSocketOption(fd, StandardSocketOptions.SO_REUSEPORT);
+1137                 default:
+1138                     throw new SocketException(&quot;Unknown option &quot; + opt);
+1139                 }
+1140             } catch (SocketException e) {
+1141                 throw e;
+1142             } catch (IllegalArgumentException | IOException e) {
+1143                 throw new SocketException(e.getMessage());
+1144             }
+1145         }
+1146     }
+1147 
+1148     @Override
+1149     protected void shutdownInput() throws IOException {
+1150         synchronized (stateLock) {
+1151             ensureOpenAndConnected();
+1152             if (!isInputClosed) {
+1153                 Net.shutdown(fd, Net.SHUT_RD);
+1154                 isInputClosed = true;
+1155             }
+1156         }
+1157     }
+1158 
+1159     @Override
+1160     protected void shutdownOutput() throws IOException {
+1161         synchronized (stateLock) {
+1162             ensureOpenAndConnected();
+1163             if (!isOutputClosed) {
+1164                 Net.shutdown(fd, Net.SHUT_WR);
+1165                 isOutputClosed = true;
+1166             }
+1167         }
+1168     }
+1169 
+1170     @Override
+1171     protected boolean supportsUrgentData() {
+1172         return true;
+1173     }
+1174 
+1175     @Override
+1176     protected void sendUrgentData(int data) throws IOException {
+1177         writeLock.lock();
+1178         try {
+1179             int n = 0;
+1180             FileDescriptor fd = beginWrite();
+1181             try {
+1182                 do {
+1183                     n = Net.sendOOB(fd, (byte) data);
+1184                 } while (n == IOStatus.INTERRUPTED &amp;&amp; isOpen());
+1185                 if (n == IOStatus.UNAVAILABLE) {
+1186                     throw new SocketException(&quot;No buffer space available&quot;);
+1187                 }
+1188             } finally {
+1189                 endWrite(n &gt; 0);
+1190             }
+1191         } finally {
+1192             writeLock.unlock();
+1193         }
+1194     }
+1195 
+1196     /**
+1197      * Returns an action to close the given file descriptor.
+1198      */
+1199     private static Runnable closerFor(FileDescriptor fd, boolean stream) {
+1200         if (stream) {
+1201             return () -&gt; {
+1202                 try {
+1203                     nd.close(fd);
+1204                 } catch (IOException ioe) {
+1205                     throw new UncheckedIOException(ioe);
+1206                 }
+1207             };
+1208         } else {
+1209             return () -&gt; {
+1210                 try {
+1211                     nd.close(fd);
+1212                 } catch (IOException ioe) {
+1213                     throw new UncheckedIOException(ioe);
+1214                 } finally {
+1215                     // decrement
+1216                     ResourceManager.afterUdpClose();
+1217                 }
+1218             };
+1219         }
+1220     }
+1221 
+1222     /**
+1223      * Attempts to acquire the given lock within the given waiting time.
+1224      * @return the remaining time in nanoseconds when the lock is acquired, zero
+1225      *         or less if the lock was not acquired before the timeout expired
+1226      */
+1227     private static long tryLock(ReentrantLock lock, long timeout, TimeUnit unit) {
+1228         assert timeout &gt; 0;
+1229         boolean interrupted = false;
+1230         long nanos = NANOSECONDS.convert(timeout, unit);
+1231         long remainingNanos = nanos;
+1232         long startNanos = System.nanoTime();
+1233         boolean acquired = false;
+1234         while (!acquired &amp;&amp; (remainingNanos &gt; 0)) {
+1235             try {
+1236                 acquired = lock.tryLock(remainingNanos, NANOSECONDS);
+1237             } catch (InterruptedException e) {
+1238                 interrupted = true;
+1239             }
+1240             remainingNanos = nanos - (System.nanoTime() - startNanos);
+1241         }
+1242         if (acquired &amp;&amp; remainingNanos &lt;= 0L)
+1243             lock.unlock();  // release lock if timeout has expired
+1244         if (interrupted)
+1245             Thread.currentThread().interrupt();
+1246         return remainingNanos;
+1247     }
+1248 
+1249     /**
+1250      * Returns the socket protocol family.
+1251      */
+1252     private static ProtocolFamily family() {
+1253         if (Net.isIPv6Available()) {
+1254             return StandardProtocolFamily.INET6;
+1255         } else {
+1256             return StandardProtocolFamily.INET;
+1257         }
+1258     }
+1259 }
+    </pre>
+  </body>
+</html>
