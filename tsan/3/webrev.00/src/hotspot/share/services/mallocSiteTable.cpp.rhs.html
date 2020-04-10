@@ -1,0 +1,343 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Frames src/hotspot/share/services/mallocSiteTable.cpp</title>
+    <link rel="stylesheet" href="../../../../style.css" />
+    <script type="text/javascript" src="../../../../navigation.js"></script>
+  </head>
+<body onkeypress="keypress(event);">
+<a name="0"></a>
+<hr />
+<pre>  1 /*
+  2  * Copyright (c) 2014, 2019, Oracle and/or its affiliates. All rights reserved.
+  3  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  4  *
+  5  * This code is free software; you can redistribute it and/or modify it
+  6  * under the terms of the GNU General Public License version 2 only, as
+  7  * published by the Free Software Foundation.
+  8  *
+  9  * This code is distributed in the hope that it will be useful, but WITHOUT
+ 10  * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ 11  * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ 12  * version 2 for more details (a copy is included in the LICENSE file that
+ 13  * accompanied this code).
+ 14  *
+ 15  * You should have received a copy of the GNU General Public License version
+ 16  * 2 along with this work; if not, write to the Free Software Foundation,
+ 17  * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ 18  *
+ 19  * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ 20  * or visit www.oracle.com if you need additional information or have any
+ 21  * questions.
+ 22  *
+ 23  */
+ 24 #include &quot;precompiled.hpp&quot;
+ 25 
+ 26 
+ 27 #include &quot;memory/allocation.inline.hpp&quot;
+ 28 #include &quot;runtime/atomic.hpp&quot;
+ 29 #include &quot;services/mallocSiteTable.hpp&quot;
+ 30 
+ 31 // Malloc site hashtable buckets
+ 32 MallocSiteHashtableEntry*  MallocSiteTable::_table[MallocSiteTable::table_size];
+ 33 const NativeCallStack* MallocSiteTable::_hash_entry_allocation_stack = NULL;
+ 34 const MallocSiteHashtableEntry* MallocSiteTable::_hash_entry_allocation_site = NULL;
+ 35 
+ 36 // concurrent access counter
+ 37 volatile int MallocSiteTable::_access_count = 0;
+ 38 
+ 39 // Tracking hashtable contention
+ 40 NOT_PRODUCT(int MallocSiteTable::_peak_count = 0;)
+ 41 
+ 42 
+ 43 /*
+ 44  * Initialize malloc site table.
+ 45  * Hashtable entry is malloc&#39;d, so it can cause infinite recursion.
+ 46  * To avoid above problem, we pre-initialize a hash entry for
+ 47  * this allocation site.
+ 48  * The method is called during C runtime static variable initialization
+ 49  * time, it is in single-threaded mode from JVM perspective.
+ 50  */
+ 51 bool MallocSiteTable::initialize() {
+ 52   assert((size_t)table_size &lt;= MAX_MALLOCSITE_TABLE_SIZE, &quot;Hashtable overflow&quot;);
+ 53 
+ 54   // Fake the call stack for hashtable entry allocation
+ 55   assert(NMT_TrackingStackDepth &gt; 1, &quot;At least one tracking stack&quot;);
+ 56 
+ 57   // Create pseudo call stack for hashtable entry allocation
+ 58   address pc[3];
+ 59   if (NMT_TrackingStackDepth &gt;= 3) {
+ 60     uintx *fp = (uintx*)MallocSiteTable::allocation_at;
+ 61     // On ppc64, &#39;fp&#39; is a pointer to a function descriptor which is a struct  of
+ 62     // three native pointers where the first pointer is the real function address.
+ 63     // See: http://refspecs.linuxfoundation.org/ELF/ppc64/PPC-elf64abi-1.9.html#FUNC-DES
+ 64     pc[2] = (address)(fp PPC64_ONLY(BIG_ENDIAN_ONLY([0])));
+ 65   }
+ 66   if (NMT_TrackingStackDepth &gt;= 2) {
+ 67     uintx *fp = (uintx*)MallocSiteTable::lookup_or_add;
+ 68     pc[1] = (address)(fp PPC64_ONLY(BIG_ENDIAN_ONLY([0])));
+ 69   }
+ 70   uintx *fp = (uintx*)MallocSiteTable::new_entry;
+ 71   pc[0] = (address)(fp PPC64_ONLY(BIG_ENDIAN_ONLY([0])));
+ 72 
+ 73   static const NativeCallStack stack(pc, MIN2(((int)(sizeof(pc) / sizeof(address))), ((int)NMT_TrackingStackDepth)));
+ 74   static const MallocSiteHashtableEntry entry(stack, mtNMT);
+ 75 
+ 76   assert(_hash_entry_allocation_stack == NULL &amp;&amp;
+ 77          _hash_entry_allocation_site == NULL,
+ 78          &quot;Already initailized&quot;);
+ 79 
+ 80   _hash_entry_allocation_stack = &amp;stack;
+ 81   _hash_entry_allocation_site = &amp;entry;
+ 82 
+ 83   // Add the allocation site to hashtable.
+ 84   int index = hash_to_index(stack.hash());
+ 85   _table[index] = const_cast&lt;MallocSiteHashtableEntry*&gt;(&amp;entry);
+ 86 
+ 87   return true;
+ 88 }
+ 89 
+ 90 // Walks entries in the hashtable.
+ 91 // It stops walk if the walker returns false.
+ 92 bool MallocSiteTable::walk(MallocSiteWalker* walker) {
+ 93   MallocSiteHashtableEntry* head;
+ 94   for (int index = 0; index &lt; table_size; index ++) {
+ 95     head = _table[index];
+ 96     while (head != NULL) {
+ 97       if (!walker-&gt;do_malloc_site(head-&gt;peek())) {
+ 98         return false;
+ 99       }
+100       head = (MallocSiteHashtableEntry*)head-&gt;next();
+101     }
+102   }
+103   return true;
+104 }
+105 
+106 /*
+107  *  The hashtable does not have deletion policy on individual entry,
+108  *  and each linked list node is inserted via compare-and-swap,
+109  *  so each linked list is stable, the contention only happens
+110  *  at the end of linked list.
+111  *  This method should not return NULL under normal circumstance.
+112  *  If NULL is returned, it indicates:
+113  *    1. Out of memory, it cannot allocate new hash entry.
+114  *    2. Overflow hash bucket.
+115  *  Under any of above circumstances, caller should handle the situation.
+116  */
+117 MallocSite* MallocSiteTable::lookup_or_add(const NativeCallStack&amp; key, size_t* bucket_idx,
+118   size_t* pos_idx, MEMFLAGS flags) {
+119   assert(flags != mtNone, &quot;Should have a real memory type&quot;);
+120   unsigned int index = hash_to_index(key.hash());
+121   *bucket_idx = (size_t)index;
+122   *pos_idx = 0;
+123 
+124   // First entry for this hash bucket
+125   if (_table[index] == NULL) {
+126     MallocSiteHashtableEntry* entry = new_entry(key, flags);
+127     // OOM check
+128     if (entry == NULL) return NULL;
+129 
+130     // swap in the head
+<a name="1" id="anc1"></a><span class="line-modified">131     if (Atomic::replace_if_null(&amp;_table[index], entry)) {</span>
+132       return entry-&gt;data();
+133     }
+134 
+135     delete entry;
+136   }
+137 
+138   MallocSiteHashtableEntry* head = _table[index];
+139   while (head != NULL &amp;&amp; (*pos_idx) &lt;= MAX_BUCKET_LENGTH) {
+140     MallocSite* site = head-&gt;data();
+141     if (site-&gt;flag() == flags &amp;&amp; site-&gt;equals(key)) {
+142       return head-&gt;data();
+143     }
+144 
+145     if (head-&gt;next() == NULL &amp;&amp; (*pos_idx) &lt; MAX_BUCKET_LENGTH) {
+146       MallocSiteHashtableEntry* entry = new_entry(key, flags);
+147       // OOM check
+148       if (entry == NULL) return NULL;
+149       if (head-&gt;atomic_insert(entry)) {
+150         (*pos_idx) ++;
+151         return entry-&gt;data();
+152       }
+153       // contended, other thread won
+154       delete entry;
+155     }
+156     head = (MallocSiteHashtableEntry*)head-&gt;next();
+157     (*pos_idx) ++;
+158   }
+159   return NULL;
+160 }
+161 
+162 // Access malloc site
+163 MallocSite* MallocSiteTable::malloc_site(size_t bucket_idx, size_t pos_idx) {
+164   assert(bucket_idx &lt; table_size, &quot;Invalid bucket index&quot;);
+165   MallocSiteHashtableEntry* head = _table[bucket_idx];
+166   for (size_t index = 0;
+167        index &lt; pos_idx &amp;&amp; head != NULL;
+168        index++, head = (MallocSiteHashtableEntry*)head-&gt;next()) {}
+169   assert(head != NULL, &quot;Invalid position index&quot;);
+170   return head-&gt;data();
+171 }
+172 
+173 // Allocates MallocSiteHashtableEntry object. Special call stack
+174 // (pre-installed allocation site) has to be used to avoid infinite
+175 // recursion.
+176 MallocSiteHashtableEntry* MallocSiteTable::new_entry(const NativeCallStack&amp; key, MEMFLAGS flags) {
+177   void* p = AllocateHeap(sizeof(MallocSiteHashtableEntry), mtNMT,
+178     *hash_entry_allocation_stack(), AllocFailStrategy::RETURN_NULL);
+179   return ::new (p) MallocSiteHashtableEntry(key, flags);
+180 }
+181 
+182 void MallocSiteTable::reset() {
+183   for (int index = 0; index &lt; table_size; index ++) {
+184     MallocSiteHashtableEntry* head = _table[index];
+185     _table[index] = NULL;
+186     delete_linked_list(head);
+187   }
+188 
+189   _hash_entry_allocation_stack = NULL;
+190   _hash_entry_allocation_site = NULL;
+191 }
+192 
+193 void MallocSiteTable::delete_linked_list(MallocSiteHashtableEntry* head) {
+194   MallocSiteHashtableEntry* p;
+195   while (head != NULL) {
+196     p = head;
+197     head = (MallocSiteHashtableEntry*)head-&gt;next();
+198     if (p != hash_entry_allocation_site()) {
+199       delete p;
+200     }
+201   }
+202 }
+203 
+204 void MallocSiteTable::shutdown() {
+205   AccessLock locker(&amp;_access_count);
+206   locker.exclusiveLock();
+207   reset();
+208 }
+209 
+210 bool MallocSiteTable::walk_malloc_site(MallocSiteWalker* walker) {
+211   assert(walker != NULL, &quot;NuLL walker&quot;);
+212   AccessLock locker(&amp;_access_count);
+213   if (locker.sharedLock()) {
+214     NOT_PRODUCT(_peak_count = MAX2(_peak_count, _access_count);)
+215     return walk(walker);
+216   }
+217   return false;
+218 }
+219 
+220 
+221 void MallocSiteTable::AccessLock::exclusiveLock() {
+222   int target;
+223   int val;
+224 
+225   assert(_lock_state != ExclusiveLock, &quot;Can only call once&quot;);
+226   assert(*_lock &gt;= 0, &quot;Can not content exclusive lock&quot;);
+227 
+228   // make counter negative to block out shared locks
+229   do {
+230     val = *_lock;
+231     target = _MAGIC_ + *_lock;
+<a name="2" id="anc2"></a><span class="line-modified">232   } while (Atomic::cmpxchg(_lock, val, target) != val);</span>
+233 
+234   // wait for all readers to exit
+235   while (*_lock != _MAGIC_) {
+236 #ifdef _WINDOWS
+237     os::naked_short_sleep(1);
+238 #else
+239     os::naked_yield();
+240 #endif
+241   }
+242   _lock_state = ExclusiveLock;
+243 }
+244 
+245 bool MallocSiteHashtableEntry::atomic_insert(MallocSiteHashtableEntry* entry) {
+<a name="3" id="anc3"></a><span class="line-modified">246   return Atomic::replace_if_null(&amp;_next, entry);</span>
+247 }
+<a name="4" id="anc4"></a><b style="font-size: large; color: red">--- EOF ---</b>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+</pre>
+<input id="eof" value="4" type="hidden" />
+</body>
+</html>

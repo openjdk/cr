@@ -1,0 +1,512 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Old src/hotspot/share/utilities/concurrentHashTable.hpp</title>
+    <link rel="stylesheet" href="../../../../style.css" />
+  </head>
+  <body>
+    <pre>
+  1 /*
+  2  * Copyright (c) 2018, 2019, Oracle and/or its affiliates. All rights reserved.
+  3  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  4  *
+  5  * This code is free software; you can redistribute it and/or modify it
+  6  * under the terms of the GNU General Public License version 2 only, as
+  7  * published by the Free Software Foundation.
+  8  *
+  9  * This code is distributed in the hope that it will be useful, but WITHOUT
+ 10  * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ 11  * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ 12  * version 2 for more details (a copy is included in the LICENSE file that
+ 13  * accompanied this code).
+ 14  *
+ 15  * You should have received a copy of the GNU General Public License version
+ 16  * 2 along with this work; if not, write to the Free Software Foundation,
+ 17  * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ 18  *
+ 19  * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ 20  * or visit www.oracle.com if you need additional information or have any
+ 21  * questions.
+ 22  *
+ 23  */
+ 24 
+ 25 #ifndef SHARE_UTILITIES_CONCURRENTHASHTABLE_HPP
+ 26 #define SHARE_UTILITIES_CONCURRENTHASHTABLE_HPP
+ 27 
+ 28 #include &quot;memory/allocation.hpp&quot;
+ 29 #include &quot;utilities/globalCounter.hpp&quot;
+ 30 #include &quot;utilities/globalDefinitions.hpp&quot;
+ 31 
+ 32 // A mostly concurrent-hash-table where the read-side is wait-free, inserts are
+ 33 // CAS and deletes mutual exclude each other on per bucket-basis. VALUE is the
+ 34 // type kept inside each Node and CONFIG contains hash and allocation methods.
+ 35 // A CALLBACK_FUNC and LOOKUP_FUNC needs to be provided for get and insert.
+ 36 
+ 37 class Thread;
+ 38 class Mutex;
+ 39 
+ 40 template &lt;typename VALUE, typename CONFIG, MEMFLAGS F&gt;
+ 41 class ConcurrentHashTable : public CHeapObj&lt;F&gt; {
+ 42  private:
+ 43   // This is the internal node structure.
+ 44   // Only constructed with placement new from memory allocated with MEMFLAGS of
+ 45   // the InternalTable or user-defined memory.
+ 46   class Node {
+ 47    private:
+ 48     Node * volatile _next;
+ 49     VALUE _value;
+ 50    public:
+ 51     Node(const VALUE&amp; value, Node* next = NULL)
+ 52       : _next(next), _value(value) {
+ 53       assert((((uintptr_t)this) &amp; ((uintptr_t)0x3)) == 0,
+ 54              &quot;Must 16 bit aligned.&quot;);
+ 55     }
+ 56 
+ 57     Node* next() const;
+ 58     void set_next(Node* node)         { _next = node; }
+ 59     Node* const volatile * next_ptr() { return &amp;_next; }
+ 60 
+ 61     VALUE* value()                    { return &amp;_value; }
+ 62 
+ 63     // Creates a node.
+ 64     static Node* create_node(const VALUE&amp; value, Node* next = NULL) {
+ 65       return new (CONFIG::allocate_node(sizeof(Node), value)) Node(value, next);
+ 66     }
+ 67     // Destroys a node.
+ 68     static void destroy_node(Node* node) {
+ 69       CONFIG::free_node((void*)node, node-&gt;_value);
+ 70     }
+ 71 
+ 72     void print_on(outputStream* st) const {};
+ 73     void print_value_on(outputStream* st) const {};
+ 74   };
+ 75 
+ 76   // Only constructed with placement new from an array allocated with MEMFLAGS
+ 77   // of InternalTable.
+ 78   class Bucket {
+ 79    private:
+ 80 
+ 81     // Embedded state in two low bits in first pointer is a spinlock with 3
+ 82     // states, unlocked, locked, redirect. You must never busy-spin on trylock()
+ 83     // or call lock() without _resize_lock, that would deadlock. Redirect can
+ 84     // only be installed by owner and is the final state of a bucket.
+ 85     // The only two valid flows are:
+ 86     // unlocked -&gt; locked -&gt; unlocked
+ 87     // unlocked -&gt; locked -&gt; redirect
+ 88     // Locked state only applies to an updater.
+ 89     // Reader only check for redirect.
+ 90     Node * volatile _first;
+ 91 
+ 92     static const uintptr_t STATE_LOCK_BIT     = 0x1;
+ 93     static const uintptr_t STATE_REDIRECT_BIT = 0x2;
+ 94     static const uintptr_t STATE_MASK         = 0x3;
+ 95 
+ 96     // Get the first pointer unmasked.
+ 97     Node* first_raw() const;
+ 98 
+ 99     // Methods to manipulate the embedded.
+100     static bool is_state(Node* node, uintptr_t bits) {
+101       return (bits &amp; (uintptr_t)node) == bits;
+102     }
+103 
+104     static Node* set_state(Node* n, uintptr_t bits) {
+105       return (Node*)(bits | (uintptr_t)n);
+106     }
+107 
+108     static uintptr_t get_state(Node* node) {
+109       return (((uintptr_t)node) &amp; STATE_MASK);
+110     }
+111 
+112     static Node* clear_state(Node* node) {
+113       return (Node*)(((uintptr_t)node) &amp; (~(STATE_MASK)));
+114     }
+115 
+116     static Node* clear_set_state(Node* node, Node* state) {
+117       return (Node*)(((uintptr_t)clear_state(node)) ^ get_state(state));
+118     }
+119 
+120    public:
+121     // A bucket is only one pointer with the embedded state.
+122     Bucket() : _first(NULL) {};
+123 
+124     // Get the first pointer unmasked.
+125     Node* first() const;
+126 
+127     // Get a pointer to the const first pointer. Do not deference this
+128     // pointer, the pointer pointed to _may_ contain an embedded state. Such
+129     // pointer should only be used as input to release_assign_node_ptr.
+130     Node* const volatile * first_ptr() { return &amp;_first; }
+131 
+132     // This is the only place where a pointer to a Node pointer that potentially
+133     // is _first should be changed. Otherwise we destroy the embedded state. We
+134     // only give out pointer to const Node pointer to avoid accidental
+135     // assignment, thus here we must cast const part away. Method is not static
+136     // due to an assert.
+137     void release_assign_node_ptr(Node* const volatile * dst, Node* node) const;
+138 
+139     // This method assigns this buckets last Node next ptr to input Node.
+140     void release_assign_last_node_next(Node* node);
+141 
+142     // Setting the first pointer must be done with CAS.
+143     bool cas_first(Node *node, Node* expect);
+144 
+145     // Returns true if this bucket is redirecting to a new table.
+146     // Redirect is a terminal state and will never change.
+147     bool have_redirect() const;
+148 
+149     // Return true if this bucket is locked for updates.
+150     bool is_locked() const;
+151 
+152     // Return true if this bucket was locked.
+153     bool trylock();
+154 
+155     // The bucket might be invalid, due to a concurrent resize. The lock()
+156     // method do no respect that and can deadlock if caller do not hold
+157     // _resize_lock.
+158     void lock();
+159 
+160     // Unlocks this bucket.
+161     void unlock();
+162 
+163     // Installs redirect in this bucket.
+164     // Prior to doing so you must have successfully locked this bucket.
+165     void redirect();
+166   };
+167 
+168   // The backing storage table holding the buckets and it&#39;s size and mask-bits.
+169   // Table is always a power of two for two reasons:
+170   // - Re-size can only change the size into half or double
+171   //   (any pow 2 would also be possible).
+172   // - Use masking of hash for bucket index.
+173   class InternalTable : public CHeapObj&lt;F&gt; {
+174    private:
+175     Bucket* _buckets;        // Bucket array.
+176    public:
+177     const size_t _log2_size; // Size in log2.
+178     const size_t _size;      // Size in log10.
+179 
+180     // The mask used on hash for selecting bucket.
+181     // The masked value is guaranteed be to inside the buckets array.
+182     const size_t _hash_mask;
+183 
+184     // Create a backing table
+185     InternalTable(size_t log2_size);
+186     ~InternalTable();
+187 
+188     Bucket* get_buckets() { return _buckets; }
+189     Bucket* get_bucket(size_t idx) { return &amp;_buckets[idx]; }
+190   };
+191 
+192   // Used as default functor when no functor supplied for some methods.
+193   struct NoOp {
+194     void operator()(VALUE*) {}
+195     const VALUE&amp; operator()() {}
+196     void operator()(bool, VALUE*) {}
+197   } noOp;
+198 
+199   // For materializing a supplied value.
+200   class LazyValueRetrieve {
+201    private:
+202     const VALUE&amp; _val;
+203    public:
+204     LazyValueRetrieve(const VALUE&amp; val) : _val(val) {}
+205     const VALUE&amp; operator()() { return _val; }
+206   };
+207 
+208   InternalTable* _table;      // Active table.
+209   InternalTable* _new_table;  // Table we are resizing to.
+210 
+211   // Default sizes
+212   static const size_t DEFAULT_MAX_SIZE_LOG2 = 21;
+213   static const size_t DEFAULT_START_SIZE_LOG2 = 13;
+214   static const size_t DEFAULT_GROW_HINT = 4; // Chain length
+215 
+216   const size_t _log2_size_limit;  // The biggest size.
+217   const size_t _log2_start_size;  // Start size.
+218   const size_t _grow_hint;        // Number of linked items
+219 
+220   volatile bool _size_limit_reached;
+221 
+222   // We serialize resizers and other bulk operations which do not support
+223   // concurrent resize with this lock.
+224   Mutex* _resize_lock;
+225   // Since we need to drop mutex for safepoints, but stop other threads from
+226   // taking the mutex after a safepoint this bool is the actual state. After
+227   // acquiring the mutex you must check if this is already locked. If so you
+228   // must drop the mutex until the real lock holder grabs the mutex.
+229   volatile Thread* _resize_lock_owner;
+230 
+231   // Return true if lock mutex/state succeeded.
+232   bool try_resize_lock(Thread* locker);
+233   // Returns when both mutex and state are proper locked.
+234   void lock_resize_lock(Thread* locker);
+235   // Unlocks mutex and state.
+236   void unlock_resize_lock(Thread* locker);
+237 
+238   // This method sets the _invisible_epoch and do a write_synchronize.
+239   // Subsequent calls check the state of _invisible_epoch and determine if the
+240   // write_synchronize can be avoided. If not, it sets the _invisible_epoch
+241   // again and do a write_synchronize.
+242   void write_synchonize_on_visible_epoch(Thread* thread);
+243   // To be-able to avoid write_synchronize in resize and other bulk operation,
+244   // this field keep tracks if a version of the hash-table was ever been seen.
+245   // We the working thread pointer as tag for debugging. The _invisible_epoch
+246   // can only be used by the owner of _resize_lock.
+247   volatile Thread* _invisible_epoch;
+248 
+249   // Scoped critical section, which also handles the invisible epochs.
+250   // An invisible epoch/version do not need a write_synchronize().
+251   class ScopedCS: public StackObj {
+252    protected:
+253     Thread* _thread;
+254     ConcurrentHashTable&lt;VALUE, CONFIG, F&gt;* _cht;
+255     GlobalCounter::CSContext _cs_context;
+256    public:
+257     ScopedCS(Thread* thread, ConcurrentHashTable&lt;VALUE, CONFIG, F&gt;* cht);
+258     ~ScopedCS();
+259   };
+260 
+261 
+262   // Max number of deletes in one bucket chain during bulk delete.
+263   static const size_t BULK_DELETE_LIMIT = 256;
+264 
+265   // Simple getters and setters for the internal table.
+266   InternalTable* get_table() const;
+267   InternalTable* get_new_table() const;
+268   InternalTable* set_table_from_new();
+269 
+270   // Destroys all nodes.
+271   void free_nodes();
+272 
+273   // Mask away high bits of hash.
+274   static size_t bucket_idx_hash(InternalTable* table, const uintx hash) {
+275     return ((size_t)hash) &amp; table-&gt;_hash_mask;
+276   }
+277 
+278   // Returns bucket for hash for that internal table.
+279   Bucket* get_bucket_in(InternalTable* table, const uintx hash) const {
+280     size_t bucket_index = bucket_idx_hash(table, hash);
+281     return table-&gt;get_bucket(bucket_index);
+282   }
+283 
+284   // Return correct bucket for reading and handles resizing.
+285   Bucket* get_bucket(const uintx hash) const;
+286 
+287   // Return correct bucket for updates and handles resizing.
+288   Bucket* get_bucket_locked(Thread* thread, const uintx hash);
+289 
+290   // Finds a node.
+291   template &lt;typename LOOKUP_FUNC&gt;
+292   Node* get_node(const Bucket* const bucket, LOOKUP_FUNC&amp; lookup_f,
+293                  bool* have_dead, size_t* loops = NULL) const;
+294 
+295   // Method for shrinking.
+296   bool internal_shrink_prolog(Thread* thread, size_t log2_size);
+297   void internal_shrink_epilog(Thread* thread);
+298   void internal_shrink_range(Thread* thread, size_t start, size_t stop);
+299   bool internal_shrink(Thread* thread, size_t size_limit_log2);
+300 
+301   // Methods for growing.
+302   bool unzip_bucket(Thread* thread, InternalTable* old_table,
+303                     InternalTable* new_table, size_t even_index,
+304                     size_t odd_index);
+305   bool internal_grow_prolog(Thread* thread, size_t log2_size);
+306   void internal_grow_epilog(Thread* thread);
+307   void internal_grow_range(Thread* thread, size_t start, size_t stop);
+308   bool internal_grow(Thread* thread, size_t log2_size);
+309 
+310   // Get a value.
+311   template &lt;typename LOOKUP_FUNC&gt;
+312   VALUE* internal_get(Thread* thread, LOOKUP_FUNC&amp; lookup_f,
+313                       bool* grow_hint = NULL);
+314 
+315   // Plain insert.
+316   template &lt;typename LOOKUP_FUNC&gt;
+317   bool internal_insert(Thread* thread, LOOKUP_FUNC&amp; lookup_f, const VALUE&amp; value,
+318                        bool* grow_hint, bool* clean_hint);
+319 
+320   // Returns true if an item matching LOOKUP_FUNC is removed.
+321   // Calls DELETE_FUNC before destroying the node.
+322   template &lt;typename LOOKUP_FUNC, typename DELETE_FUNC&gt;
+323   bool internal_remove(Thread* thread, LOOKUP_FUNC&amp; lookup_f,
+324                        DELETE_FUNC&amp; delete_f);
+325 
+326   // Visits nodes with FUNC.
+327   template &lt;typename FUNC&gt;
+328   static bool visit_nodes(Bucket* bucket, FUNC&amp; visitor_f);
+329 
+330   // During shrink/grow we cannot guarantee that we only visit nodes once, with
+331   // current algorithm. To keep it simple caller will have locked
+332   // _resize_lock.
+333   template &lt;typename FUNC&gt;
+334   void do_scan_locked(Thread* thread, FUNC&amp; scan_f);
+335 
+336   // Check for dead items in a bucket.
+337   template &lt;typename EVALUATE_FUNC&gt;
+338   size_t delete_check_nodes(Bucket* bucket, EVALUATE_FUNC&amp; eval_f,
+339                             size_t num_del, Node** ndel);
+340 
+341   // Check for dead items in this table. During shrink/grow we cannot guarantee
+342   // that we only visit nodes once. To keep it simple caller will have locked
+343   // _resize_lock.
+344   template &lt;typename EVALUATE_FUNC, typename DELETE_FUNC&gt;
+345   void do_bulk_delete_locked(Thread* thread, EVALUATE_FUNC&amp; eval_f
+346                              , DELETE_FUNC&amp; del_f) {
+347     do_bulk_delete_locked_for(thread, 0, _table-&gt;_size, eval_f, del_f);
+348   }
+349 
+350   // To have prefetching for a VALUE that is pointer during
+351   // do_bulk_delete_locked, we have this helper classes. One for non-pointer
+352   // case without prefect and one for pointer with prefect.
+353   template &lt;bool b, typename EVALUATE_FUNC&gt;
+354   struct HaveDeletables {
+355     static bool have_deletable(Bucket* bucket, EVALUATE_FUNC&amp; eval_f,
+356                                Bucket* prefetch_bucket);
+357   };
+358   template&lt;typename EVALUATE_FUNC&gt;
+359   struct HaveDeletables&lt;true, EVALUATE_FUNC&gt; {
+360     static bool have_deletable(Bucket* bucket, EVALUATE_FUNC&amp; eval_f,
+361                                Bucket* prefetch_bucket);
+362   };
+363 
+364   // Check for dead items in this table with range. During shrink/grow we cannot
+365   // guarantee that we only visit nodes once. To keep it simple caller will
+366   // have locked _resize_lock.
+367   template &lt;typename EVALUATE_FUNC, typename DELETE_FUNC&gt;
+368   void do_bulk_delete_locked_for(Thread* thread, size_t start_idx,
+369                                  size_t stop_idx, EVALUATE_FUNC&amp; eval_f,
+370                                  DELETE_FUNC&amp; del_f, bool is_mt = false);
+371 
+372   // Method to delete one items.
+373   template &lt;typename LOOKUP_FUNC&gt;
+374   void delete_in_bucket(Thread* thread, Bucket* bucket, LOOKUP_FUNC&amp; lookup_f);
+375 
+376  public:
+377   ConcurrentHashTable(size_t log2size = DEFAULT_START_SIZE_LOG2,
+378                       size_t log2size_limit = DEFAULT_MAX_SIZE_LOG2,
+379                       size_t grow_hint = DEFAULT_GROW_HINT);
+380 
+381   ~ConcurrentHashTable();
+382 
+383   size_t get_size_log2(Thread* thread);
+384   size_t get_node_size() const { return sizeof(Node); }
+385   bool is_max_size_reached() { return _size_limit_reached; }
+386 
+387   // This means no paused bucket resize operation is going to resume
+388   // on this table.
+389   bool is_safepoint_safe() { return _resize_lock_owner == NULL; }
+390 
+391   // Re-size operations.
+392   bool shrink(Thread* thread, size_t size_limit_log2 = 0);
+393   bool grow(Thread* thread, size_t size_limit_log2 = 0);
+394 
+395   // All callbacks for get are under critical sections. Other callbacks may be
+396   // under critical section or may have locked parts of table. Calling any
+397   // methods on the table during a callback is not supported.Only MultiGetHandle
+398   // supports multiple gets.
+399 
+400   // Get methods return true on found item with LOOKUP_FUNC and FOUND_FUNC is
+401   // called.
+402   template &lt;typename LOOKUP_FUNC, typename FOUND_FUNC&gt;
+403   bool get(Thread* thread, LOOKUP_FUNC&amp; lookup_f, FOUND_FUNC&amp; foundf,
+404            bool* grow_hint = NULL);
+405 
+406   // Returns true true if the item was inserted, duplicates are found with
+407   // LOOKUP_FUNC.
+408   template &lt;typename LOOKUP_FUNC&gt;
+409   bool insert(Thread* thread, LOOKUP_FUNC&amp; lookup_f, const VALUE&amp; value,
+410               bool* grow_hint = NULL, bool* clean_hint = NULL) {
+411     return internal_insert(thread, lookup_f, value, grow_hint, clean_hint);
+412   }
+413 
+414   // This does a fast unsafe insert and can thus only be used when there is no
+415   // risk for a duplicates and no other threads uses this table.
+416   bool unsafe_insert(const VALUE&amp; value);
+417 
+418   // Returns true if items was deleted matching LOOKUP_FUNC and
+419   // prior to destruction DELETE_FUNC is called.
+420   template &lt;typename LOOKUP_FUNC, typename DELETE_FUNC&gt;
+421   bool remove(Thread* thread, LOOKUP_FUNC&amp; lookup_f, DELETE_FUNC&amp; del_f) {
+422     return internal_remove(thread, lookup_f, del_f);
+423   }
+424 
+425   // Same without DELETE_FUNC.
+426   template &lt;typename LOOKUP_FUNC&gt;
+427   bool remove(Thread* thread, LOOKUP_FUNC&amp; lookup_f) {
+428     return internal_remove(thread, lookup_f, noOp);
+429   }
+430 
+431   // Visit all items with SCAN_FUNC if no concurrent resize. Takes the resize
+432   // lock to avoid concurrent resizes. Else returns false.
+433   template &lt;typename SCAN_FUNC&gt;
+434   bool try_scan(Thread* thread, SCAN_FUNC&amp; scan_f);
+435 
+436   // Visit all items with SCAN_FUNC when the resize lock is obtained.
+437   template &lt;typename SCAN_FUNC&gt;
+438   void do_scan(Thread* thread, SCAN_FUNC&amp; scan_f);
+439 
+440   // Visit all items with SCAN_FUNC without any protection.
+441   // It will assume there is no other thread accessing this
+442   // table during the safepoint. Must be called with VM thread.
+443   template &lt;typename SCAN_FUNC&gt;
+444   void do_safepoint_scan(SCAN_FUNC&amp; scan_f);
+445 
+446   // Destroying items matching EVALUATE_FUNC, before destroying items
+447   // DELETE_FUNC is called, if resize lock is obtained. Else returns false.
+448   template &lt;typename EVALUATE_FUNC, typename DELETE_FUNC&gt;
+449   bool try_bulk_delete(Thread* thread, EVALUATE_FUNC&amp; eval_f,
+450                        DELETE_FUNC&amp; del_f);
+451 
+452   // Destroying items matching EVALUATE_FUNC, before destroying items
+453   // DELETE_FUNC is called, when the resize lock is successfully obtained.
+454   template &lt;typename EVALUATE_FUNC, typename DELETE_FUNC&gt;
+455   void bulk_delete(Thread* thread, EVALUATE_FUNC&amp; eval_f, DELETE_FUNC&amp; del_f);
+456 
+457   // Writes statistics to the outputStream. Item sizes are calculated with
+458   // VALUE_SIZE_FUNC.
+459   template &lt;typename VALUE_SIZE_FUNC&gt;
+460   void statistics_to(Thread* thread, VALUE_SIZE_FUNC&amp; vs_f, outputStream* st,
+461                      const char* table_name);
+462 
+463   // Moves all nodes from this table to to_cht
+464   bool try_move_nodes_to(Thread* thread, ConcurrentHashTable&lt;VALUE, CONFIG, F&gt;* to_cht);
+465 
+466   // This is a Curiously Recurring Template Pattern (CRPT) interface for the
+467   // specialization.
+468   struct BaseConfig {
+469    public:
+470     // Called when the hash table needs the hash for a VALUE.
+471     static uintx get_hash(const VALUE&amp; value, bool* dead) {
+472       return CONFIG::get_hash(value, dead);
+473     }
+474     // Default node allocation.
+475     static void* allocate_node(size_t size, const VALUE&amp; value);
+476     // Default node reclamation.
+477     static void free_node(void* memory, const VALUE&amp; value);
+478   };
+479 
+480   // Scoped multi getter.
+481   class MultiGetHandle : private ScopedCS {
+482    public:
+483     MultiGetHandle(Thread* thread, ConcurrentHashTable&lt;VALUE, CONFIG, F&gt;* cht)
+484       : ScopedCS(thread, cht) {}
+485     // In the MultiGetHandle scope you can lookup items matching LOOKUP_FUNC.
+486     // The VALUEs are safe as long as you never save the VALUEs outside the
+487     // scope, e.g. after ~MultiGetHandle().
+488     template &lt;typename LOOKUP_FUNC&gt;
+489     VALUE* get(LOOKUP_FUNC&amp; lookup_f, bool* grow_hint = NULL);
+490   };
+491 
+492  private:
+493   class BucketsOperation;
+494 
+495  public:
+496   class BulkDeleteTask;
+497   class GrowTask;
+498 };
+499 
+500 #endif // SHARE_UTILITIES_CONCURRENTHASHTABLE_HPP
+    </pre>
+  </body>
+</html>

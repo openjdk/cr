@@ -1,0 +1,633 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Frames src/hotspot/share/tsan/tsanOopMap.cpp</title>
+    <link rel="stylesheet" href="../../../../style.css" />
+    <script type="text/javascript" src="../../../../navigation.js"></script>
+  </head>
+<body onkeypress="keypress(event);">
+<a name="0"></a>
+<hr />
+<pre>  1 /*
+  2  * Copyright (c) 2019, Oracle and/or its affiliates. All rights reserved.
+  3  * Copyright (c) 2019, Google and/or its affiliates. All rights reserved.
+  4  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  5  *
+  6  * This code is free software; you can redistribute it and/or modify it
+  7  * under the terms of the GNU General Public License version 2 only, as
+  8  * published by the Free Software Foundation.
+  9  *
+ 10  * This code is distributed in the hope that it will be useful, but WITHOUT
+ 11  * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ 12  * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ 13  * version 2 for more details (a copy is included in the LICENSE file that
+ 14  * accompanied this code).
+ 15  *
+ 16  * You should have received a copy of the GNU General Public License version
+ 17  * 2 along with this work; if not, write to the Free Software Foundation,
+ 18  * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ 19  *
+ 20  * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ 21  * or visit www.oracle.com if you need additional information or have any
+ 22  * questions.
+ 23  *
+ 24  */
+ 25 
+ 26 #include &quot;precompiled.hpp&quot;
+ 27 #include &quot;gc/shared/gcTraceTime.inline.hpp&quot;
+ 28 #include &quot;gc/shared/gcId.hpp&quot;
+ 29 #include &quot;gc/shared/referenceProcessor.hpp&quot;
+ 30 #include &quot;oops/oop.inline.hpp&quot;
+ 31 #include &quot;runtime/mutexLocker.hpp&quot;
+ 32 #include &quot;runtime/safepointVerifiers.hpp&quot;
+ 33 #include &quot;tsan/tsanExternalDecls.hpp&quot;
+ 34 #include &quot;tsan/tsanOopMap.hpp&quot;
+ 35 #include &quot;utilities/bitMap.inline.hpp&quot;
+ 36 
+ 37 extern &quot;C&quot; int jio_printf(const char *fmt, ...);
+ 38 
+ 39 #if 0
+ 40 #define DEBUG_PRINT(...) jio_printf(__VA_ARGS__)
+ 41 #else
+ 42 #define DEBUG_PRINT(...)
+ 43 #endif
+ 44 namespace TsanOopMapImpl {
+ 45 
+ 46   struct PendingMove {
+ 47     char *source_begin() const { return source_address; }
+ 48     char *source_end() const { return source_address + n_bytes; }
+ 49     char *target_begin() const { return target_address; }
+ 50     char *target_end() const { return target_address + n_bytes; }
+ 51     char *source_address;
+ 52     char *target_address;
+ 53     size_t n_bytes;  // number of bytes being moved
+ 54   };
+ 55 
+ 56   // Our data
+ 57   class TsanOopSizeMap *oop_map = NULL;
+ 58 
+ 59   /**
+ 60    * TsanOopSizeMap is a hash map of {oopDesc * -&gt; size}.
+ 61    */
+ 62   class TsanOopSizeMap : public CHeapObj&lt;mtInternal&gt; {
+ 63 
+ 64     class TsanOop : public CHeapObj&lt;mtInternal&gt; {
+ 65       /* We track the lifecycle (alloc/move/free) of interesting oops;
+ 66        * tsan needs to know. */
+ 67       oopDesc *_oop;  // key
+ 68 
+ 69       /* We cache the oop&#39;s size, since we cannot reliably determine it after
+ 70        * the oop is freed. Size is measured in number of HeapWords. */
+ 71       uintx _oop_size;  // value
+ 72 
+ 73     public:
+ 74       TsanOop():_oop(NULL), _oop_size(0) {}
+ 75       void set_oop(oopDesc *o, uintx s) { _oop = o; _oop_size = s; }
+ 76       bool has_oop() const { return _oop != NULL; }
+ 77       oopDesc *get_oop() const { return _oop; }
+ 78       uintx get_oop_size() const { return _oop_size; }
+ 79     };
+ 80 
+ 81     size_t _size;
+ 82     size_t _n_elements;
+ 83     float _load_factor;
+ 84     TsanOop *_buckets;
+ 85 
+ 86     static uintx _hash64(uintx key) {
+ 87       key = ~key + (key &lt;&lt; 21);
+ 88       key ^= (key &gt;&gt; 24);
+ 89       key += (key &lt;&lt; 3) + (key &lt;&lt; 8);
+ 90       key ^= (key &gt;&gt; 14);
+ 91       key += (key &lt;&lt; 2) + (key &lt;&lt; 4);
+ 92       key ^= (key &gt;&gt; 28);
+ 93       key += (key &lt;&lt; 31);
+ 94       return key;
+ 95     }
+ 96 
+ 97     static uintx _hash32(uintx key) {
+ 98       key = ~key + (key &lt;&lt; 15);
+ 99       key ^= (key &gt;&gt; 12);
+100       key += (key &lt;&lt; 2);
+101       key ^= (key &gt;&gt; 4);
+102       key *= 2057;
+103       key ^= (key &gt;&gt; 16);
+104       return key;
+105     }
+106 
+107     TsanOop* find_bucket(oopDesc* o) {
+108       uintx h = reinterpret_cast&lt;uintx&gt;((address)o);
+109       TsanOop* bucket;
+110       do {
+111         h = hash(h);
+112         bucket = &amp;_buckets[h % _size];
+113       } while (bucket-&gt;has_oop() &amp;&amp; bucket-&gt;get_oop() != o);
+114       return bucket;
+115     }
+116 
+117     static bool collect_oops(BoolObjectClosure* is_alive,
+118                              OopClosure* f,
+119                              GrowableArray&lt;PendingMove&gt;* moves,
+120                              int* n_downward_moves,
+121                              char** min_low,
+122                              char** max_high);
+123 
+124     static void handle_overlapping_moves(GrowableArray&lt;PendingMove&gt;&amp; moves,
+125                                          char* min_low,
+126                                          char* max_high);
+127 
+128   public:
+129     TsanOopSizeMap(size_t initial_size)
+130         : _size(initial_size), _n_elements(0), _load_factor(0.7) {
+131       _buckets = new TsanOop[_size];
+132     }
+133 
+134     ~TsanOopSizeMap() {
+135       delete [] _buckets;
+136     }
+137 
+138     static uintx hash(uintx key) {
+139       return (sizeof(uintx) == 4) ? _hash32(key) : _hash64(key);
+140     }
+141 
+142     // Put an oop and oop size into the hash map.
+143     // Ok to call multiple times on same oop.
+144     // Return true if seen for first time; else return false.
+145     // Synchronized in mutator threads with TsanOopMap_lock.
+146     bool put(oopDesc* o, uintx s) {
+147       TsanOop* bucket = find_bucket(o);
+148 
+149       if (!bucket-&gt;has_oop()) {
+150         if (++_n_elements &gt; _load_factor * _size) {
+151           grow();
+152           bucket = find_bucket(o);
+153         }
+154         bucket-&gt;set_oop(o, s);
+155         return true;
+156       } else {
+157         assert(s == bucket-&gt;get_oop_size(), &quot;same oop should have same size&quot;);
+158         return false;
+159       }
+160     }
+161 
+162     void grow(void) {
+163       TsanOop *old_buckets = _buckets;
+164       size_t old_size = _size;
+165       _size *= 2;
+166 
+167       _buckets = new TsanOop[_size];
+168 
+169       for (uintx i = 0; i &lt; old_size; i++) {
+170         if (old_buckets[i].has_oop()) {
+171           put(old_buckets[i].get_oop(), old_buckets[i].get_oop_size());
+172         }
+173       }
+174       delete [] old_buckets;
+175     }
+176 
+177     // Call this function at the end of the garbage collection to
+178     // notify TSan about object location changes and to build oops map.
+179     static void rebuild_oops_map(BoolObjectClosure *is_alive,
+180                                  OopClosure *pointer_adjuster);
+181 
+182 #ifdef ASSERT
+183     bool exists(oopDesc *o) const {
+184       uintx h = reinterpret_cast&lt;uintx&gt;((address)o);
+185       TsanOop *bucket = NULL;
+186 
+187       do {
+188         h = hash(h);
+189         bucket = &amp;_buckets[h % _size];
+190       } while (bucket-&gt;has_oop() &amp;&amp; bucket-&gt;get_oop() != o);
+191 
+192       return bucket-&gt;has_oop() &amp;&amp; bucket-&gt;get_oop() == o;
+193     }
+194 #endif
+195 
+196     size_t size() const { return _size; }
+197     oopDesc *oop_at(size_t i) const { return _buckets[i].get_oop(); }
+198     uintx oop_size_at(size_t i) const { return _buckets[i].get_oop_size(); }
+199   };
+200 
+201   // Two little callbacks used by sort.
+202   int lessThan(PendingMove *l, PendingMove *r) {
+203     char *left = l-&gt;target_begin();
+204     char *right = r-&gt;target_begin();
+205     return (left &lt; right) ? -1 : (left == right ? 0 : 1);
+206   }
+207 
+208   int moreThan(PendingMove *l, PendingMove *r) {
+209     return lessThan(r, l);
+210   }
+211 
+212   // Maintains the occupancy state of the given heap memory area.
+213   // TsanOopSizeMap::rebuild_oop_map below uses an instance of this
+214   // class to order object moves, please see additional comments there.
+215   class OccupancyMap: public StackObj {
+216     // Internally it is a BitMap. A bit is set if the corresponding HeapWord
+217     // is currently occupied, cleared otherwise (HeapWord is Java object
+218     // allocation unit).
+219     char *mem_begin_;
+220     char *mem_end_;
+221     CHeapBitMap bitmap_;
+222     BitMap::idx_t to_idx(char *mem) const {
+223       return (mem - mem_begin_) / HeapWordSize;
+224     }
+225   public:
+226     // NOTE: The constructor creates a bitmap on the resource area.
+227     // The bitmap can be quite large (it is 16MB per every 1GB of heap,
+228     // so it is worth releasing it as soon as possible by creating a
+229     // ResourceMark.
+230     OccupancyMap(char *mem_begin, char *mem_end)
+231         : mem_begin_(mem_begin), mem_end_(mem_end),
+232           bitmap_((mem_end - mem_begin) / HeapWordSize) {}
+233     bool is_range_vacant(char *from, char *to) const {
+234       assert(from &lt; to, &quot;bad range&quot;);
+235       assert(from &gt;= mem_begin_ &amp;&amp; from &lt; mem_end_,
+236              &quot;start address outside range&quot;);
+237       assert(to &gt; mem_begin_ &amp;&amp; to &lt;= mem_end_, &quot;end address outside range&quot;);
+238       BitMap::idx_t idx_to = to_idx(to);
+239       return bitmap_.get_next_one_offset(to_idx(from), idx_to) == idx_to;
+240     }
+241     void range_occupy(char *from, char *to) {
+242       assert(from &lt; to, &quot;range_occupy: bad range&quot;);
+243       assert(from &gt;= mem_begin_ &amp;&amp; from &lt; mem_end_,
+244              &quot;start address outside range&quot;);
+245       assert(to &gt; mem_begin_ &amp;&amp; to &lt;= mem_end_, &quot;end address outside range&quot;);
+246       bitmap_.set_range(to_idx(from), to_idx(to));
+247     }
+248     void range_vacate(char *from, char *to) {
+249       assert(from &lt; to, &quot;bad range&quot;);
+250       assert(from &gt;= mem_begin_ &amp;&amp; from &lt; mem_end_,
+251              &quot;start address outside range&quot;);
+252       assert(to &gt; mem_begin_ &amp;&amp; to &lt;= mem_end_, &quot;end address outside range&quot;);
+253       bitmap_.clear_range(to_idx(from), to_idx(to));
+254     }
+255     int bit_count() const {
+256       return bitmap_.size();
+257     }
+258   };
+259 
+260   bool TsanOopSizeMap::collect_oops(BoolObjectClosure* is_alive,
+261                                     OopClosure* pointer_adjuster,
+262                                     GrowableArray&lt;PendingMove&gt;* moves,
+263                                     int* n_downward_moves,
+264                                     char** min_low,
+265                                     char** max_high) {
+266     size_t map_size = oop_map-&gt;size();
+267 
+268     // Traverse oop map. For each object that survived GC calculate its new
+269     // oop, add it to the new oop map, and append the move from the source oop
+270     // to the target one to the moves list. While doing that, collect oop
+271     // source and target ranges and count the moves that move an object
+272     // downwards (this is heuristics to order the moves, see below).
+273     TsanOopSizeMap* new_map = new TsanOopSizeMap(map_size / 2);
+274     *n_downward_moves = 0;
+275     bool disjoint_regions;
+276     char *source_low = reinterpret_cast&lt;char *&gt;(UINTPTR_MAX);
+277     char *source_high = NULL;
+278     char *target_low = reinterpret_cast&lt;char *&gt;(UINTPTR_MAX);
+279     char *target_high = NULL;
+280     size_t deleted_objects = 0;
+281     size_t unmoved_objects = 0;
+282     size_t total_size_words = 0;
+283     CollectedHeap *heap = Universe::heap();
+284     for (size_t i = 0; i &lt; map_size; i++) {
+285       oopDesc *source_obj = oop_map-&gt;oop_at(i);
+286 
+<a name="1" id="anc1"></a><span class="line-modified">287       if (source_obj != NULL &amp;&amp; heap-&gt;is_in_reserved(source_obj)) {</span>
+288         uintx obj_size = oop_map-&gt;oop_size_at(i);
+289         size_t obj_size_bytes = obj_size * HeapWordSize;
+290         if (is_alive-&gt;do_object_b(source_obj)) {
+291           // The object survived GC, add its updated oop to the new oops map.
+292           oop target_oop = cast_to_oop((intptr_t)source_obj);
+293           pointer_adjuster-&gt;do_oop(&amp;target_oop);
+294           // The memory pointed by target_oop may not be a valid oop yet,
+295           // for example the G1 full collector needs to adjust all pointers
+296           // first, then compacts and moves the objects. In this case
+297           // TsanOopSizeMap::rebuild_oops_map() is called during the adjust-
+298           // pointer phase, before the collector moves the objects. Thus,
+299           // we cannot use heap-&gt;is_in() or oopDesc::is_oop() to check
+300           // target_oop.
+<a name="2" id="anc2"></a><span class="line-modified">301           assert(heap-&gt;is_in_reserved(target_oop), &quot;Adjustment failed&quot;);</span>
+302           oopDesc *target_obj = target_oop;
+303           new_map-&gt;put(target_obj, obj_size);
+304           if (target_obj == source_obj) {
+305             ++unmoved_objects;
+306             continue;
+307           }
+308           if (target_obj &lt; source_obj) {
+309             ++(*n_downward_moves);
+310           }
+311           // Append to the moves list.
+312           PendingMove move = {(char *)source_obj, (char *)target_obj,
+313                               obj_size_bytes};
+314           total_size_words += obj_size;
+315           moves-&gt;append(move);
+316 
+317           // Update source and target ranges.
+318           source_low = MIN2(source_low, move.source_begin());
+319           source_high = MAX2(source_high, move.source_end());
+320           target_low = MIN2(target_low, move.target_begin());
+321           target_high = MAX2(target_high, move.target_end());
+322         } else {  // dead!
+323           __tsan_java_free((char *)source_obj, obj_size_bytes);
+324           ++deleted_objects;
+325         }
+326       }
+327     }
+328 
+329     // Update the oop map.
+330     delete TsanOopMapImpl::oop_map;
+331     TsanOopMapImpl::oop_map = new_map;
+332 
+333     disjoint_regions = (source_low &gt;= target_high || source_high &lt;= target_low);
+334     log_debug(gc)(
+335           &quot;Tsan: map of &quot; SIZE_FORMAT &quot; objects, &quot; SIZE_FORMAT &quot; deleted, &quot;
+336           SIZE_FORMAT &quot; unmoved, &quot; SIZE_FORMAT &quot; to move &quot;
+337           &quot;(&quot; SIZE_FORMAT &quot; words), %soverlap&quot;,
+338           map_size, deleted_objects, unmoved_objects, (size_t)moves-&gt;length(),
+339           total_size_words, disjoint_regions ? &quot;no &quot; : &quot;&quot;);
+340 
+341     *min_low = MIN2(source_low, target_low);
+342     *max_high = MAX2(source_high, target_high);
+343     return disjoint_regions;
+344   }
+345 
+346   void TsanOopSizeMap::handle_overlapping_moves(GrowableArray&lt;PendingMove&gt;&amp; moves,
+347                                                 char* min_low,
+348                                                 char* max_high) {
+349     // Populate occupied memory. The bitmap allocated by the OccupancyMap can
+350     // be fairly large, scope this code and insert a ResourceMark
+351     ResourceMark rm;
+352     OccupancyMap occupied_memory(min_low, max_high);
+353     DEBUG_PRINT(&quot;%s:%d: %d objects occupying %d words between %p and %p\n&quot;,
+354                 __FUNCTION__, __LINE__, moves.length(),
+355                 occupied_memory.bit_count(),
+356                 MIN2(source_low, target_low),
+357                 MAX2(source_high, target_high));
+358     for (int i = 0; i &lt; moves.length(); ++i) {
+359       PendingMove &amp;m = moves.at(i);
+360       occupied_memory.range_occupy(m.source_begin(), m.source_end());
+361     }
+362 
+363     // Keep traversing moves list until everything is moved
+364     int passes = 0;
+365     for (int remaining_moves = moves.length(); remaining_moves &gt; 0; ) {
+366       ++passes;
+367       int moves_this_cycle = 0;
+368       for (int i = 0; i &lt; moves.length(); ++i) {
+369         if (moves.at(i).n_bytes == 0) {
+370            // Already moved this one.
+371            continue;
+372         }
+373 
+374         // Check if this move is currently possible.
+375         // For this, everything in the target region that is not in the source
+376         // region has to be vacant.
+377         bool can_move;
+378         PendingMove &amp;m = moves.at(i);
+379         if (m.target_begin() &lt; m.source_begin()) {
+380           // &#39;+++++++&#39; is region being moved, lower addresses are to the left:
+381           // Moving downwards:
+382           //         ++++++++         SOURCE
+383           //    ++++++++              TARGET
+384           // or
+385           //              ++++++++    SOURCE
+386           //    ++++++++              TARGET
+387           can_move = occupied_memory.is_range_vacant(
+388               m.target_begin(), MIN2(m.target_end(), m.source_begin()));
+389         } else {
+390           // Moving upwards:
+391           //    ++++++++              SOURCE
+392           //         ++++++++         TARGET
+393           // or
+394           //    ++++++++              SOURCE
+395           //              ++++++++    TARGET
+396           can_move = occupied_memory.is_range_vacant(
+397               MAX2(m.source_end(), m.target_begin()), m.target_end());
+398         }
+399         if (can_move) {
+400           // Notify TSan, update occupied region.
+401           __tsan_java_move(m.source_begin(), m.target_begin(), m.n_bytes);
+402           occupied_memory.range_vacate(m.source_begin(), m.source_end());
+403           occupied_memory.range_occupy(m.target_begin(), m.target_end());
+404           // Indicate that this move has been done and remember that we
+405           // made some progress.
+406           m.n_bytes = 0;
+407           ++moves_this_cycle;
+408         }
+409       }
+410       // We have to make some progress, otherwise bail out:
+411       guarantee(moves_this_cycle, &quot;Impossible to reconcile GC&quot;);
+412 
+413       guarantee(remaining_moves &gt;= moves_this_cycle,
+414                 &quot;Excessive number of moves&quot;);
+415       remaining_moves -= moves_this_cycle;
+416       DEBUG_PRINT(&quot;%s:%d: %d moved, %d remaining\n&quot;, __FUNCTION__, __LINE__,
+417                   moves_this_cycle, remaining_moves);
+418     }
+419     log_debug(gc)(&quot;Tsan: Move %d passes&quot;, passes);
+420   }
+421 
+422   void TsanOopSizeMap::rebuild_oops_map(BoolObjectClosure *is_alive,
+423                                         OopClosure *pointer_adjuster) {
+424     ResourceMark rm;
+425     GCTraceTime(Debug, gc) tt_top(&quot;Tsan relocate&quot;);
+426     GCTraceCPUTime tcpu;
+427     GrowableArray&lt;PendingMove&gt; moves(MAX2((int)(oop_map-&gt;size() / 100),
+428                                           100000));
+429     bool disjoint_regions;
+430     int n_downward_moves;
+431     char *min_low, *max_high;
+432 
+433     {
+434       GCTraceTime(Debug, gc) tt_collect(&quot;Collect oops&quot;);
+435       disjoint_regions = collect_oops(is_alive, pointer_adjuster, &amp;moves,
+436                                       &amp;n_downward_moves, &amp;min_low, &amp;max_high);
+437     }
+438     if (moves.length() == 0) {
+439       return;
+440     }
+441 
+442     // Notifying TSan is straightforward when source and target regions
+443     // do not overlap:
+444     if (disjoint_regions) {
+445       GCTraceTime(Debug, gc) tt_disjoint(&quot;Move between regions&quot;);
+446 
+447       for (int i = 0; i &lt; moves.length(); ++i) {
+448         const PendingMove &amp;m = moves.at(i);
+449         __tsan_java_move(m.source_begin(), m.target_begin(), m.n_bytes);
+450       }
+451       return;
+452     }
+453 
+454     // Source and target ranges overlap, the moves need to be ordered to prevent
+455     // overwriting. Overall, this can take N^2 steps if only one object can be
+456     // moved during the array traversal; however, when we are dealing with
+457     // compacting garbage collector, observation shows that the overwhelming
+458     // majority of the objects move in one direction. If we sort the moves (in
+459     // the ascending order if dominant direction is downwards, in the descending
+460     // order otherwise), chances are we will be able to order the moves in a few
+461     // traversals of the moves array.
+462     {
+463       GCTraceTime(Debug, gc) tt_sort(&quot;Sort moves&quot;);
+464 
+465       moves.sort((2 * n_downward_moves &gt; moves.length()) ? lessThan : moreThan);
+466       log_debug(gc)(&quot;Tsan: sort %d objects&quot;, moves.length());
+467     }
+468 
+469     {
+470       GCTraceTime(Debug, gc) tt_sort(&quot;Move&quot;);
+471       handle_overlapping_moves(moves, min_low, max_high);
+472     }
+473   }
+474 
+475 }  // namespace TsanOopMapImpl
+476 
+477 
+478 void TsanOopMap::initialize_map() {
+479   TsanOopMapImpl::oop_map = new TsanOopMapImpl::TsanOopSizeMap(512);
+480 }
+481 
+482 void TsanOopMap::destroy() {
+483   delete TsanOopMapImpl::oop_map;
+484 }
+485 
+486 void TsanOopMap::weak_oops_do(
+487     BoolObjectClosure* is_alive,
+488     OopClosure* pointer_adjuster) {
+489   if (!ThreadSanitizer) return;
+490   assert(SafepointSynchronize::is_at_safepoint(), &quot;must be at a safepoint&quot;);
+491 
+492   // We&#39;re mutating oopMap, but we don&#39;t need to acquire TsanOopMap_lock:
+493   // Mutation to map happens at (A) constructor (single threaded) and
+494   // (B) add (in mutator threads) and (C) do_weak_oops (single-threaded).
+495   // Calls between add are synchronized.
+496   // Calls between add and do_weak_oops are synchronized via STW GC.
+497   TsanOopMapImpl::TsanOopSizeMap::rebuild_oops_map(
+498       is_alive, pointer_adjuster);
+499 }
+500 
+501 // Safe to deal with raw oop; for example this is called in a LEAF function
+502 // There is no safepoint in this code: 1) special mutex is used, and
+503 // 2) there is no VM state transition
+504 // We cannot use ordinary VM mutex, as that requires a state transition.
+505 void TsanOopMap::add_oop_with_size(oopDesc *addr, int size) {
+506   DEBUG_ONLY(NoSafepointVerifier nsv;)
+507   assert(TsanOopMapImpl::oop_map != NULL, &quot;TsanOopMap not initialized&quot;);
+508   guarantee(addr != NULL, &quot;null oop&quot;);
+509   bool alloc = false;
+510   {
+<a name="3" id="anc3"></a><span class="line-modified">511     MutexLockerEx mu(TsanOopMap_lock, Mutex::_no_safepoint_check_flag);</span>
+512     // N.B. addr-&gt;size() may not be available yet!
+513     alloc = TsanOopMapImpl::oop_map-&gt;put(addr, size);
+514   }
+515   if (alloc) {
+516     __tsan_java_alloc(addr, size * HeapWordSize);
+517   }
+518 }
+519 
+520 void TsanOopMap::add_oop(oopDesc *addr) {
+521   // N.B. oop&#39;s size field must be init&#39;ed; else addr-&gt;size() crashes.
+522   TsanOopMap::add_oop_with_size(addr, addr-&gt;size());
+523 }
+524 
+525 #ifdef ASSERT
+526 bool TsanOopMap::exists(oopDesc *addr) {
+527   DEBUG_ONLY(NoSafepointVerifier nsv;)
+528   assert(TsanOopMapImpl::oop_map != NULL, &quot;TsanOopMap not initialized&quot;);
+529   guarantee(addr != NULL, &quot;null oop&quot;);
+530   bool in_map = false;
+531   {
+<a name="4" id="anc4"></a><span class="line-modified">532     MutexLockerEx mu(TsanOopMap_lock, Mutex::_no_safepoint_check_flag);</span>
+533     in_map = TsanOopMapImpl::oop_map-&gt;exists(addr);
+534   }
+535   return in_map;
+536 }
+537 #endif
+<a name="5" id="anc5"></a><b style="font-size: large; color: red">--- EOF ---</b>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+</pre>
+<input id="eof" value="5" type="hidden" />
+</body>
+</html>

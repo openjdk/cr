@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Frames src/hotspot/share/runtime/threadHeapSampler.cpp</title>
+    <link rel="stylesheet" href="../../../../style.css" />
+    <script type="text/javascript" src="../../../../navigation.js"></script>
+  </head>
+<body onkeypress="keypress(event);">
+<a name="0"></a>
+<hr />
+<pre>  1 /*
+  2  * Copyright (c) 2018, Oracle and/or its affiliates. All rights reserved.
+  3  * Copyright (c) 2018, Google and/or its affiliates. All rights reserved.
+  4  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  5  *
+  6  * This code is free software; you can redistribute it and/or modify it
+  7  * under the terms of the GNU General Public License version 2 only, as
+  8  * published by the Free Software Foundation.
+  9  *
+ 10  * This code is distributed in the hope that it will be useful, but WITHOUT
+ 11  * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ 12  * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ 13  * version 2 for more details (a copy is included in the LICENSE file that
+ 14  * accompanied this code).
+ 15  *
+ 16  * You should have received a copy of the GNU General Public License version
+ 17  * 2 along with this work; if not, write to the Free Software Foundation,
+ 18  * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ 19  *
+ 20  * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ 21  * or visit www.oracle.com if you need additional information or have any
+ 22  * questions.
+ 23  *
+ 24  */
+ 25 
+ 26 #include &quot;precompiled.hpp&quot;
+<a name="1" id="anc1"></a>
+ 27 #include &quot;runtime/handles.inline.hpp&quot;
+<a name="2" id="anc2"></a><span class="line-removed"> 28 #include &quot;runtime/orderAccess.hpp&quot;</span>
+ 29 #include &quot;runtime/sharedRuntime.hpp&quot;
+ 30 #include &quot;runtime/threadHeapSampler.hpp&quot;
+ 31 
+ 32 // Cheap random number generator.
+ 33 uint64_t ThreadHeapSampler::_rnd;
+ 34 // Default is 512kb.
+ 35 volatile int ThreadHeapSampler::_sampling_interval = 512 * 1024;
+ 36 
+ 37 // Ordering here is important: _log_table first, _log_table_initialized second.
+ 38 double ThreadHeapSampler::_log_table[1 &lt;&lt; ThreadHeapSampler::FastLogNumBits] = {};
+ 39 
+ 40 // Force initialization of the log_table.
+ 41 bool ThreadHeapSampler::_log_table_initialized = init_log_table();
+ 42 
+ 43 bool ThreadHeapSampler::init_log_table() {
+ 44   for (int i = 0; i &lt; (1 &lt;&lt; FastLogNumBits); i++) {
+ 45     _log_table[i] = (log(1.0 + static_cast&lt;double&gt;(i+0.5) / (1 &lt;&lt; FastLogNumBits))
+ 46                     / log(2.0));
+ 47   }
+ 48   return true;
+ 49 }
+ 50 
+ 51 // Returns the next prng value.
+ 52 // pRNG is: aX+b mod c with a = 0x5DEECE66D, b =  0xB, c = 1&lt;&lt;48
+ 53 // This is the lrand64 generator.
+ 54 uint64_t ThreadHeapSampler::next_random(uint64_t rnd) {
+ 55   const uint64_t PrngMult = 0x5DEECE66DLL;
+ 56   const uint64_t PrngAdd = 0xB;
+ 57   const uint64_t PrngModPower = 48;
+ 58   const uint64_t PrngModMask = ((uint64_t)1 &lt;&lt; PrngModPower) - 1;
+ 59   //assert(IS_SAFE_SIZE_MUL(PrngMult, rnd), &quot;Overflow on multiplication.&quot;);
+ 60   //assert(IS_SAFE_SIZE_ADD(PrngMult * rnd, PrngAdd), &quot;Overflow on addition.&quot;);
+ 61   return (PrngMult * rnd + PrngAdd) &amp; PrngModMask;
+ 62 }
+ 63 
+ 64 double ThreadHeapSampler::fast_log2(const double&amp; d) {
+ 65   assert(d&gt;0, &quot;bad value passed to assert&quot;);
+ 66   uint64_t x = 0;
+ 67   assert(sizeof(d) == sizeof(x),
+ 68          &quot;double and uint64_t do not have the same size&quot;);
+ 69   x = *reinterpret_cast&lt;const uint64_t*&gt;(&amp;d);
+ 70   const uint32_t x_high = x &gt;&gt; 32;
+ 71   assert(FastLogNumBits &lt;= 20, &quot;FastLogNumBits should be less than 20.&quot;);
+ 72   const uint32_t y = x_high &gt;&gt; (20 - FastLogNumBits) &amp; FastLogMask;
+ 73   const int32_t exponent = ((x_high &gt;&gt; 20) &amp; 0x7FF) - 1023;
+ 74 
+ 75   assert(_log_table_initialized, &quot;log table should be initialized&quot;);
+ 76   return exponent + _log_table[y];
+ 77 }
+ 78 
+ 79 // Generates a geometric variable with the specified mean (512K by default).
+ 80 // This is done by generating a random number between 0 and 1 and applying
+ 81 // the inverse cumulative distribution function for an exponential.
+ 82 // Specifically: Let m be the inverse of the sample interval, then
+ 83 // the probability distribution function is m*exp(-mx) so the CDF is
+ 84 // p = 1 - exp(-mx), so
+ 85 // q = 1 - p = exp(-mx)
+ 86 // log_e(q) = -mx
+ 87 // -log_e(q)/m = x
+ 88 // log_2(q) * (-log_e(2) * 1/m) = x
+ 89 // In the code, q is actually in the range 1 to 2**26, hence the -26 below
+ 90 void ThreadHeapSampler::pick_next_geometric_sample() {
+ 91   _rnd = next_random(_rnd);
+ 92   // Take the top 26 bits as the random number
+ 93   // (This plus a 1&lt;&lt;58 sampling bound gives a max possible step of
+ 94   // 5194297183973780480 bytes.  In this case,
+ 95   // for sample_parameter = 1&lt;&lt;19, max possible step is
+ 96   // 9448372 bytes (24 bits).
+ 97   const uint64_t PrngModPower = 48;  // Number of bits in prng
+ 98   // The uint32_t cast is to prevent a (hard-to-reproduce) NAN
+ 99   // under piii debug for some binaries.
+100   double q = static_cast&lt;uint32_t&gt;(_rnd &gt;&gt; (PrngModPower - 26)) + 1.0;
+101   // Put the computed p-value through the CDF of a geometric.
+102   // For faster performance (save ~1/20th exec time), replace
+103   // min(0.0, FastLog2(q) - 26)  by  (Fastlog2(q) - 26.000705)
+104   // The value 26.000705 is used rather than 26 to compensate
+105   // for inaccuracies in FastLog2 which otherwise result in a
+106   // negative answer.
+107   double log_val = (fast_log2(q) - 26);
+108   double result =
+109       (0.0 &lt; log_val ? 0.0 : log_val) * (-log(2.0) * (get_sampling_interval())) + 1;
+110   assert(result &gt; 0 &amp;&amp; result &lt; SIZE_MAX, &quot;Result is not in an acceptable range.&quot;);
+111   size_t interval = static_cast&lt;size_t&gt;(result);
+112   _bytes_until_sample = interval;
+113 }
+114 
+115 void ThreadHeapSampler::pick_next_sample(size_t overflowed_bytes) {
+116   // Explicitly test if the sampling interval is 0, return 0 to sample every
+117   // allocation.
+118   if (get_sampling_interval() == 0) {
+119     _bytes_until_sample = 0;
+120     return;
+121   }
+122 
+123   pick_next_geometric_sample();
+<a name="3" id="anc3"></a><span class="line-removed">124 </span>
+<span class="line-removed">125   // Try to correct sample size by removing extra space from last allocation.</span>
+<span class="line-removed">126   if (overflowed_bytes &gt; 0 &amp;&amp; _bytes_until_sample &gt; overflowed_bytes) {</span>
+<span class="line-removed">127     _bytes_until_sample -= overflowed_bytes;</span>
+<span class="line-removed">128   }</span>
+129 }
+130 
+131 void ThreadHeapSampler::check_for_sampling(oop obj, size_t allocation_size, size_t bytes_since_allocation) {
+132   size_t total_allocated_bytes = bytes_since_allocation + allocation_size;
+133 
+134   // If not yet time for a sample, skip it.
+135   if (total_allocated_bytes &lt; _bytes_until_sample) {
+136     _bytes_until_sample -= total_allocated_bytes;
+137     return;
+138   }
+139 
+140   JvmtiExport::sampled_object_alloc_event_collector(obj);
+141 
+142   size_t overflow_bytes = total_allocated_bytes - _bytes_until_sample;
+143   pick_next_sample(overflow_bytes);
+144 }
+145 
+146 int ThreadHeapSampler::get_sampling_interval() {
+<a name="4" id="anc4"></a><span class="line-modified">147   return OrderAccess::load_acquire(&amp;_sampling_interval);</span>
+148 }
+149 
+150 void ThreadHeapSampler::set_sampling_interval(int sampling_interval) {
+<a name="5" id="anc5"></a><span class="line-modified">151   OrderAccess::release_store(&amp;_sampling_interval, sampling_interval);</span>
+152 }
+<a name="6" id="anc6"></a><b style="font-size: large; color: red">--- EOF ---</b>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+</pre>
+<input id="eof" value="6" type="hidden" />
+</body>
+</html>
