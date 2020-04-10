@@ -1,0 +1,892 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Old src/hotspot/share/runtime/biasedLocking.cpp</title>
+    <link rel="stylesheet" href="../../../../style.css" />
+  </head>
+  <body>
+    <pre>
+  1 /*
+  2  * Copyright (c) 2005, 2018, Oracle and/or its affiliates. All rights reserved.
+  3  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  4  *
+  5  * This code is free software; you can redistribute it and/or modify it
+  6  * under the terms of the GNU General Public License version 2 only, as
+  7  * published by the Free Software Foundation.
+  8  *
+  9  * This code is distributed in the hope that it will be useful, but WITHOUT
+ 10  * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ 11  * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ 12  * version 2 for more details (a copy is included in the LICENSE file that
+ 13  * accompanied this code).
+ 14  *
+ 15  * You should have received a copy of the GNU General Public License version
+ 16  * 2 along with this work; if not, write to the Free Software Foundation,
+ 17  * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ 18  *
+ 19  * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ 20  * or visit www.oracle.com if you need additional information or have any
+ 21  * questions.
+ 22  *
+ 23  */
+ 24 
+ 25 #include &quot;precompiled.hpp&quot;
+ 26 #include &quot;classfile/classLoaderDataGraph.hpp&quot;
+ 27 #include &quot;jfr/jfrEvents.hpp&quot;
+ 28 #include &quot;jfr/support/jfrThreadId.hpp&quot;
+ 29 #include &quot;logging/log.hpp&quot;
+ 30 #include &quot;memory/resourceArea.hpp&quot;
+ 31 #include &quot;oops/klass.inline.hpp&quot;
+ 32 #include &quot;oops/markOop.hpp&quot;
+ 33 #include &quot;oops/oop.inline.hpp&quot;
+ 34 #include &quot;runtime/atomic.hpp&quot;
+ 35 #include &quot;runtime/basicLock.hpp&quot;
+ 36 #include &quot;runtime/biasedLocking.hpp&quot;
+ 37 #include &quot;runtime/handles.inline.hpp&quot;
+ 38 #include &quot;runtime/task.hpp&quot;
+ 39 #include &quot;runtime/threadSMR.hpp&quot;
+ 40 #include &quot;runtime/vframe.hpp&quot;
+ 41 #include &quot;runtime/vmThread.hpp&quot;
+ 42 #include &quot;runtime/vmOperations.hpp&quot;
+ 43 
+ 44 
+ 45 static bool _biased_locking_enabled = false;
+ 46 BiasedLockingCounters BiasedLocking::_counters;
+ 47 
+ 48 static GrowableArray&lt;Handle&gt;*  _preserved_oop_stack  = NULL;
+ 49 static GrowableArray&lt;markOop&gt;* _preserved_mark_stack = NULL;
+ 50 
+ 51 static void enable_biased_locking(InstanceKlass* k) {
+ 52   k-&gt;set_prototype_header(markOopDesc::biased_locking_prototype());
+ 53 }
+ 54 
+ 55 class VM_EnableBiasedLocking: public VM_Operation {
+ 56  private:
+ 57   bool _is_cheap_allocated;
+ 58  public:
+ 59   VM_EnableBiasedLocking(bool is_cheap_allocated) { _is_cheap_allocated = is_cheap_allocated; }
+ 60   VMOp_Type type() const          { return VMOp_EnableBiasedLocking; }
+ 61   Mode evaluation_mode() const    { return _is_cheap_allocated ? _async_safepoint : _safepoint; }
+ 62   bool is_cheap_allocated() const { return _is_cheap_allocated; }
+ 63 
+ 64   void doit() {
+ 65     // Iterate the class loader data dictionaries enabling biased locking for all
+ 66     // currently loaded classes.
+ 67     ClassLoaderDataGraph::dictionary_classes_do(enable_biased_locking);
+ 68     // Indicate that future instances should enable it as well
+ 69     _biased_locking_enabled = true;
+ 70 
+ 71     log_info(biasedlocking)(&quot;Biased locking enabled&quot;);
+ 72   }
+ 73 
+ 74   bool allow_nested_vm_operations() const        { return false; }
+ 75 };
+ 76 
+ 77 
+ 78 // One-shot PeriodicTask subclass for enabling biased locking
+ 79 class EnableBiasedLockingTask : public PeriodicTask {
+ 80  public:
+ 81   EnableBiasedLockingTask(size_t interval_time) : PeriodicTask(interval_time) {}
+ 82 
+ 83   virtual void task() {
+ 84     // Use async VM operation to avoid blocking the Watcher thread.
+ 85     // VM Thread will free C heap storage.
+ 86     VM_EnableBiasedLocking *op = new VM_EnableBiasedLocking(true);
+ 87     VMThread::execute(op);
+ 88 
+ 89     // Reclaim our storage and disenroll ourself
+ 90     delete this;
+ 91   }
+ 92 };
+ 93 
+ 94 
+ 95 void BiasedLocking::init() {
+ 96   // If biased locking is enabled, schedule a task to fire a few
+ 97   // seconds into the run which turns on biased locking for all
+ 98   // currently loaded classes as well as future ones. This is a
+ 99   // workaround for startup time regressions due to a large number of
+100   // safepoints being taken during VM startup for bias revocation.
+101   // Ideally we would have a lower cost for individual bias revocation
+102   // and not need a mechanism like this.
+103   if (UseBiasedLocking) {
+104     if (BiasedLockingStartupDelay &gt; 0) {
+105       EnableBiasedLockingTask* task = new EnableBiasedLockingTask(BiasedLockingStartupDelay);
+106       task-&gt;enroll();
+107     } else {
+108       VM_EnableBiasedLocking op(false);
+109       VMThread::execute(&amp;op);
+110     }
+111   }
+112 }
+113 
+114 
+115 bool BiasedLocking::enabled() {
+116   return _biased_locking_enabled;
+117 }
+118 
+119 // Returns MonitorInfos for all objects locked on this thread in youngest to oldest order
+120 static GrowableArray&lt;MonitorInfo*&gt;* get_or_compute_monitor_info(JavaThread* thread) {
+121   GrowableArray&lt;MonitorInfo*&gt;* info = thread-&gt;cached_monitor_info();
+122   if (info != NULL) {
+123     return info;
+124   }
+125 
+126   info = new GrowableArray&lt;MonitorInfo*&gt;();
+127 
+128   // It&#39;s possible for the thread to not have any Java frames on it,
+129   // i.e., if it&#39;s the main thread and it&#39;s already returned from main()
+130   if (thread-&gt;has_last_Java_frame()) {
+131     RegisterMap rm(thread);
+132     for (javaVFrame* vf = thread-&gt;last_java_vframe(&amp;rm); vf != NULL; vf = vf-&gt;java_sender()) {
+133       GrowableArray&lt;MonitorInfo*&gt; *monitors = vf-&gt;monitors();
+134       if (monitors != NULL) {
+135         int len = monitors-&gt;length();
+136         // Walk monitors youngest to oldest
+137         for (int i = len - 1; i &gt;= 0; i--) {
+138           MonitorInfo* mon_info = monitors-&gt;at(i);
+139           if (mon_info-&gt;eliminated()) continue;
+140           oop owner = mon_info-&gt;owner();
+141           if (owner != NULL) {
+142             info-&gt;append(mon_info);
+143           }
+144         }
+145       }
+146     }
+147   }
+148 
+149   thread-&gt;set_cached_monitor_info(info);
+150   return info;
+151 }
+152 
+153 // After the call, *biased_locker will be set to obj-&gt;mark()-&gt;biased_locker() if biased_locker != NULL,
+154 // AND it is a living thread. Otherwise it will not be updated, (i.e. the caller is responsible for initialization).
+155 static BiasedLocking::Condition revoke_bias(oop obj, bool allow_rebias, bool is_bulk, JavaThread* requesting_thread, JavaThread** biased_locker) {
+156   markOop mark = obj-&gt;mark();
+157   if (!mark-&gt;has_bias_pattern()) {
+158     if (log_is_enabled(Info, biasedlocking)) {
+159       ResourceMark rm;
+160       log_info(biasedlocking)(&quot;  (Skipping revocation of object &quot; INTPTR_FORMAT
+161                               &quot;, mark &quot; INTPTR_FORMAT &quot;, type %s&quot;
+162                               &quot;, requesting thread &quot; INTPTR_FORMAT
+163                               &quot; because it&#39;s no longer biased)&quot;,
+164                               p2i((void *)obj), (intptr_t) mark,
+165                               obj-&gt;klass()-&gt;external_name(),
+166                               (intptr_t) requesting_thread);
+167     }
+168     return BiasedLocking::NOT_BIASED;
+169   }
+170 
+171   uint age = mark-&gt;age();
+172   markOop   biased_prototype = markOopDesc::biased_locking_prototype()-&gt;set_age(age);
+173   markOop unbiased_prototype = markOopDesc::prototype()-&gt;set_age(age);
+174 
+175   // Log at &quot;info&quot; level if not bulk, else &quot;trace&quot; level
+176   if (!is_bulk) {
+177     ResourceMark rm;
+178     log_info(biasedlocking)(&quot;Revoking bias of object &quot; INTPTR_FORMAT &quot;, mark &quot;
+179                             INTPTR_FORMAT &quot;, type %s, prototype header &quot; INTPTR_FORMAT
+180                             &quot;, allow rebias %d, requesting thread &quot; INTPTR_FORMAT,
+181                             p2i((void *)obj),
+182                             (intptr_t) mark,
+183                             obj-&gt;klass()-&gt;external_name(),
+184                             (intptr_t) obj-&gt;klass()-&gt;prototype_header(),
+185                             (allow_rebias ? 1 : 0),
+186                             (intptr_t) requesting_thread);
+187   } else {
+188     ResourceMark rm;
+189     log_trace(biasedlocking)(&quot;Revoking bias of object &quot; INTPTR_FORMAT &quot; , mark &quot;
+190                              INTPTR_FORMAT &quot; , type %s , prototype header &quot; INTPTR_FORMAT
+191                              &quot; , allow rebias %d , requesting thread &quot; INTPTR_FORMAT,
+192                              p2i((void *)obj),
+193                              (intptr_t) mark,
+194                              obj-&gt;klass()-&gt;external_name(),
+195                              (intptr_t) obj-&gt;klass()-&gt;prototype_header(),
+196                              (allow_rebias ? 1 : 0),
+197                              (intptr_t) requesting_thread);
+198   }
+199 
+200   JavaThread* biased_thread = mark-&gt;biased_locker();
+201   if (biased_thread == NULL) {
+202     // Object is anonymously biased. We can get here if, for
+203     // example, we revoke the bias due to an identity hash code
+204     // being computed for an object.
+205     if (!allow_rebias) {
+206       obj-&gt;set_mark(unbiased_prototype);
+207     }
+208     // Log at &quot;info&quot; level if not bulk, else &quot;trace&quot; level
+209     if (!is_bulk) {
+210       log_info(biasedlocking)(&quot;  Revoked bias of anonymously-biased object&quot;);
+211     } else {
+212       log_trace(biasedlocking)(&quot;  Revoked bias of anonymously-biased object&quot;);
+213     }
+214     return BiasedLocking::BIAS_REVOKED;
+215   }
+216 
+217   // Handle case where the thread toward which the object was biased has exited
+218   bool thread_is_alive = false;
+219   if (requesting_thread == biased_thread) {
+220     thread_is_alive = true;
+221   } else {
+222     ThreadsListHandle tlh;
+223     thread_is_alive = tlh.includes(biased_thread);
+224   }
+225   if (!thread_is_alive) {
+226     if (allow_rebias) {
+227       obj-&gt;set_mark(biased_prototype);
+228     } else {
+229       obj-&gt;set_mark(unbiased_prototype);
+230     }
+231     // Log at &quot;info&quot; level if not bulk, else &quot;trace&quot; level
+232     if (!is_bulk) {
+233       log_info(biasedlocking)(&quot;  Revoked bias of object biased toward dead thread (&quot;
+234                               PTR_FORMAT &quot;)&quot;, p2i(biased_thread));
+235     } else {
+236       log_trace(biasedlocking)(&quot;  Revoked bias of object biased toward dead thread (&quot;
+237                                PTR_FORMAT &quot;)&quot;, p2i(biased_thread));
+238     }
+239     return BiasedLocking::BIAS_REVOKED;
+240   }
+241 
+242   // Log at &quot;info&quot; level if not bulk, else &quot;trace&quot; level
+243   if (!is_bulk) {
+244     log_info(biasedlocking)(&quot;  Revoked bias of object biased toward live thread (&quot;
+245                             PTR_FORMAT &quot;)&quot;, p2i(biased_thread));
+246   } else {
+247     log_trace(biasedlocking)(&quot;  Revoked bias of object biased toward live thread (&quot;
+248                                PTR_FORMAT &quot;)&quot;, p2i(biased_thread));
+249   }
+250 
+251   // Thread owning bias is alive.
+252   // Check to see whether it currently owns the lock and, if so,
+253   // write down the needed displaced headers to the thread&#39;s stack.
+254   // Otherwise, restore the object&#39;s header either to the unlocked
+255   // or unbiased state.
+256   GrowableArray&lt;MonitorInfo*&gt;* cached_monitor_info = get_or_compute_monitor_info(biased_thread);
+257   BasicLock* highest_lock = NULL;
+258   for (int i = 0; i &lt; cached_monitor_info-&gt;length(); i++) {
+259     MonitorInfo* mon_info = cached_monitor_info-&gt;at(i);
+260     if (oopDesc::equals(mon_info-&gt;owner(), obj)) {
+261       log_trace(biasedlocking)(&quot;   mon_info-&gt;owner (&quot; PTR_FORMAT &quot;) == obj (&quot; PTR_FORMAT &quot;)&quot;,
+262                                p2i((void *) mon_info-&gt;owner()),
+263                                p2i((void *) obj));
+264       // Assume recursive case and fix up highest lock later
+265       markOop mark = markOopDesc::encode((BasicLock*) NULL);
+266       highest_lock = mon_info-&gt;lock();
+267       highest_lock-&gt;set_displaced_header(mark);
+268     } else {
+269       log_trace(biasedlocking)(&quot;   mon_info-&gt;owner (&quot; PTR_FORMAT &quot;) != obj (&quot; PTR_FORMAT &quot;)&quot;,
+270                                p2i((void *) mon_info-&gt;owner()),
+271                                p2i((void *) obj));
+272     }
+273   }
+274   if (highest_lock != NULL) {
+275     // Fix up highest lock to contain displaced header and point
+276     // object at it
+277     highest_lock-&gt;set_displaced_header(unbiased_prototype);
+278     // Reset object header to point to displaced mark.
+279     // Must release storing the lock address for platforms without TSO
+280     // ordering (e.g. ppc).
+281     obj-&gt;release_set_mark(markOopDesc::encode(highest_lock));
+282     assert(!obj-&gt;mark()-&gt;has_bias_pattern(), &quot;illegal mark state: stack lock used bias bit&quot;);
+283     // Log at &quot;info&quot; level if not bulk, else &quot;trace&quot; level
+284     if (!is_bulk) {
+285       log_info(biasedlocking)(&quot;  Revoked bias of currently-locked object&quot;);
+286     } else {
+287       log_trace(biasedlocking)(&quot;  Revoked bias of currently-locked object&quot;);
+288     }
+289   } else {
+290     // Log at &quot;info&quot; level if not bulk, else &quot;trace&quot; level
+291     if (!is_bulk) {
+292       log_info(biasedlocking)(&quot;  Revoked bias of currently-unlocked object&quot;);
+293     } else {
+294       log_trace(biasedlocking)(&quot;  Revoked bias of currently-unlocked object&quot;);
+295     }
+296     if (allow_rebias) {
+297       obj-&gt;set_mark(biased_prototype);
+298     } else {
+299       // Store the unlocked value into the object&#39;s header.
+300       obj-&gt;set_mark(unbiased_prototype);
+301     }
+302   }
+303 
+304   // If requested, return information on which thread held the bias
+305   if (biased_locker != NULL) {
+306     *biased_locker = biased_thread;
+307   }
+308 
+309   return BiasedLocking::BIAS_REVOKED;
+310 }
+311 
+312 
+313 enum HeuristicsResult {
+314   HR_NOT_BIASED    = 1,
+315   HR_SINGLE_REVOKE = 2,
+316   HR_BULK_REBIAS   = 3,
+317   HR_BULK_REVOKE   = 4
+318 };
+319 
+320 
+321 static HeuristicsResult update_heuristics(oop o, bool allow_rebias) {
+322   markOop mark = o-&gt;mark();
+323   if (!mark-&gt;has_bias_pattern()) {
+324     return HR_NOT_BIASED;
+325   }
+326 
+327   // Heuristics to attempt to throttle the number of revocations.
+328   // Stages:
+329   // 1. Revoke the biases of all objects in the heap of this type,
+330   //    but allow rebiasing of those objects if unlocked.
+331   // 2. Revoke the biases of all objects in the heap of this type
+332   //    and don&#39;t allow rebiasing of these objects. Disable
+333   //    allocation of objects of that type with the bias bit set.
+334   Klass* k = o-&gt;klass();
+335   jlong cur_time = os::javaTimeMillis();
+336   jlong last_bulk_revocation_time = k-&gt;last_biased_lock_bulk_revocation_time();
+337   int revocation_count = k-&gt;biased_lock_revocation_count();
+338   if ((revocation_count &gt;= BiasedLockingBulkRebiasThreshold) &amp;&amp;
+339       (revocation_count &lt;  BiasedLockingBulkRevokeThreshold) &amp;&amp;
+340       (last_bulk_revocation_time != 0) &amp;&amp;
+341       (cur_time - last_bulk_revocation_time &gt;= BiasedLockingDecayTime)) {
+342     // This is the first revocation we&#39;ve seen in a while of an
+343     // object of this type since the last time we performed a bulk
+344     // rebiasing operation. The application is allocating objects in
+345     // bulk which are biased toward a thread and then handing them
+346     // off to another thread. We can cope with this allocation
+347     // pattern via the bulk rebiasing mechanism so we reset the
+348     // klass&#39;s revocation count rather than allow it to increase
+349     // monotonically. If we see the need to perform another bulk
+350     // rebias operation later, we will, and if subsequently we see
+351     // many more revocation operations in a short period of time we
+352     // will completely disable biasing for this type.
+353     k-&gt;set_biased_lock_revocation_count(0);
+354     revocation_count = 0;
+355   }
+356 
+357   // Make revocation count saturate just beyond BiasedLockingBulkRevokeThreshold
+358   if (revocation_count &lt;= BiasedLockingBulkRevokeThreshold) {
+359     revocation_count = k-&gt;atomic_incr_biased_lock_revocation_count();
+360   }
+361 
+362   if (revocation_count == BiasedLockingBulkRevokeThreshold) {
+363     return HR_BULK_REVOKE;
+364   }
+365 
+366   if (revocation_count == BiasedLockingBulkRebiasThreshold) {
+367     return HR_BULK_REBIAS;
+368   }
+369 
+370   return HR_SINGLE_REVOKE;
+371 }
+372 
+373 
+374 static BiasedLocking::Condition bulk_revoke_or_rebias_at_safepoint(oop o,
+375                                                                    bool bulk_rebias,
+376                                                                    bool attempt_rebias_of_object,
+377                                                                    JavaThread* requesting_thread) {
+378   assert(SafepointSynchronize::is_at_safepoint(), &quot;must be done at safepoint&quot;);
+379 
+380   log_info(biasedlocking)(&quot;* Beginning bulk revocation (kind == %s) because of object &quot;
+381                           INTPTR_FORMAT &quot; , mark &quot; INTPTR_FORMAT &quot; , type %s&quot;,
+382                           (bulk_rebias ? &quot;rebias&quot; : &quot;revoke&quot;),
+383                           p2i((void *) o),
+384                           (intptr_t) o-&gt;mark(),
+385                           o-&gt;klass()-&gt;external_name());
+386 
+387   jlong cur_time = os::javaTimeMillis();
+388   o-&gt;klass()-&gt;set_last_biased_lock_bulk_revocation_time(cur_time);
+389 
+390 
+391   Klass* k_o = o-&gt;klass();
+392   Klass* klass = k_o;
+393 
+394   {
+395     JavaThreadIteratorWithHandle jtiwh;
+396 
+397     if (bulk_rebias) {
+398       // Use the epoch in the klass of the object to implicitly revoke
+399       // all biases of objects of this data type and force them to be
+400       // reacquired. However, we also need to walk the stacks of all
+401       // threads and update the headers of lightweight locked objects
+402       // with biases to have the current epoch.
+403 
+404       // If the prototype header doesn&#39;t have the bias pattern, don&#39;t
+405       // try to update the epoch -- assume another VM operation came in
+406       // and reset the header to the unbiased state, which will
+407       // implicitly cause all existing biases to be revoked
+408       if (klass-&gt;prototype_header()-&gt;has_bias_pattern()) {
+409         int prev_epoch = klass-&gt;prototype_header()-&gt;bias_epoch();
+410         klass-&gt;set_prototype_header(klass-&gt;prototype_header()-&gt;incr_bias_epoch());
+411         int cur_epoch = klass-&gt;prototype_header()-&gt;bias_epoch();
+412 
+413         // Now walk all threads&#39; stacks and adjust epochs of any biased
+414         // and locked objects of this data type we encounter
+415         for (; JavaThread *thr = jtiwh.next(); ) {
+416           GrowableArray&lt;MonitorInfo*&gt;* cached_monitor_info = get_or_compute_monitor_info(thr);
+417           for (int i = 0; i &lt; cached_monitor_info-&gt;length(); i++) {
+418             MonitorInfo* mon_info = cached_monitor_info-&gt;at(i);
+419             oop owner = mon_info-&gt;owner();
+420             markOop mark = owner-&gt;mark();
+421             if ((owner-&gt;klass() == k_o) &amp;&amp; mark-&gt;has_bias_pattern()) {
+422               // We might have encountered this object already in the case of recursive locking
+423               assert(mark-&gt;bias_epoch() == prev_epoch || mark-&gt;bias_epoch() == cur_epoch, &quot;error in bias epoch adjustment&quot;);
+424               owner-&gt;set_mark(mark-&gt;set_bias_epoch(cur_epoch));
+425             }
+426           }
+427         }
+428       }
+429 
+430       // At this point we&#39;re done. All we have to do is potentially
+431       // adjust the header of the given object to revoke its bias.
+432       revoke_bias(o, attempt_rebias_of_object &amp;&amp; klass-&gt;prototype_header()-&gt;has_bias_pattern(), true, requesting_thread, NULL);
+433     } else {
+434       if (log_is_enabled(Info, biasedlocking)) {
+435         ResourceMark rm;
+436         log_info(biasedlocking)(&quot;* Disabling biased locking for type %s&quot;, klass-&gt;external_name());
+437       }
+438 
+439       // Disable biased locking for this data type. Not only will this
+440       // cause future instances to not be biased, but existing biased
+441       // instances will notice that this implicitly caused their biases
+442       // to be revoked.
+443       klass-&gt;set_prototype_header(markOopDesc::prototype());
+444 
+445       // Now walk all threads&#39; stacks and forcibly revoke the biases of
+446       // any locked and biased objects of this data type we encounter.
+447       for (; JavaThread *thr = jtiwh.next(); ) {
+448         GrowableArray&lt;MonitorInfo*&gt;* cached_monitor_info = get_or_compute_monitor_info(thr);
+449         for (int i = 0; i &lt; cached_monitor_info-&gt;length(); i++) {
+450           MonitorInfo* mon_info = cached_monitor_info-&gt;at(i);
+451           oop owner = mon_info-&gt;owner();
+452           markOop mark = owner-&gt;mark();
+453           if ((owner-&gt;klass() == k_o) &amp;&amp; mark-&gt;has_bias_pattern()) {
+454             revoke_bias(owner, false, true, requesting_thread, NULL);
+455           }
+456         }
+457       }
+458 
+459       // Must force the bias of the passed object to be forcibly revoked
+460       // as well to ensure guarantees to callers
+461       revoke_bias(o, false, true, requesting_thread, NULL);
+462     }
+463   } // ThreadsListHandle is destroyed here.
+464 
+465   log_info(biasedlocking)(&quot;* Ending bulk revocation&quot;);
+466 
+467   BiasedLocking::Condition status_code = BiasedLocking::BIAS_REVOKED;
+468 
+469   if (attempt_rebias_of_object &amp;&amp;
+470       o-&gt;mark()-&gt;has_bias_pattern() &amp;&amp;
+471       klass-&gt;prototype_header()-&gt;has_bias_pattern()) {
+472     markOop new_mark = markOopDesc::encode(requesting_thread, o-&gt;mark()-&gt;age(),
+473                                            klass-&gt;prototype_header()-&gt;bias_epoch());
+474     o-&gt;set_mark(new_mark);
+475     status_code = BiasedLocking::BIAS_REVOKED_AND_REBIASED;
+476     log_info(biasedlocking)(&quot;  Rebiased object toward thread &quot; INTPTR_FORMAT, (intptr_t) requesting_thread);
+477   }
+478 
+479   assert(!o-&gt;mark()-&gt;has_bias_pattern() ||
+480          (attempt_rebias_of_object &amp;&amp; (o-&gt;mark()-&gt;biased_locker() == requesting_thread)),
+481          &quot;bug in bulk bias revocation&quot;);
+482 
+483   return status_code;
+484 }
+485 
+486 
+487 static void clean_up_cached_monitor_info() {
+488   // Walk the thread list clearing out the cached monitors
+489   for (JavaThreadIteratorWithHandle jtiwh; JavaThread *thr = jtiwh.next(); ) {
+490     thr-&gt;set_cached_monitor_info(NULL);
+491   }
+492 }
+493 
+494 
+495 class VM_RevokeBias : public VM_Operation {
+496 protected:
+497   Handle* _obj;
+498   GrowableArray&lt;Handle&gt;* _objs;
+499   JavaThread* _requesting_thread;
+500   BiasedLocking::Condition _status_code;
+501   traceid _biased_locker_id;
+502 
+503 public:
+504   VM_RevokeBias(Handle* obj, JavaThread* requesting_thread)
+505     : _obj(obj)
+506     , _objs(NULL)
+507     , _requesting_thread(requesting_thread)
+508     , _status_code(BiasedLocking::NOT_BIASED)
+509     , _biased_locker_id(0) {}
+510 
+511   VM_RevokeBias(GrowableArray&lt;Handle&gt;* objs, JavaThread* requesting_thread)
+512     : _obj(NULL)
+513     , _objs(objs)
+514     , _requesting_thread(requesting_thread)
+515     , _status_code(BiasedLocking::NOT_BIASED)
+516     , _biased_locker_id(0) {}
+517 
+518   virtual VMOp_Type type() const { return VMOp_RevokeBias; }
+519 
+520   virtual bool doit_prologue() {
+521     // Verify that there is actual work to do since the callers just
+522     // give us locked object(s). If we don&#39;t find any biased objects
+523     // there is nothing to do and we avoid a safepoint.
+524     if (_obj != NULL) {
+525       markOop mark = (*_obj)()-&gt;mark();
+526       if (mark-&gt;has_bias_pattern()) {
+527         return true;
+528       }
+529     } else {
+530       for ( int i = 0 ; i &lt; _objs-&gt;length(); i++ ) {
+531         markOop mark = (_objs-&gt;at(i))()-&gt;mark();
+532         if (mark-&gt;has_bias_pattern()) {
+533           return true;
+534         }
+535       }
+536     }
+537     return false;
+538   }
+539 
+540   virtual void doit() {
+541     if (_obj != NULL) {
+542       log_info(biasedlocking)(&quot;Revoking bias with potentially per-thread safepoint:&quot;);
+543       JavaThread* biased_locker = NULL;
+544       _status_code = revoke_bias((*_obj)(), false, false, _requesting_thread, &amp;biased_locker);
+545       if (biased_locker != NULL) {
+546         _biased_locker_id = JFR_THREAD_ID(biased_locker);
+547       }
+548       clean_up_cached_monitor_info();
+549       return;
+550     } else {
+551       log_info(biasedlocking)(&quot;Revoking bias with global safepoint:&quot;);
+552       BiasedLocking::revoke_at_safepoint(_objs);
+553     }
+554   }
+555 
+556   BiasedLocking::Condition status_code() const {
+557     return _status_code;
+558   }
+559 
+560   traceid biased_locker() const {
+561     return _biased_locker_id;
+562   }
+563 };
+564 
+565 
+566 class VM_BulkRevokeBias : public VM_RevokeBias {
+567 private:
+568   bool _bulk_rebias;
+569   bool _attempt_rebias_of_object;
+570 
+571 public:
+572   VM_BulkRevokeBias(Handle* obj, JavaThread* requesting_thread,
+573                     bool bulk_rebias,
+574                     bool attempt_rebias_of_object)
+575     : VM_RevokeBias(obj, requesting_thread)
+576     , _bulk_rebias(bulk_rebias)
+577     , _attempt_rebias_of_object(attempt_rebias_of_object) {}
+578 
+579   virtual VMOp_Type type() const { return VMOp_BulkRevokeBias; }
+580   virtual bool doit_prologue()   { return true; }
+581 
+582   virtual void doit() {
+583     _status_code = bulk_revoke_or_rebias_at_safepoint((*_obj)(), _bulk_rebias, _attempt_rebias_of_object, _requesting_thread);
+584     clean_up_cached_monitor_info();
+585   }
+586 };
+587 
+588 template &lt;typename E&gt;
+589 static void set_safepoint_id(E* event) {
+590   assert(event != NULL, &quot;invariant&quot;);
+591   // Subtract 1 to match the id of events committed inside the safepoint
+592   event-&gt;set_safepointId(SafepointSynchronize::safepoint_counter() - 1);
+593 }
+594 
+595 static void post_self_revocation_event(EventBiasedLockSelfRevocation* event, Klass* k) {
+596   assert(event != NULL, &quot;invariant&quot;);
+597   assert(k != NULL, &quot;invariant&quot;);
+598   assert(event-&gt;should_commit(), &quot;invariant&quot;);
+599   event-&gt;set_lockClass(k);
+600   event-&gt;commit();
+601 }
+602 
+603 static void post_revocation_event(EventBiasedLockRevocation* event, Klass* k, VM_RevokeBias* revoke) {
+604   assert(event != NULL, &quot;invariant&quot;);
+605   assert(k != NULL, &quot;invariant&quot;);
+606   assert(revoke != NULL, &quot;invariant&quot;);
+607   assert(event-&gt;should_commit(), &quot;invariant&quot;);
+608   event-&gt;set_lockClass(k);
+609   set_safepoint_id(event);
+610   event-&gt;set_previousOwner(revoke-&gt;biased_locker());
+611   event-&gt;commit();
+612 }
+613 
+614 static void post_class_revocation_event(EventBiasedLockClassRevocation* event, Klass* k, bool disabled_bias) {
+615   assert(event != NULL, &quot;invariant&quot;);
+616   assert(k != NULL, &quot;invariant&quot;);
+617   assert(event-&gt;should_commit(), &quot;invariant&quot;);
+618   event-&gt;set_revokedClass(k);
+619   event-&gt;set_disableBiasing(disabled_bias);
+620   set_safepoint_id(event);
+621   event-&gt;commit();
+622 }
+623 
+624 BiasedLocking::Condition BiasedLocking::revoke_and_rebias(Handle obj, bool attempt_rebias, TRAPS) {
+625   assert(!SafepointSynchronize::is_at_safepoint(), &quot;must not be called while at safepoint&quot;);
+626 
+627   // We can revoke the biases of anonymously-biased objects
+628   // efficiently enough that we should not cause these revocations to
+629   // update the heuristics because doing so may cause unwanted bulk
+630   // revocations (which are expensive) to occur.
+631   markOop mark = obj-&gt;mark();
+632   if (mark-&gt;is_biased_anonymously() &amp;&amp; !attempt_rebias) {
+633     // We are probably trying to revoke the bias of this object due to
+634     // an identity hash code computation. Try to revoke the bias
+635     // without a safepoint. This is possible if we can successfully
+636     // compare-and-exchange an unbiased header into the mark word of
+637     // the object, meaning that no other thread has raced to acquire
+638     // the bias of the object.
+639     markOop biased_value       = mark;
+640     markOop unbiased_prototype = markOopDesc::prototype()-&gt;set_age(mark-&gt;age());
+641     markOop res_mark = obj-&gt;cas_set_mark(unbiased_prototype, mark);
+642     if (res_mark == biased_value) {
+643       return BIAS_REVOKED;
+644     }
+645   } else if (mark-&gt;has_bias_pattern()) {
+646     Klass* k = obj-&gt;klass();
+647     markOop prototype_header = k-&gt;prototype_header();
+648     if (!prototype_header-&gt;has_bias_pattern()) {
+649       // This object has a stale bias from before the bulk revocation
+650       // for this data type occurred. It&#39;s pointless to update the
+651       // heuristics at this point so simply update the header with a
+652       // CAS. If we fail this race, the object&#39;s bias has been revoked
+653       // by another thread so we simply return and let the caller deal
+654       // with it.
+655       markOop biased_value       = mark;
+656       markOop res_mark = obj-&gt;cas_set_mark(prototype_header, mark);
+657       assert(!obj-&gt;mark()-&gt;has_bias_pattern(), &quot;even if we raced, should still be revoked&quot;);
+658       return BIAS_REVOKED;
+659     } else if (prototype_header-&gt;bias_epoch() != mark-&gt;bias_epoch()) {
+660       // The epoch of this biasing has expired indicating that the
+661       // object is effectively unbiased. Depending on whether we need
+662       // to rebias or revoke the bias of this object we can do it
+663       // efficiently enough with a CAS that we shouldn&#39;t update the
+664       // heuristics. This is normally done in the assembly code but we
+665       // can reach this point due to various points in the runtime
+666       // needing to revoke biases.
+667       if (attempt_rebias) {
+668         assert(THREAD-&gt;is_Java_thread(), &quot;&quot;);
+669         markOop biased_value       = mark;
+670         markOop rebiased_prototype = markOopDesc::encode((JavaThread*) THREAD, mark-&gt;age(), prototype_header-&gt;bias_epoch());
+671         markOop res_mark = obj-&gt;cas_set_mark(rebiased_prototype, mark);
+672         if (res_mark == biased_value) {
+673           return BIAS_REVOKED_AND_REBIASED;
+674         }
+675       } else {
+676         markOop biased_value       = mark;
+677         markOop unbiased_prototype = markOopDesc::prototype()-&gt;set_age(mark-&gt;age());
+678         markOop res_mark = obj-&gt;cas_set_mark(unbiased_prototype, mark);
+679         if (res_mark == biased_value) {
+680           return BIAS_REVOKED;
+681         }
+682       }
+683     }
+684   }
+685 
+686   HeuristicsResult heuristics = update_heuristics(obj(), attempt_rebias);
+687   if (heuristics == HR_NOT_BIASED) {
+688     return NOT_BIASED;
+689   } else if (heuristics == HR_SINGLE_REVOKE) {
+690     Klass *k = obj-&gt;klass();
+691     markOop prototype_header = k-&gt;prototype_header();
+692     if (mark-&gt;biased_locker() == THREAD &amp;&amp;
+693         prototype_header-&gt;bias_epoch() == mark-&gt;bias_epoch()) {
+694       // A thread is trying to revoke the bias of an object biased
+695       // toward it, again likely due to an identity hash code
+696       // computation. We can again avoid a safepoint in this case
+697       // since we are only going to walk our own stack. There are no
+698       // races with revocations occurring in other threads because we
+699       // reach no safepoints in the revocation path.
+700       // Also check the epoch because even if threads match, another thread
+701       // can come in with a CAS to steal the bias of an object that has a
+702       // stale epoch.
+703       ResourceMark rm;
+704       log_info(biasedlocking)(&quot;Revoking bias by walking my own stack:&quot;);
+705       EventBiasedLockSelfRevocation event;
+706       BiasedLocking::Condition cond = revoke_bias(obj(), false, false, (JavaThread*) THREAD, NULL);
+707       ((JavaThread*) THREAD)-&gt;set_cached_monitor_info(NULL);
+708       assert(cond == BIAS_REVOKED, &quot;why not?&quot;);
+709       if (event.should_commit()) {
+710         post_self_revocation_event(&amp;event, k);
+711       }
+712       return cond;
+713     } else {
+714       EventBiasedLockRevocation event;
+715       VM_RevokeBias revoke(&amp;obj, (JavaThread*) THREAD);
+716       VMThread::execute(&amp;revoke);
+717       if (event.should_commit() &amp;&amp; revoke.status_code() != NOT_BIASED) {
+718         post_revocation_event(&amp;event, k, &amp;revoke);
+719       }
+720       return revoke.status_code();
+721     }
+722   }
+723 
+724   assert((heuristics == HR_BULK_REVOKE) ||
+725          (heuristics == HR_BULK_REBIAS), &quot;?&quot;);
+726   EventBiasedLockClassRevocation event;
+727   VM_BulkRevokeBias bulk_revoke(&amp;obj, (JavaThread*) THREAD,
+728                                 (heuristics == HR_BULK_REBIAS),
+729                                 attempt_rebias);
+730   VMThread::execute(&amp;bulk_revoke);
+731   if (event.should_commit()) {
+732     post_class_revocation_event(&amp;event, obj-&gt;klass(), heuristics != HR_BULK_REBIAS);
+733   }
+734   return bulk_revoke.status_code();
+735 }
+736 
+737 
+738 void BiasedLocking::revoke(GrowableArray&lt;Handle&gt;* objs) {
+739   assert(!SafepointSynchronize::is_at_safepoint(), &quot;must not be called while at safepoint&quot;);
+740   if (objs-&gt;length() == 0) {
+741     return;
+742   }
+743   VM_RevokeBias revoke(objs, JavaThread::current());
+744   VMThread::execute(&amp;revoke);
+745 }
+746 
+747 
+748 void BiasedLocking::revoke_at_safepoint(Handle h_obj) {
+749   assert(SafepointSynchronize::is_at_safepoint(), &quot;must only be called while at safepoint&quot;);
+750   oop obj = h_obj();
+751   HeuristicsResult heuristics = update_heuristics(obj, false);
+752   if (heuristics == HR_SINGLE_REVOKE) {
+753     revoke_bias(obj, false, false, NULL, NULL);
+754   } else if ((heuristics == HR_BULK_REBIAS) ||
+755              (heuristics == HR_BULK_REVOKE)) {
+756     bulk_revoke_or_rebias_at_safepoint(obj, (heuristics == HR_BULK_REBIAS), false, NULL);
+757   }
+758   clean_up_cached_monitor_info();
+759 }
+760 
+761 
+762 void BiasedLocking::revoke_at_safepoint(GrowableArray&lt;Handle&gt;* objs) {
+763   assert(SafepointSynchronize::is_at_safepoint(), &quot;must only be called while at safepoint&quot;);
+764   int len = objs-&gt;length();
+765   for (int i = 0; i &lt; len; i++) {
+766     oop obj = (objs-&gt;at(i))();
+767     HeuristicsResult heuristics = update_heuristics(obj, false);
+768     if (heuristics == HR_SINGLE_REVOKE) {
+769       revoke_bias(obj, false, false, NULL, NULL);
+770     } else if ((heuristics == HR_BULK_REBIAS) ||
+771                (heuristics == HR_BULK_REVOKE)) {
+772       bulk_revoke_or_rebias_at_safepoint(obj, (heuristics == HR_BULK_REBIAS), false, NULL);
+773     }
+774   }
+775   clean_up_cached_monitor_info();
+776 }
+777 
+778 
+779 void BiasedLocking::preserve_marks() {
+780   if (!UseBiasedLocking)
+781     return;
+782 
+783   assert(SafepointSynchronize::is_at_safepoint(), &quot;must only be called while at safepoint&quot;);
+784 
+785   assert(_preserved_oop_stack  == NULL, &quot;double initialization&quot;);
+786   assert(_preserved_mark_stack == NULL, &quot;double initialization&quot;);
+787 
+788   // In order to reduce the number of mark words preserved during GC
+789   // due to the presence of biased locking, we reinitialize most mark
+790   // words to the class&#39;s prototype during GC -- even those which have
+791   // a currently valid bias owner. One important situation where we
+792   // must not clobber a bias is when a biased object is currently
+793   // locked. To handle this case we iterate over the currently-locked
+794   // monitors in a prepass and, if they are biased, preserve their
+795   // mark words here. This should be a relatively small set of objects
+796   // especially compared to the number of objects in the heap.
+797   _preserved_mark_stack = new (ResourceObj::C_HEAP, mtInternal) GrowableArray&lt;markOop&gt;(10, true);
+798   _preserved_oop_stack = new (ResourceObj::C_HEAP, mtInternal) GrowableArray&lt;Handle&gt;(10, true);
+799 
+800   ResourceMark rm;
+801   Thread* cur = Thread::current();
+802   for (JavaThreadIteratorWithHandle jtiwh; JavaThread *thread = jtiwh.next(); ) {
+803     if (thread-&gt;has_last_Java_frame()) {
+804       RegisterMap rm(thread);
+805       for (javaVFrame* vf = thread-&gt;last_java_vframe(&amp;rm); vf != NULL; vf = vf-&gt;java_sender()) {
+806         GrowableArray&lt;MonitorInfo*&gt; *monitors = vf-&gt;monitors();
+807         if (monitors != NULL) {
+808           int len = monitors-&gt;length();
+809           // Walk monitors youngest to oldest
+810           for (int i = len - 1; i &gt;= 0; i--) {
+811             MonitorInfo* mon_info = monitors-&gt;at(i);
+812             if (mon_info-&gt;owner_is_scalar_replaced()) continue;
+813             oop owner = mon_info-&gt;owner();
+814             if (owner != NULL) {
+815               markOop mark = owner-&gt;mark();
+816               if (mark-&gt;has_bias_pattern()) {
+817                 _preserved_oop_stack-&gt;push(Handle(cur, owner));
+818                 _preserved_mark_stack-&gt;push(mark);
+819               }
+820             }
+821           }
+822         }
+823       }
+824     }
+825   }
+826 }
+827 
+828 
+829 void BiasedLocking::restore_marks() {
+830   if (!UseBiasedLocking)
+831     return;
+832 
+833   assert(_preserved_oop_stack  != NULL, &quot;double free&quot;);
+834   assert(_preserved_mark_stack != NULL, &quot;double free&quot;);
+835 
+836   int len = _preserved_oop_stack-&gt;length();
+837   for (int i = 0; i &lt; len; i++) {
+838     Handle owner = _preserved_oop_stack-&gt;at(i);
+839     markOop mark = _preserved_mark_stack-&gt;at(i);
+840     owner-&gt;set_mark(mark);
+841   }
+842 
+843   delete _preserved_oop_stack;
+844   _preserved_oop_stack = NULL;
+845   delete _preserved_mark_stack;
+846   _preserved_mark_stack = NULL;
+847 }
+848 
+849 
+850 int* BiasedLocking::total_entry_count_addr()                   { return _counters.total_entry_count_addr(); }
+851 int* BiasedLocking::biased_lock_entry_count_addr()             { return _counters.biased_lock_entry_count_addr(); }
+852 int* BiasedLocking::anonymously_biased_lock_entry_count_addr() { return _counters.anonymously_biased_lock_entry_count_addr(); }
+853 int* BiasedLocking::rebiased_lock_entry_count_addr()           { return _counters.rebiased_lock_entry_count_addr(); }
+854 int* BiasedLocking::revoked_lock_entry_count_addr()            { return _counters.revoked_lock_entry_count_addr(); }
+855 int* BiasedLocking::fast_path_entry_count_addr()               { return _counters.fast_path_entry_count_addr(); }
+856 int* BiasedLocking::slow_path_entry_count_addr()               { return _counters.slow_path_entry_count_addr(); }
+857 
+858 
+859 // BiasedLockingCounters
+860 
+861 int BiasedLockingCounters::slow_path_entry_count() {
+862   if (_slow_path_entry_count != 0) {
+863     return _slow_path_entry_count;
+864   }
+865   int sum = _biased_lock_entry_count   + _anonymously_biased_lock_entry_count +
+866             _rebiased_lock_entry_count + _revoked_lock_entry_count +
+867             _fast_path_entry_count;
+868 
+869   return _total_entry_count - sum;
+870 }
+871 
+872 void BiasedLockingCounters::print_on(outputStream* st) {
+873   tty-&gt;print_cr(&quot;# total entries: %d&quot;, _total_entry_count);
+874   tty-&gt;print_cr(&quot;# biased lock entries: %d&quot;, _biased_lock_entry_count);
+875   tty-&gt;print_cr(&quot;# anonymously biased lock entries: %d&quot;, _anonymously_biased_lock_entry_count);
+876   tty-&gt;print_cr(&quot;# rebiased lock entries: %d&quot;, _rebiased_lock_entry_count);
+877   tty-&gt;print_cr(&quot;# revoked lock entries: %d&quot;, _revoked_lock_entry_count);
+878   tty-&gt;print_cr(&quot;# fast path lock entries: %d&quot;, _fast_path_entry_count);
+879   tty-&gt;print_cr(&quot;# slow path lock entries: %d&quot;, slow_path_entry_count());
+880 }
+    </pre>
+  </body>
+</html>
