@@ -1,0 +1,923 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Frames src/java.base/solaris/classes/sun/nio/fs/SolarisWatchService.java</title>
+    <link rel="stylesheet" href="../../../../../../../style.css" />
+    <script type="text/javascript" src="../../../../../../../navigation.js"></script>
+  </head>
+<body onkeypress="keypress(event);">
+<a name="0"></a>
+<hr />
+<pre>  1 /*
+<a name="1" id="anc1"></a><span class="line-modified">  2  * Copyright (c) 2008, 2019, Oracle and/or its affiliates. All rights reserved.</span>
+  3  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  4  *
+  5  * This code is free software; you can redistribute it and/or modify it
+  6  * under the terms of the GNU General Public License version 2 only, as
+  7  * published by the Free Software Foundation.  Oracle designates this
+  8  * particular file as subject to the &quot;Classpath&quot; exception as provided
+  9  * by Oracle in the LICENSE file that accompanied this code.
+ 10  *
+ 11  * This code is distributed in the hope that it will be useful, but WITHOUT
+ 12  * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ 13  * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ 14  * version 2 for more details (a copy is included in the LICENSE file that
+ 15  * accompanied this code).
+ 16  *
+ 17  * You should have received a copy of the GNU General Public License version
+ 18  * 2 along with this work; if not, write to the Free Software Foundation,
+ 19  * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ 20  *
+ 21  * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ 22  * or visit www.oracle.com if you need additional information or have any
+ 23  * questions.
+ 24  */
+ 25 
+ 26 package sun.nio.fs;
+ 27 
+ 28 import java.nio.file.*;
+<a name="2" id="anc2"></a>
+
+ 29 import java.util.*;
+ 30 import java.io.IOException;
+ 31 import jdk.internal.misc.Unsafe;
+ 32 
+ 33 import static sun.nio.fs.UnixConstants.*;
+ 34 
+ 35 /**
+ 36  * Solaris implementation of WatchService based on file events notification
+ 37  * facility.
+ 38  */
+ 39 
+ 40 class SolarisWatchService
+ 41     extends AbstractWatchService
+ 42 {
+ 43     private static final Unsafe unsafe = Unsafe.getUnsafe();
+ 44     private static int addressSize = unsafe.addressSize();
+ 45 
+ 46     private static int dependsArch(int value32, int value64) {
+ 47         return (addressSize == 4) ? value32 : value64;
+ 48     }
+ 49 
+ 50     /*
+ 51      * typedef struct port_event {
+ 52      *     int             portev_events;
+ 53      *     ushort_t        portev_source;
+ 54      *     ushort_t        portev_pad;
+ 55      *     uintptr_t       portev_object;
+ 56      *     void            *portev_user;
+ 57      * } port_event_t;
+ 58      */
+ 59     private static final int SIZEOF_PORT_EVENT  = dependsArch(16, 24);
+ 60     private static final int OFFSETOF_EVENTS    = 0;
+ 61     private static final int OFFSETOF_SOURCE    = 4;
+ 62     private static final int OFFSETOF_OBJECT    = 8;
+ 63 
+ 64     /*
+ 65      * typedef struct file_obj {
+ 66      *     timestruc_t     fo_atime;
+ 67      *     timestruc_t     fo_mtime;
+ 68      *     timestruc_t     fo_ctime;
+ 69      *     uintptr_t       fo_pad[3];
+ 70      *     char            *fo_name;
+ 71      * } file_obj_t;
+ 72      */
+ 73     private static final int SIZEOF_FILEOBJ    = dependsArch(40, 80);
+ 74     private static final int OFFSET_FO_NAME    = dependsArch(36, 72);
+ 75 
+ 76     // port sources
+ 77     private static final short PORT_SOURCE_USER     = 3;
+ 78     private static final short PORT_SOURCE_FILE     = 7;
+ 79 
+ 80     // user-watchable events
+ 81     private static final int FILE_MODIFIED      = 0x00000002;
+ 82     private static final int FILE_ATTRIB        = 0x00000004;
+ 83     private static final int FILE_NOFOLLOW      = 0x10000000;
+ 84 
+ 85     // exception events
+ 86     private static final int FILE_DELETE        = 0x00000010;
+ 87     private static final int FILE_RENAME_TO     = 0x00000020;
+ 88     private static final int FILE_RENAME_FROM   = 0x00000040;
+ 89     private static final int UNMOUNTED          = 0x20000000;
+ 90     private static final int MOUNTEDOVER        = 0x40000000;
+ 91 
+ 92     // background thread to read change events
+ 93     private final Poller poller;
+ 94 
+ 95     SolarisWatchService(UnixFileSystem fs) throws IOException {
+ 96         int port = -1;
+ 97         try {
+ 98             port = portCreate();
+ 99         } catch (UnixException x) {
+100             throw new IOException(x.errorString());
+101         }
+102 
+103         this.poller = new Poller(fs, this, port);
+104         this.poller.start();
+105     }
+106 
+107     @Override
+108     WatchKey register(Path dir,
+109                       WatchEvent.Kind&lt;?&gt;[] events,
+110                       WatchEvent.Modifier... modifiers)
+111          throws IOException
+112     {
+113         // delegate to poller
+114         return poller.register(dir, events, modifiers);
+115     }
+116 
+117     @Override
+118     void implClose() throws IOException {
+119         // delegate to poller
+120         poller.close();
+121     }
+122 
+123     /**
+124      * WatchKey implementation
+125      */
+126     private class SolarisWatchKey extends AbstractWatchKey
+127         implements DirectoryNode
+128     {
+129         private final UnixFileKey fileKey;
+130 
+131         // pointer to native file_obj object
+132         private final long object;
+133 
+134         // events (may be changed). set to null when watch key is invalid
+135         private volatile Set&lt;? extends WatchEvent.Kind&lt;?&gt;&gt; events;
+136 
+137         // map of entries in directory; created lazily; accessed only by
+138         // poller thread.
+139         private Map&lt;Path,EntryNode&gt; children = new HashMap&lt;&gt;();
+140 
+141         SolarisWatchKey(SolarisWatchService watcher,
+142                         UnixPath dir,
+143                         UnixFileKey fileKey,
+144                         long object,
+145                         Set&lt;? extends WatchEvent.Kind&lt;?&gt;&gt; events)
+146         {
+147             super(dir, watcher);
+148             this.fileKey = fileKey;
+149             this.object = object;
+150             this.events = events;
+151         }
+152 
+153         UnixPath getDirectory() {
+154             return (UnixPath)watchable();
+155         }
+156 
+157         UnixFileKey getFileKey() {
+158             return fileKey;
+159         }
+160 
+161         @Override
+162         public long object() {
+163             return object;
+164         }
+165 
+166         void invalidate() {
+167             events = null;
+168         }
+169 
+170         Set&lt;? extends WatchEvent.Kind&lt;?&gt;&gt; events() {
+171             return events;
+172         }
+173 
+174         void setEvents(Set&lt;? extends WatchEvent.Kind&lt;?&gt;&gt; events) {
+175             this.events = events;
+176         }
+177 
+178         Map&lt;Path,EntryNode&gt; children() {
+179             return children;
+180         }
+181 
+182         @Override
+183         public boolean isValid() {
+184             return events != null;
+185         }
+186 
+187         @Override
+188         public void cancel() {
+189             if (isValid()) {
+190                 // delegate to poller
+191                 poller.cancel(this);
+192             }
+193         }
+194 
+195         @Override
+196         public void addChild(Path name, EntryNode node) {
+197             children.put(name, node);
+198         }
+199 
+200         @Override
+201         public void removeChild(Path name) {
+202             children.remove(name);
+203         }
+204 
+205         @Override
+206         public EntryNode getChild(Path name) {
+207             return children.get(name);
+208         }
+209     }
+210 
+211     /**
+212      * Background thread to read from port
+213      */
+214     private class Poller extends AbstractPoller {
+215 
+216         // maximum number of events to read per call to port_getn
+217         private static final int MAX_EVENT_COUNT            = 128;
+218 
+219         // events that map to ENTRY_DELETE
+220         private static final int FILE_REMOVED =
+221             (FILE_DELETE|FILE_RENAME_TO|FILE_RENAME_FROM);
+222 
+223         // events that tell us not to re-associate the object
+224         private static final int FILE_EXCEPTION =
+225             (FILE_REMOVED|UNMOUNTED|MOUNTEDOVER);
+226 
+227         // address of event buffers (used to receive events with port_getn)
+228         private final long bufferAddress;
+229 
+230         private final SolarisWatchService watcher;
+231 
+232         // the I/O port
+233         private final int port;
+234 
+235         // maps file key (dev/inode) to WatchKey
+236         private final Map&lt;UnixFileKey,SolarisWatchKey&gt; fileKey2WatchKey;
+237 
+238         // maps file_obj object to Node
+239         private final Map&lt;Long,Node&gt; object2Node;
+240 
+241         /**
+242          * Create a new instance
+243          */
+244         Poller(UnixFileSystem fs, SolarisWatchService watcher, int port) {
+245             this.watcher = watcher;
+246             this.port = port;
+247             this.bufferAddress =
+248                 unsafe.allocateMemory(SIZEOF_PORT_EVENT * MAX_EVENT_COUNT);
+249             this.fileKey2WatchKey = new HashMap&lt;UnixFileKey,SolarisWatchKey&gt;();
+250             this.object2Node = new HashMap&lt;Long,Node&gt;();
+251         }
+252 
+253         @Override
+254         void wakeup() throws IOException {
+255             // write to port to wakeup polling thread
+256             try {
+257                 portSend(port, 0);
+258             } catch (UnixException x) {
+259                 throw new IOException(x.errorString());
+260             }
+261         }
+262 
+263         @Override
+264         Object implRegister(Path obj,
+265                             Set&lt;? extends WatchEvent.Kind&lt;?&gt;&gt; events,
+266                             WatchEvent.Modifier... modifiers)
+267         {
+268             // no modifiers supported at this time
+269             if (modifiers.length &gt; 0) {
+270                 for (WatchEvent.Modifier modifier: modifiers) {
+271                     if (modifier == null)
+272                         return new NullPointerException();
+273                     if (!ExtendedOptions.SENSITIVITY_HIGH.matches(modifier) &amp;&amp;
+274                             !ExtendedOptions.SENSITIVITY_MEDIUM.matches(modifier) &amp;&amp;
+275                             !ExtendedOptions.SENSITIVITY_LOW.matches(modifier)) {
+276                         return new UnsupportedOperationException(&quot;Modifier not supported&quot;);
+277                     }
+278                 }
+279             }
+280 
+281             UnixPath dir = (UnixPath)obj;
+282 
+283             // check file is directory
+284             UnixFileAttributes attrs = null;
+285             try {
+286                 attrs = UnixFileAttributes.get(dir, true);
+287             } catch (UnixException x) {
+288                 return x.asIOException(dir);
+289             }
+290             if (!attrs.isDirectory()) {
+291                 return new NotDirectoryException(dir.getPathForExceptionMessage());
+292             }
+293 
+294             // if already registered then update the events and return existing key
+295             UnixFileKey fileKey = attrs.fileKey();
+296             SolarisWatchKey watchKey = fileKey2WatchKey.get(fileKey);
+297             if (watchKey != null) {
+298                 try {
+299                     updateEvents(watchKey, events);
+300                 } catch (UnixException x) {
+301                     return x.asIOException(dir);
+302                 }
+303                 return watchKey;
+304             }
+305 
+306             // register directory
+307             long object = 0L;
+308             try {
+309                 object = registerImpl(dir, (FILE_MODIFIED | FILE_ATTRIB));
+310             } catch (UnixException x) {
+311                 return x.asIOException(dir);
+312             }
+313 
+314             // create watch key and insert it into maps
+315             watchKey = new SolarisWatchKey(watcher, dir, fileKey, object, events);
+316             object2Node.put(object, watchKey);
+317             fileKey2WatchKey.put(fileKey, watchKey);
+318 
+319             // register all entries in directory
+320             registerChildren(dir, watchKey, false, false);
+321 
+322             return watchKey;
+323         }
+324 
+325         // release resources for single entry
+326         void releaseChild(EntryNode node) {
+327             long object = node.object();
+328             if (object != 0L) {
+329                object2Node.remove(object);
+330                releaseObject(object, true);
+331                node.setObject(0L);
+332            }
+333         }
+334 
+335         // release resources for entries in directory
+336         void releaseChildren(SolarisWatchKey key) {
+337            for (EntryNode node: key.children().values()) {
+338                releaseChild(node);
+339            }
+340         }
+341 
+342         // cancel single key
+343         @Override
+344         void implCancelKey(WatchKey obj) {
+345            SolarisWatchKey key = (SolarisWatchKey)obj;
+346            if (key.isValid()) {
+347                fileKey2WatchKey.remove(key.getFileKey());
+348 
+349                // release resources for entries
+350                releaseChildren(key);
+351 
+352                // release resources for directory
+353                long object = key.object();
+354                object2Node.remove(object);
+355                releaseObject(object, true);
+356 
+357                // and finally invalidate the key
+358                key.invalidate();
+359            }
+360         }
+361 
+362         // close watch service
+363         @Override
+364         void implCloseAll() {
+365             // release all native resources
+366             for (Long object: object2Node.keySet()) {
+367                 releaseObject(object, true);
+368             }
+369 
+370             // invalidate all keys
+371             for (Map.Entry&lt;UnixFileKey,SolarisWatchKey&gt; entry: fileKey2WatchKey.entrySet()) {
+372                 entry.getValue().invalidate();
+373             }
+374 
+375             // clean-up
+376             object2Node.clear();
+377             fileKey2WatchKey.clear();
+378 
+379             // free global resources
+380             unsafe.freeMemory(bufferAddress);
+381             UnixNativeDispatcher.close(port);
+382         }
+383 
+384         /**
+385          * Poller main loop. Blocks on port_getn waiting for events and then
+386          * processes them.
+387          */
+388         @Override
+389         public void run() {
+390             try {
+391                 for (;;) {
+392                     int n = portGetn(port, bufferAddress, MAX_EVENT_COUNT);
+393                     assert n &gt; 0;
+394 
+395                     long address = bufferAddress;
+396                     for (int i=0; i&lt;n; i++) {
+397                         boolean shutdown = processEvent(address);
+398                         if (shutdown)
+399                             return;
+400                         address += SIZEOF_PORT_EVENT;
+401                     }
+402                 }
+403             } catch (UnixException x) {
+404                 x.printStackTrace();
+405             }
+406         }
+407 
+408         /**
+409          * Process a single port_event
+410          *
+411          * Returns true if poller thread is requested to shutdown.
+412          */
+413         boolean processEvent(long address) {
+414             // pe-&gt;portev_source
+415             short source = unsafe.getShort(address + OFFSETOF_SOURCE);
+416             // pe-&gt;portev_object
+417             long object = unsafe.getAddress(address + OFFSETOF_OBJECT);
+418             // pe-&gt;portev_events
+419             int events = unsafe.getInt(address + OFFSETOF_EVENTS);
+420 
+421             // user event is trigger to process pending requests
+422             if (source != PORT_SOURCE_FILE) {
+423                 if (source == PORT_SOURCE_USER) {
+424                     // process any pending requests
+425                     boolean shutdown = processRequests();
+426                     if (shutdown)
+427                         return true;
+428                 }
+429                 return false;
+430             }
+431 
+432             // lookup object to get Node
+433             Node node = object2Node.get(object);
+434             if (node == null) {
+435                 // should not happen
+436                 return false;
+437             }
+438 
+439             // As a workaround for 6642290 and 6636438/6636412 we don&#39;t use
+440             // FILE_EXCEPTION events to tell use not to register the file.
+441             // boolean reregister = (events &amp; FILE_EXCEPTION) == 0;
+442             boolean reregister = true;
+443 
+444             // If node is EntryNode then event relates to entry in directory
+445             // If node is a SolarisWatchKey (DirectoryNode) then event relates
+446             // to a watched directory.
+447             boolean isDirectory = (node instanceof SolarisWatchKey);
+448             if (isDirectory) {
+449                 processDirectoryEvents((SolarisWatchKey)node, events);
+450             } else {
+451                 boolean ignore = processEntryEvents((EntryNode)node, events);
+452                 if (ignore)
+453                     reregister = false;
+454             }
+455 
+456             // need to re-associate to get further events
+457             if (reregister) {
+458                 try {
+459                     events = FILE_MODIFIED | FILE_ATTRIB;
+460                     if (!isDirectory) events |= FILE_NOFOLLOW;
+461                     portAssociate(port,
+462                                   PORT_SOURCE_FILE,
+463                                   object,
+464                                   events);
+465                 } catch (UnixException x) {
+466                     // unable to re-register
+467                     reregister = false;
+468                 }
+469             }
+470 
+471             // object is not re-registered so release resources. If
+472             // object is a watched directory then signal key
+473             if (!reregister) {
+474                 // release resources
+475                 object2Node.remove(object);
+476                 releaseObject(object, false);
+477 
+478                 // if watch key then signal it
+479                 if (isDirectory) {
+480                     SolarisWatchKey key = (SolarisWatchKey)node;
+481                     fileKey2WatchKey.remove( key.getFileKey() );
+482                     key.invalidate();
+483                     key.signal();
+484                 } else {
+485                     // if entry then remove it from parent
+486                     EntryNode entry = (EntryNode)node;
+487                     SolarisWatchKey key = (SolarisWatchKey)entry.parent();
+488                     key.removeChild(entry.name());
+489                 }
+490             }
+491 
+492             return false;
+493         }
+494 
+495         /**
+496          * Process directory events. If directory is modified then re-scan
+497          * directory to register any new entries
+498          */
+499         void processDirectoryEvents(SolarisWatchKey key, int mask) {
+500             if ((mask &amp; (FILE_MODIFIED | FILE_ATTRIB)) != 0) {
+501                 registerChildren(key.getDirectory(), key,
+502                     key.events().contains(StandardWatchEventKinds.ENTRY_CREATE),
+503                     key.events().contains(StandardWatchEventKinds.ENTRY_DELETE));
+504             }
+505         }
+506 
+507         /**
+508          * Process events for entries in registered directories. Returns {@code
+509          * true} if events are ignored because the watch key has been cancelled.
+510          */
+511         boolean processEntryEvents(EntryNode node, int mask) {
+512             SolarisWatchKey key = (SolarisWatchKey)node.parent();
+513             Set&lt;? extends WatchEvent.Kind&lt;?&gt;&gt; events = key.events();
+514             if (events == null) {
+515                 // key has been cancelled so ignore event
+516                 return true;
+517             }
+518 
+519             // entry modified
+520             if (((mask &amp; (FILE_MODIFIED | FILE_ATTRIB)) != 0) &amp;&amp;
+521                 events.contains(StandardWatchEventKinds.ENTRY_MODIFY))
+522             {
+523                 key.signalEvent(StandardWatchEventKinds.ENTRY_MODIFY, node.name());
+524             }
+525 
+526 
+527             return false;
+528         }
+529 
+530         /**
+531          * Registers all entries in the given directory
+532          *
+533          * The {@code sendCreateEvents} and {@code sendDeleteEvents} parameters
+534          * indicates if ENTRY_CREATE and ENTRY_DELETE events should be queued
+535          * when new entries are found. When initially registering a directory
+536          * they will always be false. When re-scanning a directory then it
+537          * depends on if the events are enabled or not.
+538          */
+539         void registerChildren(UnixPath dir,
+540                               SolarisWatchKey parent,
+541                               boolean sendCreateEvents,
+542                               boolean sendDeleteEvents)
+543         {
+544             boolean isModifyEnabled =
+545                 parent.events().contains(StandardWatchEventKinds.ENTRY_MODIFY) ;
+546 
+547             // reset visited flag on entries so that we can detect file deletes
+548             for (EntryNode node: parent.children().values()) {
+549                 node.setVisited(false);
+550             }
+551 
+552             try (DirectoryStream&lt;Path&gt; stream = Files.newDirectoryStream(dir)) {
+553                 for (Path entry: stream) {
+554                     Path name = entry.getFileName();
+555 
+556                     // skip entry if already registered
+557                     EntryNode node = parent.getChild(name);
+558                     if (node != null) {
+559                         node.setVisited(true);
+560                         continue;
+561                     }
+562 
+563                     // new entry found
+564 
+565                     long object = 0L;
+566                     int errno = 0;
+567                     boolean addNode = false;
+568 
+569                     // if ENTRY_MODIFY enabled then we register the entry for events
+570                     if (isModifyEnabled) {
+571                         try {
+572                             UnixPath path = (UnixPath)entry;
+573                             int events = (FILE_NOFOLLOW | FILE_MODIFIED | FILE_ATTRIB);
+574                             object = registerImpl(path, events);
+575                             addNode = true;
+576                         } catch (UnixException x) {
+577                             errno = x.errno();
+578                         }
+579                     } else {
+580                         addNode = true;
+581                     }
+582 
+583                     if (addNode) {
+584                         // create node
+585                         node = new EntryNode(object, (UnixPath)entry.getFileName(), parent);
+586                         node.setVisited(true);
+587                         // tell the parent about it
+588                         parent.addChild(entry.getFileName(), node);
+589                         if (object != 0L)
+590                             object2Node.put(object, node);
+591                     }
+592 
+593                     // send ENTRY_CREATE event for the new file
+594                     // send ENTRY_DELETE event for files that were deleted immediately
+595                     boolean deleted = (errno == ENOENT);
+596                     if (sendCreateEvents &amp;&amp; (addNode || deleted))
+597                         parent.signalEvent(StandardWatchEventKinds.ENTRY_CREATE, name);
+598                     if (sendDeleteEvents &amp;&amp; deleted)
+599                         parent.signalEvent(StandardWatchEventKinds.ENTRY_DELETE, name);
+600 
+601                 }
+602             } catch (DirectoryIteratorException | IOException x) {
+603                 // queue OVERFLOW event so that user knows to re-scan directory
+604                 parent.signalEvent(StandardWatchEventKinds.OVERFLOW, null);
+605                 return;
+606             }
+607 
+608             // clean-up and send ENTRY_DELETE events for any entries that were
+609             // not found
+610             Iterator&lt;Map.Entry&lt;Path,EntryNode&gt;&gt; iterator =
+611                 parent.children().entrySet().iterator();
+612             while (iterator.hasNext()) {
+613                 Map.Entry&lt;Path,EntryNode&gt; entry = iterator.next();
+614                 EntryNode node = entry.getValue();
+615                 if (!node.isVisited()) {
+616                     long object = node.object();
+617                     if (object != 0L) {
+618                         object2Node.remove(object);
+619                         releaseObject(object, true);
+620                     }
+621                     if (sendDeleteEvents)
+622                         parent.signalEvent(StandardWatchEventKinds.ENTRY_DELETE, node.name());
+623                     iterator.remove();
+624                 }
+625             }
+626         }
+627 
+628         /**
+629          * Update watch key&#39;s events. If ENTRY_MODIFY changes to be enabled
+630          * then register each file in the directory; If ENTRY_MODIFY changed to
+631          * be disabled then unregister each file.
+632          */
+633         void updateEvents(SolarisWatchKey key, Set&lt;? extends WatchEvent.Kind&lt;?&gt;&gt; events)
+634             throws UnixException
+635         {
+636 
+637             // update events, remembering if ENTRY_MODIFY was previously
+638             // enabled or disabled.
+639             boolean oldModifyEnabled = key.events()
+640                 .contains(StandardWatchEventKinds.ENTRY_MODIFY);
+641             key.setEvents(events);
+642 
+643             // check if ENTRY_MODIFY has changed
+644             boolean newModifyEnabled = events
+645                 .contains(StandardWatchEventKinds.ENTRY_MODIFY);
+646             if (newModifyEnabled != oldModifyEnabled) {
+647                 UnixException ex = null;
+648                 for (EntryNode node: key.children().values()) {
+649                     if (newModifyEnabled) {
+650                         // register
+651                         UnixPath path = key.getDirectory().resolve(node.name());
+652                         int ev = (FILE_NOFOLLOW | FILE_MODIFIED | FILE_ATTRIB);
+653                         try {
+654                             long object = registerImpl(path, ev);
+655                             object2Node.put(object, node);
+656                             node.setObject(object);
+657                         } catch (UnixException x) {
+658                             // if file has been deleted then it will be detected
+659                             // as a FILE_MODIFIED event on the directory
+660                             if (x.errno() != ENOENT) {
+661                                 ex = x;
+662                                 break;
+663                             }
+664                         }
+665                     } else {
+666                         // unregister
+667                         releaseChild(node);
+668                     }
+669                 }
+670 
+671                 // an error occurred
+672                 if (ex != null) {
+673                     releaseChildren(key);
+674                     throw ex;
+675                 }
+676             }
+677         }
+678 
+679         /**
+680          * Calls port_associate to register the given path.
+681          * Returns pointer to fileobj structure that is allocated for
+682          * the registration.
+683          */
+684         long registerImpl(UnixPath dir, int events)
+685             throws UnixException
+686         {
+687             // allocate memory for the path (file_obj-&gt;fo_name field)
+688             byte[] path = dir.getByteArrayForSysCalls();
+689             int len = path.length;
+690             long name = unsafe.allocateMemory(len+1);
+691             unsafe.copyMemory(path, Unsafe.ARRAY_BYTE_BASE_OFFSET, null,
+692                 name, (long)len);
+693             unsafe.putByte(name + len, (byte)0);
+694 
+695             // allocate memory for filedatanode structure - this is the object
+696             // to port_associate
+697             long object = unsafe.allocateMemory(SIZEOF_FILEOBJ);
+698             unsafe.setMemory(null, object, SIZEOF_FILEOBJ, (byte)0);
+699             unsafe.putAddress(object + OFFSET_FO_NAME, name);
+700 
+701             // associate the object with the port
+702             try {
+703                 portAssociate(port,
+704                               PORT_SOURCE_FILE,
+705                               object,
+706                               events);
+707             } catch (UnixException x) {
+708                 // debugging
+709                 if (x.errno() == EAGAIN) {
+710                     System.err.println(&quot;The maximum number of objects associated &quot;+
+711                         &quot;with the port has been reached&quot;);
+712                 }
+713 
+714                 unsafe.freeMemory(name);
+715                 unsafe.freeMemory(object);
+716                 throw x;
+717             }
+718             return object;
+719         }
+720 
+721         /**
+722          * Frees all resources for an file_obj object; optionally remove
+723          * association from port
+724          */
+725         void releaseObject(long object, boolean dissociate) {
+726             // remove association
+727             if (dissociate) {
+728                 try {
+729                     portDissociate(port, PORT_SOURCE_FILE, object);
+730                 } catch (UnixException x) {
+731                     // ignore
+732                 }
+733             }
+734 
+735             // free native memory
+736             long name = unsafe.getAddress(object + OFFSET_FO_NAME);
+737             unsafe.freeMemory(name);
+738             unsafe.freeMemory(object);
+739         }
+740     }
+741 
+742     /**
+743      * A node with native (file_obj) resources
+744      */
+745     private static interface Node {
+746         long object();
+747     }
+748 
+749     /**
+750      * A directory node with a map of the entries in the directory
+751      */
+752     private static interface DirectoryNode extends Node {
+753         void addChild(Path name, EntryNode node);
+754         void removeChild(Path name);
+755         EntryNode getChild(Path name);
+756     }
+757 
+758     /**
+759      * An implementation of a node that is an entry in a directory.
+760      */
+761     private static class EntryNode implements Node {
+762         private long object;
+763         private final UnixPath name;
+764         private final DirectoryNode parent;
+765         private boolean visited;
+766 
+767         EntryNode(long object, UnixPath name, DirectoryNode parent) {
+768             this.object = object;
+769             this.name = name;
+770             this.parent = parent;
+771         }
+772 
+773         @Override
+774         public long object() {
+775             return object;
+776         }
+777 
+778         void setObject(long ptr) {
+779             this.object = ptr;
+780         }
+781 
+782         UnixPath name() {
+783             return name;
+784         }
+785 
+786         DirectoryNode parent() {
+787             return parent;
+788         }
+789 
+790         boolean isVisited() {
+791             return visited;
+792         }
+793 
+794         void setVisited(boolean v) {
+795             this.visited = v;
+796         }
+797     }
+798 
+799     // -- native methods --
+800 
+801     private static native void init();
+802 
+803     private static native int portCreate() throws UnixException;
+804 
+805     private static native void portAssociate(int port, int source, long object, int events)
+806         throws UnixException;
+807 
+808     private static native void portDissociate(int port, int source, long object)
+809         throws UnixException;
+810 
+811     private static native void portSend(int port, int events)
+812         throws UnixException;
+813 
+814     private static native int portGetn(int port, long address, int max)
+815         throws UnixException;
+816 
+817     static {
+<a name="3" id="anc3"></a><span class="line-modified">818         jdk.internal.loader.BootLoader.loadLibrary(&quot;nio&quot;);</span>
+
+
+
+
+819         init();
+820     }
+821 }
+<a name="4" id="anc4"></a><b style="font-size: large; color: red">--- EOF ---</b>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+</pre>
+<input id="eof" value="4" type="hidden" />
+</body>
+</html>
