@@ -1,0 +1,448 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Old src/hotspot/share/gc/shared/ptrQueue.cpp</title>
+    <link rel="stylesheet" href="../../../../../style.css" />
+  </head>
+  <body>
+    <pre>
+  1 /*
+  2  * Copyright (c) 2001, 2019, Oracle and/or its affiliates. All rights reserved.
+  3  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  4  *
+  5  * This code is free software; you can redistribute it and/or modify it
+  6  * under the terms of the GNU General Public License version 2 only, as
+  7  * published by the Free Software Foundation.
+  8  *
+  9  * This code is distributed in the hope that it will be useful, but WITHOUT
+ 10  * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ 11  * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ 12  * version 2 for more details (a copy is included in the LICENSE file that
+ 13  * accompanied this code).
+ 14  *
+ 15  * You should have received a copy of the GNU General Public License version
+ 16  * 2 along with this work; if not, write to the Free Software Foundation,
+ 17  * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ 18  *
+ 19  * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ 20  * or visit www.oracle.com if you need additional information or have any
+ 21  * questions.
+ 22  *
+ 23  */
+ 24 
+ 25 #include &quot;precompiled.hpp&quot;
+ 26 #include &quot;gc/shared/ptrQueue.hpp&quot;
+ 27 #include &quot;logging/log.hpp&quot;
+ 28 #include &quot;memory/allocation.hpp&quot;
+ 29 #include &quot;memory/allocation.inline.hpp&quot;
+ 30 #include &quot;runtime/atomic.hpp&quot;
+ 31 #include &quot;runtime/mutex.hpp&quot;
+ 32 #include &quot;runtime/mutexLocker.hpp&quot;
+ 33 #include &quot;runtime/orderAccess.hpp&quot;
+ 34 #include &quot;runtime/thread.inline.hpp&quot;
+ 35 #include &quot;utilities/globalCounter.inline.hpp&quot;
+ 36 
+ 37 #include &lt;new&gt;
+ 38 
+ 39 PtrQueue::PtrQueue(PtrQueueSet* qset, bool permanent, bool active) :
+ 40   _qset(qset),
+ 41   _active(active),
+ 42   _permanent(permanent),
+ 43   _index(0),
+ 44   _capacity_in_bytes(0),
+ 45   _buf(NULL),
+ 46   _lock(NULL)
+ 47 {}
+ 48 
+ 49 PtrQueue::~PtrQueue() {
+ 50   assert(_permanent || (_buf == NULL), &quot;queue must be flushed before delete&quot;);
+ 51 }
+ 52 
+ 53 void PtrQueue::flush_impl() {
+ 54   if (_buf != NULL) {
+ 55     BufferNode* node = BufferNode::make_node_from_buffer(_buf, index());
+ 56     if (is_empty()) {
+ 57       // No work to do.
+ 58       qset()-&gt;deallocate_buffer(node);
+ 59     } else {
+ 60       qset()-&gt;enqueue_completed_buffer(node);
+ 61     }
+ 62     _buf = NULL;
+ 63     set_index(0);
+ 64   }
+ 65 }
+ 66 
+ 67 
+ 68 void PtrQueue::enqueue_known_active(void* ptr) {
+ 69   while (_index == 0) {
+ 70     handle_zero_index();
+ 71   }
+ 72 
+ 73   assert(_buf != NULL, &quot;postcondition&quot;);
+ 74   assert(index() &gt; 0, &quot;postcondition&quot;);
+ 75   assert(index() &lt;= capacity(), &quot;invariant&quot;);
+ 76   _index -= _element_size;
+ 77   _buf[index()] = ptr;
+ 78 }
+ 79 
+ 80 BufferNode* BufferNode::allocate(size_t size) {
+ 81   size_t byte_size = size * sizeof(void*);
+ 82   void* data = NEW_C_HEAP_ARRAY(char, buffer_offset() + byte_size, mtGC);
+ 83   return new (data) BufferNode;
+ 84 }
+ 85 
+ 86 void BufferNode::deallocate(BufferNode* node) {
+ 87   node-&gt;~BufferNode();
+ 88   FREE_C_HEAP_ARRAY(char, node);
+ 89 }
+ 90 
+ 91 BufferNode::Allocator::Allocator(const char* name, size_t buffer_size) :
+ 92   _buffer_size(buffer_size),
+ 93   _pending_list(),
+ 94   _free_list(),
+ 95   _pending_count(0),
+ 96   _free_count(0),
+ 97   _transfer_lock(false)
+ 98 {
+ 99   strncpy(_name, name, sizeof(_name));
+100   _name[sizeof(_name) - 1] = &#39;\0&#39;;
+101 }
+102 
+103 BufferNode::Allocator::~Allocator() {
+104   delete_list(_free_list.pop_all());
+105   delete_list(_pending_list.pop_all());
+106 }
+107 
+108 void BufferNode::Allocator::delete_list(BufferNode* list) {
+109   while (list != NULL) {
+110     BufferNode* next = list-&gt;next();
+111     DEBUG_ONLY(list-&gt;set_next(NULL);)
+112     BufferNode::deallocate(list);
+113     list = next;
+114   }
+115 }
+116 
+117 size_t BufferNode::Allocator::free_count() const {
+118   return Atomic::load(&amp;_free_count);
+119 }
+120 
+121 BufferNode* BufferNode::Allocator::allocate() {
+122   BufferNode* node;
+123   {
+124     // Protect against ABA; see release().
+125     GlobalCounter::CriticalSection cs(Thread::current());
+126     node = _free_list.pop();
+127   }
+128   if (node == NULL) {
+129     node = BufferNode::allocate(_buffer_size);
+130   } else {
+131     // Decrement count after getting buffer from free list.  This, along
+132     // with incrementing count before adding to free list, ensures count
+133     // never underflows.
+134     size_t count = Atomic::sub(1u, &amp;_free_count);
+135     assert((count + 1) != 0, &quot;_free_count underflow&quot;);
+136   }
+137   return node;
+138 }
+139 
+140 // To solve the ABA problem for lock-free stack pop, allocate does the
+141 // pop inside a critical section, and release synchronizes on the
+142 // critical sections before adding to the _free_list.  But we don&#39;t
+143 // want to make every release have to do a synchronize.  Instead, we
+144 // initially place released nodes on the _pending_list, and transfer
+145 // them to the _free_list in batches.  Only one transfer at a time is
+146 // permitted, with a lock bit to control access to that phase.  A
+147 // transfer takes all the nodes from the _pending_list, synchronizes on
+148 // the _free_list pops, and then adds the former pending nodes to the
+149 // _free_list.  While that&#39;s happening, other threads might be adding
+150 // other nodes to the _pending_list, to be dealt with by some later
+151 // transfer.
+152 void BufferNode::Allocator::release(BufferNode* node) {
+153   assert(node != NULL, &quot;precondition&quot;);
+154   assert(node-&gt;next() == NULL, &quot;precondition&quot;);
+155 
+156   // Desired minimum transfer batch size.  There is relatively little
+157   // importance to the specific number.  It shouldn&#39;t be too big, else
+158   // we&#39;re wasting space when the release rate is low.  If the release
+159   // rate is high, we might accumulate more than this before being
+160   // able to start a new transfer, but that&#39;s okay.  Also note that
+161   // the allocation rate and the release rate are going to be fairly
+162   // similar, due to how the buffers are used.
+163   const size_t trigger_transfer = 10;
+164 
+165   // Add to pending list. Update count first so no underflow in transfer.
+166   size_t pending_count = Atomic::add(1u, &amp;_pending_count);
+167   _pending_list.push(*node);
+168   if (pending_count &gt; trigger_transfer) {
+169     try_transfer_pending();
+170   }
+171 }
+172 
+173 // Try to transfer nodes from _pending_list to _free_list, with a
+174 // synchronization delay for any in-progress pops from the _free_list,
+175 // to solve ABA there.  Return true if performed a (possibly empty)
+176 // transfer, false if blocked from doing so by some other thread&#39;s
+177 // in-progress transfer.
+178 bool BufferNode::Allocator::try_transfer_pending() {
+179   // Attempt to claim the lock.
+180   if (Atomic::load(&amp;_transfer_lock) || // Skip CAS if likely to fail.
+181       Atomic::cmpxchg(true, &amp;_transfer_lock, false)) {
+182     return false;
+183   }
+184   // Have the lock; perform the transfer.
+185 
+186   // Claim all the pending nodes.
+187   BufferNode* first = _pending_list.pop_all();
+188   if (first != NULL) {
+189     // Prepare to add the claimed nodes, and update _pending_count.
+190     BufferNode* last = first;
+191     size_t count = 1;
+192     for (BufferNode* next = first-&gt;next(); next != NULL; next = next-&gt;next()) {
+193       last = next;
+194       ++count;
+195     }
+196     Atomic::sub(count, &amp;_pending_count);
+197 
+198     // Wait for any in-progress pops, to avoid ABA for them.
+199     GlobalCounter::write_synchronize();
+200 
+201     // Add synchronized nodes to _free_list.
+202     // Update count first so no underflow in allocate().
+203     Atomic::add(count, &amp;_free_count);
+204     _free_list.prepend(*first, *last);
+205     log_trace(gc, ptrqueue, freelist)
+206              (&quot;Transferred %s pending to free: &quot; SIZE_FORMAT, name(), count);
+207   }
+208   OrderAccess::release_store(&amp;_transfer_lock, false);
+209   return true;
+210 }
+211 
+212 size_t BufferNode::Allocator::reduce_free_list(size_t remove_goal) {
+213   try_transfer_pending();
+214   size_t removed = 0;
+215   for ( ; removed &lt; remove_goal; ++removed) {
+216     BufferNode* node = _free_list.pop();
+217     if (node == NULL) break;
+218     BufferNode::deallocate(node);
+219   }
+220   size_t new_count = Atomic::sub(removed, &amp;_free_count);
+221   log_debug(gc, ptrqueue, freelist)
+222            (&quot;Reduced %s free list by &quot; SIZE_FORMAT &quot; to &quot; SIZE_FORMAT,
+223             name(), removed, new_count);
+224   return removed;
+225 }
+226 
+227 PtrQueueSet::PtrQueueSet(bool notify_when_complete) :
+228   _allocator(NULL),
+229   _cbl_mon(NULL),
+230   _completed_buffers_head(NULL),
+231   _completed_buffers_tail(NULL),
+232   _n_completed_buffers(0),
+233   _process_completed_buffers_threshold(ProcessCompletedBuffersThresholdNever),
+234   _process_completed_buffers(false),
+235   _notify_when_complete(notify_when_complete),
+236   _max_completed_buffers(MaxCompletedBuffersUnlimited),
+237   _completed_buffers_padding(0),
+238   _all_active(false)
+239 {}
+240 
+241 PtrQueueSet::~PtrQueueSet() {
+242   // There are presently only a couple (derived) instances ever
+243   // created, and they are permanent, so no harm currently done by
+244   // doing nothing here.
+245 }
+246 
+247 void PtrQueueSet::initialize(Monitor* cbl_mon,
+248                              BufferNode::Allocator* allocator) {
+249   assert(cbl_mon != NULL &amp;&amp; allocator != NULL, &quot;Init order issue?&quot;);
+250   _cbl_mon = cbl_mon;
+251   _allocator = allocator;
+252 }
+253 
+254 void** PtrQueueSet::allocate_buffer() {
+255   BufferNode* node = _allocator-&gt;allocate();
+256   return BufferNode::make_buffer_from_node(node);
+257 }
+258 
+259 void PtrQueueSet::deallocate_buffer(BufferNode* node) {
+260   _allocator-&gt;release(node);
+261 }
+262 
+263 void PtrQueue::handle_zero_index() {
+264   assert(index() == 0, &quot;precondition&quot;);
+265 
+266   // This thread records the full buffer and allocates a new one (while
+267   // holding the lock if there is one).
+268   if (_buf != NULL) {
+269     if (!should_enqueue_buffer()) {
+270       assert(index() &gt; 0, &quot;the buffer can only be re-used if it&#39;s not full&quot;);
+271       return;
+272     }
+273 
+274     if (_lock) {
+275       assert(_lock-&gt;owned_by_self(), &quot;Required.&quot;);
+276 
+277       BufferNode* node = BufferNode::make_node_from_buffer(_buf, index());
+278       _buf = NULL;         // clear shared _buf field
+279 
+280       qset()-&gt;enqueue_completed_buffer(node);
+281       assert(_buf == NULL, &quot;multiple enqueuers appear to be racing&quot;);
+282     } else {
+283       BufferNode* node = BufferNode::make_node_from_buffer(_buf, index());
+284       if (qset()-&gt;process_or_enqueue_completed_buffer(node)) {
+285         // Recycle the buffer. No allocation.
+286         assert(_buf == BufferNode::make_buffer_from_node(node), &quot;invariant&quot;);
+287         assert(capacity() == qset()-&gt;buffer_size(), &quot;invariant&quot;);
+288         reset();
+289         return;
+290       }
+291     }
+292   }
+293   // Set capacity in case this is the first allocation.
+294   set_capacity(qset()-&gt;buffer_size());
+295   // Allocate a new buffer.
+296   _buf = qset()-&gt;allocate_buffer();
+297   reset();
+298 }
+299 
+300 bool PtrQueueSet::process_or_enqueue_completed_buffer(BufferNode* node) {
+301   if (Thread::current()-&gt;is_Java_thread()) {
+302     // If the number of buffers exceeds the limit, make this Java
+303     // thread do the processing itself.  We don&#39;t lock to access
+304     // buffer count or padding; it is fine to be imprecise here.  The
+305     // add of padding could overflow, which is treated as unlimited.
+306     size_t limit = _max_completed_buffers + _completed_buffers_padding;
+307     if ((_n_completed_buffers &gt; limit) &amp;&amp; (limit &gt;= _max_completed_buffers)) {
+308       if (mut_process_buffer(node)) {
+309         // Successfully processed; return true to allow buffer reuse.
+310         return true;
+311       }
+312     }
+313   }
+314   // The buffer will be enqueued. The caller will have to get a new one.
+315   enqueue_completed_buffer(node);
+316   return false;
+317 }
+318 
+319 void PtrQueueSet::enqueue_completed_buffer(BufferNode* cbn) {
+320   MutexLockerEx x(_cbl_mon, Mutex::_no_safepoint_check_flag);
+321   cbn-&gt;set_next(NULL);
+322   if (_completed_buffers_tail == NULL) {
+323     assert(_completed_buffers_head == NULL, &quot;Well-formedness&quot;);
+324     _completed_buffers_head = cbn;
+325     _completed_buffers_tail = cbn;
+326   } else {
+327     _completed_buffers_tail-&gt;set_next(cbn);
+328     _completed_buffers_tail = cbn;
+329   }
+330   _n_completed_buffers++;
+331 
+332   if (!_process_completed_buffers &amp;&amp;
+333       (_n_completed_buffers &gt; _process_completed_buffers_threshold)) {
+334     _process_completed_buffers = true;
+335     if (_notify_when_complete) {
+336       _cbl_mon-&gt;notify();
+337     }
+338   }
+339   assert_completed_buffers_list_len_correct_locked();
+340 }
+341 
+342 BufferNode* PtrQueueSet::get_completed_buffer(size_t stop_at) {
+343   MutexLockerEx x(_cbl_mon, Mutex::_no_safepoint_check_flag);
+344 
+345   if (_n_completed_buffers &lt;= stop_at) {
+346     return NULL;
+347   }
+348 
+349   assert(_n_completed_buffers &gt; 0, &quot;invariant&quot;);
+350   assert(_completed_buffers_head != NULL, &quot;invariant&quot;);
+351   assert(_completed_buffers_tail != NULL, &quot;invariant&quot;);
+352 
+353   BufferNode* bn = _completed_buffers_head;
+354   _n_completed_buffers--;
+355   _completed_buffers_head = bn-&gt;next();
+356   if (_completed_buffers_head == NULL) {
+357     assert(_n_completed_buffers == 0, &quot;invariant&quot;);
+358     _completed_buffers_tail = NULL;
+359     _process_completed_buffers = false;
+360   }
+361   assert_completed_buffers_list_len_correct_locked();
+362   bn-&gt;set_next(NULL);
+363   return bn;
+364 }
+365 
+366 void PtrQueueSet::abandon_completed_buffers() {
+367   BufferNode* buffers_to_delete = NULL;
+368   {
+369     MutexLockerEx x(_cbl_mon, Mutex::_no_safepoint_check_flag);
+370     buffers_to_delete = _completed_buffers_head;
+371     _completed_buffers_head = NULL;
+372     _completed_buffers_tail = NULL;
+373     _n_completed_buffers = 0;
+374     _process_completed_buffers = false;
+375   }
+376   while (buffers_to_delete != NULL) {
+377     BufferNode* bn = buffers_to_delete;
+378     buffers_to_delete = bn-&gt;next();
+379     bn-&gt;set_next(NULL);
+380     deallocate_buffer(bn);
+381   }
+382 }
+383 
+384 #ifdef ASSERT
+385 
+386 void PtrQueueSet::assert_completed_buffers_list_len_correct_locked() {
+387   assert_lock_strong(_cbl_mon);
+388   size_t n = 0;
+389   for (BufferNode* bn = _completed_buffers_head; bn != NULL; bn = bn-&gt;next()) {
+390     ++n;
+391   }
+392   assert(n == _n_completed_buffers,
+393          &quot;Completed buffer length is wrong: counted: &quot; SIZE_FORMAT
+394          &quot;, expected: &quot; SIZE_FORMAT, n, _n_completed_buffers);
+395 }
+396 
+397 #endif // ASSERT
+398 
+399 // Merge lists of buffers. Notify the processing threads.
+400 // The source queue is emptied as a result. The queues
+401 // must share the monitor.
+402 void PtrQueueSet::merge_bufferlists(PtrQueueSet *src) {
+403   assert(_cbl_mon == src-&gt;_cbl_mon, &quot;Should share the same lock&quot;);
+404   MutexLockerEx x(_cbl_mon, Mutex::_no_safepoint_check_flag);
+405   if (_completed_buffers_tail == NULL) {
+406     assert(_completed_buffers_head == NULL, &quot;Well-formedness&quot;);
+407     _completed_buffers_head = src-&gt;_completed_buffers_head;
+408     _completed_buffers_tail = src-&gt;_completed_buffers_tail;
+409   } else {
+410     assert(_completed_buffers_head != NULL, &quot;Well formedness&quot;);
+411     if (src-&gt;_completed_buffers_head != NULL) {
+412       _completed_buffers_tail-&gt;set_next(src-&gt;_completed_buffers_head);
+413       _completed_buffers_tail = src-&gt;_completed_buffers_tail;
+414     }
+415   }
+416   _n_completed_buffers += src-&gt;_n_completed_buffers;
+417 
+418   src-&gt;_n_completed_buffers = 0;
+419   src-&gt;_completed_buffers_head = NULL;
+420   src-&gt;_completed_buffers_tail = NULL;
+421   src-&gt;_process_completed_buffers = false;
+422 
+423   assert(_completed_buffers_head == NULL &amp;&amp; _completed_buffers_tail == NULL ||
+424          _completed_buffers_head != NULL &amp;&amp; _completed_buffers_tail != NULL,
+425          &quot;Sanity&quot;);
+426   assert_completed_buffers_list_len_correct_locked();
+427 }
+428 
+429 void PtrQueueSet::notify_if_necessary() {
+430   MutexLockerEx x(_cbl_mon, Mutex::_no_safepoint_check_flag);
+431   if (_n_completed_buffers &gt; _process_completed_buffers_threshold) {
+432     _process_completed_buffers = true;
+433     if (_notify_when_complete)
+434       _cbl_mon-&gt;notify();
+435   }
+436 }
+    </pre>
+  </body>
+</html>

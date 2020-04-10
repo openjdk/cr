@@ -1,0 +1,366 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>New src/hotspot/share/gc/shared/satbMarkQueue.cpp</title>
+    <link rel="stylesheet" href="../../../../../style.css" />
+  </head>
+  <body>
+    <pre>
+  1 /*
+  2  * Copyright (c) 2001, 2019, Oracle and/or its affiliates. All rights reserved.
+  3  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  4  *
+  5  * This code is free software; you can redistribute it and/or modify it
+  6  * under the terms of the GNU General Public License version 2 only, as
+  7  * published by the Free Software Foundation.
+  8  *
+  9  * This code is distributed in the hope that it will be useful, but WITHOUT
+ 10  * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ 11  * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ 12  * version 2 for more details (a copy is included in the LICENSE file that
+ 13  * accompanied this code).
+ 14  *
+ 15  * You should have received a copy of the GNU General Public License version
+ 16  * 2 along with this work; if not, write to the Free Software Foundation,
+ 17  * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ 18  *
+ 19  * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ 20  * or visit www.oracle.com if you need additional information or have any
+ 21  * questions.
+ 22  *
+ 23  */
+ 24 
+ 25 #include &quot;precompiled.hpp&quot;
+ 26 #include &quot;gc/shared/satbMarkQueue.hpp&quot;
+ 27 #include &quot;gc/shared/collectedHeap.hpp&quot;
+ 28 #include &quot;logging/log.hpp&quot;
+ 29 #include &quot;memory/allocation.inline.hpp&quot;
+ 30 #include &quot;oops/oop.inline.hpp&quot;
+ 31 #include &quot;runtime/atomic.hpp&quot;
+ 32 #include &quot;runtime/mutexLocker.hpp&quot;
+ 33 #include &quot;runtime/os.hpp&quot;
+ 34 #include &quot;runtime/safepoint.hpp&quot;
+ 35 #include &quot;runtime/thread.hpp&quot;
+ 36 #include &quot;runtime/threadSMR.hpp&quot;
+ 37 #include &quot;runtime/vmThread.hpp&quot;
+ 38 #include &quot;utilities/globalCounter.inline.hpp&quot;
+ 39 
+ 40 SATBMarkQueue::SATBMarkQueue(SATBMarkQueueSet* qset) :
+ 41   // SATB queues are only active during marking cycles. We create
+ 42   // them with their active field set to false. If a thread is
+ 43   // created during a cycle and its SATB queue needs to be activated
+ 44   // before the thread starts running, we&#39;ll need to set its active
+ 45   // field to true. This must be done in the collector-specific
+ 46   // BarrierSet thread attachment protocol.
+ 47   PtrQueue(qset, false /* active */)
+ 48 { }
+ 49 
+ 50 void SATBMarkQueue::flush() {
+ 51   // Filter now to possibly save work later.  If filtering empties the
+ 52   // buffer then flush_impl can deallocate the buffer.
+ 53   filter();
+ 54   flush_impl();
+ 55 }
+ 56 
+ 57 // This method will first apply filtering to the buffer. If filtering
+ 58 // retains a small enough collection in the buffer, we can continue to
+ 59 // use the buffer as-is, instead of enqueueing and replacing it.
+ 60 
+ 61 void SATBMarkQueue::handle_completed_buffer() {
+ 62   // This method should only be called if there is a non-NULL buffer
+ 63   // that is full.
+ 64   assert(index() == 0, &quot;pre-condition&quot;);
+ 65   assert(_buf != NULL, &quot;pre-condition&quot;);
+ 66 
+ 67   filter();
+ 68 
+ 69   size_t threshold = satb_qset()-&gt;buffer_enqueue_threshold();
+ 70   // Ensure we&#39;ll enqueue completely full buffers.
+ 71   assert(threshold &gt; 0, &quot;enqueue threshold = 0&quot;);
+ 72   // Ensure we won&#39;t enqueue empty buffers.
+ 73   assert(threshold &lt;= capacity(),
+ 74          &quot;enqueue threshold &quot; SIZE_FORMAT &quot; exceeds capacity &quot; SIZE_FORMAT,
+ 75          threshold, capacity());
+ 76 
+ 77   if (index() &lt; threshold) {
+ 78     // Buffer is sufficiently full; enqueue and allocate a new one.
+ 79     enqueue_completed_buffer();
+ 80   } // Else continue to accumulate in buffer.
+ 81 }
+ 82 
+ 83 void SATBMarkQueue::apply_closure_and_empty(SATBBufferClosure* cl) {
+ 84   assert(SafepointSynchronize::is_at_safepoint(),
+ 85          &quot;SATB queues must only be processed at safepoints&quot;);
+ 86   if (_buf != NULL) {
+ 87     cl-&gt;do_buffer(&amp;_buf[index()], size());
+ 88     reset();
+ 89   }
+ 90 }
+ 91 
+ 92 #ifndef PRODUCT
+ 93 // Helpful for debugging
+ 94 
+ 95 static void print_satb_buffer(const char* name,
+ 96                               void** buf,
+ 97                               size_t index,
+ 98                               size_t capacity) {
+ 99   tty-&gt;print_cr(&quot;  SATB BUFFER [%s] buf: &quot; PTR_FORMAT &quot; index: &quot; SIZE_FORMAT
+100                 &quot; capacity: &quot; SIZE_FORMAT,
+101                 name, p2i(buf), index, capacity);
+102 }
+103 
+104 void SATBMarkQueue::print(const char* name) {
+105   print_satb_buffer(name, _buf, index(), capacity());
+106 }
+107 
+108 #endif // PRODUCT
+109 
+110 SATBMarkQueueSet::SATBMarkQueueSet(BufferNode::Allocator* allocator) :
+111   PtrQueueSet(allocator),
+112   _list(),
+113   _count_and_process_flag(0),
+114   _process_completed_buffers_threshold(SIZE_MAX),
+115   _buffer_enqueue_threshold(0)
+116 {}
+117 
+118 SATBMarkQueueSet::~SATBMarkQueueSet() {
+119   abandon_completed_buffers();
+120 }
+121 
+122 // _count_and_process_flag has flag in least significant bit, count in
+123 // remaining bits.  _process_completed_buffers_threshold is scaled
+124 // accordingly, with the lsbit set, so a _count_and_process_flag value
+125 // is directly comparable with the recorded threshold value.  The
+126 // process flag is set whenever the count exceeds the threshold, and
+127 // remains set until the count is reduced to zero.
+128 
+129 // Increment count.  If count &gt; threshold, set flag, else maintain flag.
+130 static void increment_count(volatile size_t* cfptr, size_t threshold) {
+131   size_t old;
+132   size_t value = Atomic::load(cfptr);
+133   do {
+134     old = value;
+135     value += 2;
+136     assert(value &gt; old, &quot;overflow&quot;);
+137     if (value &gt; threshold) value |= 1;
+138     value = Atomic::cmpxchg(cfptr, old, value);
+139   } while (value != old);
+140 }
+141 
+142 // Decrement count.  If count == 0, clear flag, else maintain flag.
+143 static void decrement_count(volatile size_t* cfptr) {
+144   size_t old;
+145   size_t value = Atomic::load(cfptr);
+146   do {
+147     assert((value &gt;&gt; 1) != 0, &quot;underflow&quot;);
+148     old = value;
+149     value -= 2;
+150     if (value &lt;= 1) value = 0;
+151     value = Atomic::cmpxchg(cfptr, old, value);
+152   } while (value != old);
+153 }
+154 
+155 void SATBMarkQueueSet::set_process_completed_buffers_threshold(size_t value) {
+156   // Scale requested threshold to align with count field.  If scaling
+157   // overflows, just use max value.  Set process flag field to make
+158   // comparison in increment_count exact.
+159   size_t scaled_value = value &lt;&lt; 1;
+160   if ((scaled_value &gt;&gt; 1) != value) {
+161     scaled_value = SIZE_MAX;
+162   }
+163   _process_completed_buffers_threshold = scaled_value | 1;
+164 }
+165 
+166 void SATBMarkQueueSet::set_buffer_enqueue_threshold_percentage(uint value) {
+167   // Minimum threshold of 1 ensures enqueuing of completely full buffers.
+168   size_t size = buffer_size();
+169   size_t enqueue_qty = (size * value) / 100;
+170   _buffer_enqueue_threshold = MAX2(size - enqueue_qty, (size_t)1);
+171 }
+172 
+173 #ifdef ASSERT
+174 void SATBMarkQueueSet::dump_active_states(bool expected_active) {
+175   log_error(gc, verify)(&quot;Expected SATB active state: %s&quot;, expected_active ? &quot;ACTIVE&quot; : &quot;INACTIVE&quot;);
+176   log_error(gc, verify)(&quot;Actual SATB active states:&quot;);
+177   log_error(gc, verify)(&quot;  Queue set: %s&quot;, is_active() ? &quot;ACTIVE&quot; : &quot;INACTIVE&quot;);
+178 
+179   class DumpThreadStateClosure : public ThreadClosure {
+180     SATBMarkQueueSet* _qset;
+181   public:
+182     DumpThreadStateClosure(SATBMarkQueueSet* qset) : _qset(qset) {}
+183     virtual void do_thread(Thread* t) {
+184       SATBMarkQueue&amp; queue = _qset-&gt;satb_queue_for_thread(t);
+185       log_error(gc, verify)(&quot;  Thread \&quot;%s\&quot; queue: %s&quot;,
+186                             t-&gt;name(),
+187                             queue.is_active() ? &quot;ACTIVE&quot; : &quot;INACTIVE&quot;);
+188     }
+189   } closure(this);
+190   Threads::threads_do(&amp;closure);
+191 }
+192 
+193 void SATBMarkQueueSet::verify_active_states(bool expected_active) {
+194   // Verify queue set state
+195   if (is_active() != expected_active) {
+196     dump_active_states(expected_active);
+197     fatal(&quot;SATB queue set has an unexpected active state&quot;);
+198   }
+199 
+200   // Verify thread queue states
+201   class VerifyThreadStatesClosure : public ThreadClosure {
+202     SATBMarkQueueSet* _qset;
+203     bool _expected_active;
+204   public:
+205     VerifyThreadStatesClosure(SATBMarkQueueSet* qset, bool expected_active) :
+206       _qset(qset), _expected_active(expected_active) {}
+207     virtual void do_thread(Thread* t) {
+208       if (_qset-&gt;satb_queue_for_thread(t).is_active() != _expected_active) {
+209         _qset-&gt;dump_active_states(_expected_active);
+210         fatal(&quot;Thread SATB queue has an unexpected active state&quot;);
+211       }
+212     }
+213   } closure(this, expected_active);
+214   Threads::threads_do(&amp;closure);
+215 }
+216 #endif // ASSERT
+217 
+218 void SATBMarkQueueSet::set_active_all_threads(bool active, bool expected_active) {
+219   assert(SafepointSynchronize::is_at_safepoint(), &quot;Must be at safepoint.&quot;);
+220 #ifdef ASSERT
+221   verify_active_states(expected_active);
+222 #endif // ASSERT
+223   // Update the global state, synchronized with threads list management.
+224   {
+225     MutexLocker ml(NonJavaThreadsList_lock, Mutex::_no_safepoint_check_flag);
+226     _all_active = active;
+227   }
+228 
+229   class SetThreadActiveClosure : public ThreadClosure {
+230     SATBMarkQueueSet* _qset;
+231     bool _active;
+232   public:
+233     SetThreadActiveClosure(SATBMarkQueueSet* qset, bool active) :
+234       _qset(qset), _active(active) {}
+235     virtual void do_thread(Thread* t) {
+236       _qset-&gt;satb_queue_for_thread(t).set_active(_active);
+237     }
+238   } closure(this, active);
+239   Threads::threads_do(&amp;closure);
+240 }
+241 
+242 bool SATBMarkQueueSet::apply_closure_to_completed_buffer(SATBBufferClosure* cl) {
+243   BufferNode* nd = get_completed_buffer();
+244   if (nd != NULL) {
+245     void **buf = BufferNode::make_buffer_from_node(nd);
+246     size_t index = nd-&gt;index();
+247     size_t size = buffer_size();
+248     assert(index &lt;= size, &quot;invariant&quot;);
+249     cl-&gt;do_buffer(buf + index, size - index);
+250     deallocate_buffer(nd);
+251     return true;
+252   } else {
+253     return false;
+254   }
+255 }
+256 
+257 // SATB buffer life-cycle - Per-thread queues obtain buffers from the
+258 // qset&#39;s buffer allocator, fill them, and push them onto the qset&#39;s
+259 // list.  The GC concurrently pops buffers from the qset, processes
+260 // them, and returns them to the buffer allocator for re-use.  Both
+261 // the allocator and the qset use lock-free stacks.  The ABA problem
+262 // is solved by having both allocation pops and GC pops performed
+263 // within GlobalCounter critical sections, while the return of buffers
+264 // to the allocator performs a GlobalCounter synchronize before
+265 // pushing onto the allocator&#39;s list.
+266 
+267 void SATBMarkQueueSet::enqueue_completed_buffer(BufferNode* node) {
+268   assert(node != NULL, &quot;precondition&quot;);
+269   // Increment count and update flag appropriately.  Done before
+270   // pushing buffer so count is always at least the actual number in
+271   // the list, and decrement never underflows.
+272   increment_count(&amp;_count_and_process_flag, _process_completed_buffers_threshold);
+273   _list.push(*node);
+274 }
+275 
+276 BufferNode* SATBMarkQueueSet::get_completed_buffer() {
+277   BufferNode* node;
+278   {
+279     GlobalCounter::CriticalSection cs(Thread::current());
+280     node = _list.pop();
+281   }
+282   if (node != NULL) {
+283     // Got a buffer so decrement count and update flag appropriately.
+284     decrement_count(&amp;_count_and_process_flag);
+285   }
+286   return node;
+287 }
+288 
+289 #ifndef PRODUCT
+290 // Helpful for debugging
+291 
+292 #define SATB_PRINTER_BUFFER_SIZE 256
+293 
+294 void SATBMarkQueueSet::print_all(const char* msg) {
+295   char buffer[SATB_PRINTER_BUFFER_SIZE];
+296   assert(SafepointSynchronize::is_at_safepoint(), &quot;Must be at safepoint.&quot;);
+297 
+298   tty-&gt;cr();
+299   tty-&gt;print_cr(&quot;SATB BUFFERS [%s]&quot;, msg);
+300 
+301   BufferNode* nd = _list.top();
+302   int i = 0;
+303   while (nd != NULL) {
+304     void** buf = BufferNode::make_buffer_from_node(nd);
+305     os::snprintf(buffer, SATB_PRINTER_BUFFER_SIZE, &quot;Enqueued: %d&quot;, i);
+306     print_satb_buffer(buffer, buf, nd-&gt;index(), buffer_size());
+307     nd = nd-&gt;next();
+308     i += 1;
+309   }
+310 
+311   class PrintThreadClosure : public ThreadClosure {
+312     SATBMarkQueueSet* _qset;
+313     char* _buffer;
+314 
+315   public:
+316     PrintThreadClosure(SATBMarkQueueSet* qset, char* buffer) :
+317       _qset(qset), _buffer(buffer) {}
+318 
+319     virtual void do_thread(Thread* t) {
+320       os::snprintf(_buffer, SATB_PRINTER_BUFFER_SIZE, &quot;Thread: %s&quot;, t-&gt;name());
+321       _qset-&gt;satb_queue_for_thread(t).print(_buffer);
+322     }
+323   } closure(this, buffer);
+324   Threads::threads_do(&amp;closure);
+325 
+326   tty-&gt;cr();
+327 }
+328 #endif // PRODUCT
+329 
+330 void SATBMarkQueueSet::abandon_completed_buffers() {
+331   Atomic::store(&amp;_count_and_process_flag, size_t(0));
+332   BufferNode* buffers_to_delete = _list.pop_all();
+333   while (buffers_to_delete != NULL) {
+334     BufferNode* bn = buffers_to_delete;
+335     buffers_to_delete = bn-&gt;next();
+336     bn-&gt;set_next(NULL);
+337     deallocate_buffer(bn);
+338   }
+339 }
+340 
+341 void SATBMarkQueueSet::abandon_partial_marking() {
+342   assert(SafepointSynchronize::is_at_safepoint(), &quot;Must be at safepoint.&quot;);
+343   abandon_completed_buffers();
+344 
+345   class AbandonThreadQueueClosure : public ThreadClosure {
+346     SATBMarkQueueSet* _qset;
+347   public:
+348     AbandonThreadQueueClosure(SATBMarkQueueSet* qset) : _qset(qset) {}
+349     virtual void do_thread(Thread* t) {
+350       _qset-&gt;satb_queue_for_thread(t).reset();
+351     }
+352   } closure(this);
+353   Threads::threads_do(&amp;closure);
+354 }
+    </pre>
+  </body>
+</html>
