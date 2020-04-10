@@ -1,0 +1,474 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>New src/java.base/linux/classes/sun/nio/fs/LinuxWatchService.java</title>
+    <link rel="stylesheet" href="../../../../../../../style.css" />
+  </head>
+  <body>
+    <pre>
+  1 /*
+  2  * Copyright (c) 2008, 2019, Oracle and/or its affiliates. All rights reserved.
+  3  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  4  *
+  5  * This code is free software; you can redistribute it and/or modify it
+  6  * under the terms of the GNU General Public License version 2 only, as
+  7  * published by the Free Software Foundation.  Oracle designates this
+  8  * particular file as subject to the &quot;Classpath&quot; exception as provided
+  9  * by Oracle in the LICENSE file that accompanied this code.
+ 10  *
+ 11  * This code is distributed in the hope that it will be useful, but WITHOUT
+ 12  * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ 13  * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ 14  * version 2 for more details (a copy is included in the LICENSE file that
+ 15  * accompanied this code).
+ 16  *
+ 17  * You should have received a copy of the GNU General Public License version
+ 18  * 2 along with this work; if not, write to the Free Software Foundation,
+ 19  * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ 20  *
+ 21  * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ 22  * or visit www.oracle.com if you need additional information or have any
+ 23  * questions.
+ 24  */
+ 25 
+ 26 package sun.nio.fs;
+ 27 
+ 28 import java.nio.file.*;
+ 29 import java.util.*;
+ 30 import java.io.IOException;
+ 31 import jdk.internal.misc.Unsafe;
+ 32 
+ 33 import static sun.nio.fs.UnixNativeDispatcher.*;
+ 34 import static sun.nio.fs.UnixConstants.*;
+ 35 
+ 36 /**
+ 37  * Linux implementation of WatchService based on inotify.
+ 38  *
+ 39  * In summary a background thread polls inotify plus a socket used for the wakeup
+ 40  * mechanism. Requests to add or remove a watch, or close the watch service,
+ 41  * cause the thread to wakeup and process the request. Events are processed
+ 42  * by the thread which causes it to signal/queue the corresponding watch keys.
+ 43  */
+ 44 
+ 45 class LinuxWatchService
+ 46     extends AbstractWatchService
+ 47 {
+ 48     private static final Unsafe unsafe = Unsafe.getUnsafe();
+ 49 
+ 50     // background thread to read change events
+ 51     private final Poller poller;
+ 52 
+ 53     LinuxWatchService(UnixFileSystem fs) throws IOException {
+ 54         // initialize inotify
+ 55         int ifd = - 1;
+ 56         try {
+ 57             ifd = inotifyInit();
+ 58         } catch (UnixException x) {
+ 59             String msg = (x.errno() == EMFILE) ?
+ 60                 &quot;User limit of inotify instances reached or too many open files&quot; :
+ 61                 x.errorString();
+ 62             throw new IOException(msg);
+ 63         }
+ 64 
+ 65         // configure inotify to be non-blocking
+ 66         // create socketpair used in the close mechanism
+ 67         int sp[] = new int[2];
+ 68         try {
+ 69             configureBlocking(ifd, false);
+ 70             socketpair(sp);
+ 71             configureBlocking(sp[0], false);
+ 72         } catch (UnixException x) {
+ 73             UnixNativeDispatcher.close(ifd);
+ 74             throw new IOException(x.errorString());
+ 75         }
+ 76 
+ 77         this.poller = new Poller(fs, this, ifd, sp);
+ 78         this.poller.start();
+ 79     }
+ 80 
+ 81     @Override
+ 82     WatchKey register(Path dir,
+ 83                       WatchEvent.Kind&lt;?&gt;[] events,
+ 84                       WatchEvent.Modifier... modifiers)
+ 85          throws IOException
+ 86     {
+ 87         // delegate to poller
+ 88         return poller.register(dir, events, modifiers);
+ 89     }
+ 90 
+ 91     @Override
+ 92     void implClose() throws IOException {
+ 93         // delegate to poller
+ 94         poller.close();
+ 95     }
+ 96 
+ 97     /**
+ 98      * WatchKey implementation
+ 99      */
+100     private static class LinuxWatchKey extends AbstractWatchKey {
+101         // inotify descriptor
+102         private final int ifd;
+103         // watch descriptor
+104         private volatile int wd;
+105 
+106         LinuxWatchKey(UnixPath dir, LinuxWatchService watcher, int ifd, int wd) {
+107             super(dir, watcher);
+108             this.ifd = ifd;
+109             this.wd = wd;
+110         }
+111 
+112         int descriptor() {
+113             return wd;
+114         }
+115 
+116         void invalidate(boolean remove) {
+117             if (remove) {
+118                 try {
+119                     inotifyRmWatch(ifd, wd);
+120                 } catch (UnixException x) {
+121                     // ignore
+122                 }
+123             }
+124             wd = -1;
+125         }
+126 
+127         @Override
+128         public boolean isValid() {
+129             return (wd != -1);
+130         }
+131 
+132         @Override
+133         public void cancel() {
+134             if (isValid()) {
+135                 // delegate to poller
+136                 ((LinuxWatchService)watcher()).poller.cancel(this);
+137             }
+138         }
+139     }
+140 
+141     /**
+142      * Background thread to read from inotify
+143      */
+144     private static class Poller extends AbstractPoller {
+145         /**
+146          * struct inotify_event {
+147          *     int          wd;
+148          *     uint32_t     mask;
+149          *     uint32_t     len;
+150          *     char name    __flexarr;  // present if len &gt; 0
+151          * } act_t;
+152          */
+153         private static final int SIZEOF_INOTIFY_EVENT  = eventSize();
+154         private static final int[] offsets             = eventOffsets();
+155         private static final int OFFSETOF_WD           = offsets[0];
+156         private static final int OFFSETOF_MASK         = offsets[1];
+157         private static final int OFFSETOF_LEN          = offsets[3];
+158         private static final int OFFSETOF_NAME         = offsets[4];
+159 
+160         private static final int IN_MODIFY          = 0x00000002;
+161         private static final int IN_ATTRIB          = 0x00000004;
+162         private static final int IN_MOVED_FROM      = 0x00000040;
+163         private static final int IN_MOVED_TO        = 0x00000080;
+164         private static final int IN_CREATE          = 0x00000100;
+165         private static final int IN_DELETE          = 0x00000200;
+166 
+167         private static final int IN_UNMOUNT         = 0x00002000;
+168         private static final int IN_Q_OVERFLOW      = 0x00004000;
+169         private static final int IN_IGNORED         = 0x00008000;
+170 
+171         // sizeof buffer for when polling inotify
+172         private static final int BUFFER_SIZE = 8192;
+173 
+174         private final UnixFileSystem fs;
+175         private final LinuxWatchService watcher;
+176 
+177         // inotify file descriptor
+178         private final int ifd;
+179         // socketpair used to shutdown polling thread
+180         private final int socketpair[];
+181         // maps watch descriptor to Key
+182         private final Map&lt;Integer,LinuxWatchKey&gt; wdToKey;
+183         // address of read buffer
+184         private final long address;
+185 
+186         Poller(UnixFileSystem fs, LinuxWatchService watcher, int ifd, int[] sp) {
+187             this.fs = fs;
+188             this.watcher = watcher;
+189             this.ifd = ifd;
+190             this.socketpair = sp;
+191             this.wdToKey = new HashMap&lt;&gt;();
+192             this.address = unsafe.allocateMemory(BUFFER_SIZE);
+193         }
+194 
+195         @Override
+196         void wakeup() throws IOException {
+197             // write to socketpair to wakeup polling thread
+198             try {
+199                 write(socketpair[1], address, 1);
+200             } catch (UnixException x) {
+201                 throw new IOException(x.errorString());
+202             }
+203         }
+204 
+205         @Override
+206         Object implRegister(Path obj,
+207                             Set&lt;? extends WatchEvent.Kind&lt;?&gt;&gt; events,
+208                             WatchEvent.Modifier... modifiers)
+209         {
+210             UnixPath dir = (UnixPath)obj;
+211 
+212             int mask = 0;
+213             for (WatchEvent.Kind&lt;?&gt; event: events) {
+214                 if (event == StandardWatchEventKinds.ENTRY_CREATE) {
+215                     mask |= IN_CREATE | IN_MOVED_TO;
+216                     continue;
+217                 }
+218                 if (event == StandardWatchEventKinds.ENTRY_DELETE) {
+219                     mask |= IN_DELETE | IN_MOVED_FROM;
+220                     continue;
+221                 }
+222                 if (event == StandardWatchEventKinds.ENTRY_MODIFY) {
+223                     mask |= IN_MODIFY | IN_ATTRIB;
+224                     continue;
+225                 }
+226             }
+227 
+228             // no modifiers supported at this time
+229             if (modifiers.length &gt; 0) {
+230                 for (WatchEvent.Modifier modifier: modifiers) {
+231                     if (modifier == null)
+232                         return new NullPointerException();
+233                     if (!ExtendedOptions.SENSITIVITY_HIGH.matches(modifier) &amp;&amp;
+234                             !ExtendedOptions.SENSITIVITY_MEDIUM.matches(modifier) &amp;&amp;
+235                             !ExtendedOptions.SENSITIVITY_LOW.matches(modifier)) {
+236                         return new UnsupportedOperationException(&quot;Modifier not supported&quot;);
+237                     }
+238                 }
+239             }
+240 
+241             // check file is directory
+242             UnixFileAttributes attrs = null;
+243             try {
+244                 attrs = UnixFileAttributes.get(dir, true);
+245             } catch (UnixException x) {
+246                 return x.asIOException(dir);
+247             }
+248             if (!attrs.isDirectory()) {
+249                 return new NotDirectoryException(dir.getPathForExceptionMessage());
+250             }
+251 
+252             // register with inotify (replaces existing mask if already registered)
+253             int wd = -1;
+254             try {
+255                 NativeBuffer buffer =
+256                     NativeBuffers.asNativeBuffer(dir.getByteArrayForSysCalls());
+257                 try {
+258                     wd = inotifyAddWatch(ifd, buffer.address(), mask);
+259                 } finally {
+260                     buffer.release();
+261                 }
+262             } catch (UnixException x) {
+263                 if (x.errno() == ENOSPC) {
+264                     return new IOException(&quot;User limit of inotify watches reached&quot;);
+265                 }
+266                 return x.asIOException(dir);
+267             }
+268 
+269             // ensure watch descriptor is in map
+270             LinuxWatchKey key = wdToKey.get(wd);
+271             if (key == null) {
+272                 key = new LinuxWatchKey(dir, watcher, ifd, wd);
+273                 wdToKey.put(wd, key);
+274             }
+275             return key;
+276         }
+277 
+278         // cancel single key
+279         @Override
+280         void implCancelKey(WatchKey obj) {
+281             LinuxWatchKey key = (LinuxWatchKey)obj;
+282             if (key.isValid()) {
+283                 wdToKey.remove(key.descriptor());
+284                 key.invalidate(true);
+285             }
+286         }
+287 
+288         // close watch service
+289         @Override
+290         void implCloseAll() {
+291             // invalidate all keys
+292             for (Map.Entry&lt;Integer,LinuxWatchKey&gt; entry: wdToKey.entrySet()) {
+293                 entry.getValue().invalidate(true);
+294             }
+295             wdToKey.clear();
+296 
+297             // free resources
+298             unsafe.freeMemory(address);
+299             UnixNativeDispatcher.close(socketpair[0]);
+300             UnixNativeDispatcher.close(socketpair[1]);
+301             UnixNativeDispatcher.close(ifd);
+302         }
+303 
+304         /**
+305          * Poller main loop
+306          */
+307         @Override
+308         public void run() {
+309             try {
+310                 for (;;) {
+311                     int nReady, bytesRead;
+312 
+313                     // wait for close or inotify event
+314                     nReady = poll(ifd, socketpair[0]);
+315 
+316                     // read from inotify
+317                     try {
+318                         bytesRead = read(ifd, address, BUFFER_SIZE);
+319                     } catch (UnixException x) {
+320                         if (x.errno() != EAGAIN &amp;&amp; x.errno() != EWOULDBLOCK)
+321                             throw x;
+322                         bytesRead = 0;
+323                     }
+324 
+325                     // iterate over buffer to decode events
+326                     int offset = 0;
+327                     while (offset &lt; bytesRead) {
+328                         long event = address + offset;
+329                         int wd = unsafe.getInt(event + OFFSETOF_WD);
+330                         int mask = unsafe.getInt(event + OFFSETOF_MASK);
+331                         int len = unsafe.getInt(event + OFFSETOF_LEN);
+332 
+333                         // file name
+334                         UnixPath name = null;
+335                         if (len &gt; 0) {
+336                             int actual = len;
+337 
+338                             // null-terminated and maybe additional null bytes to
+339                             // align the next event
+340                             while (actual &gt; 0) {
+341                                 long last = event + OFFSETOF_NAME + actual - 1;
+342                                 if (unsafe.getByte(last) != 0)
+343                                     break;
+344                                 actual--;
+345                             }
+346                             if (actual &gt; 0) {
+347                                 byte[] buf = new byte[actual];
+348                                 unsafe.copyMemory(null, event + OFFSETOF_NAME,
+349                                     buf, Unsafe.ARRAY_BYTE_BASE_OFFSET, actual);
+350                                 name = new UnixPath(fs, buf);
+351                             }
+352                         }
+353 
+354                         // process event
+355                         processEvent(wd, mask, name);
+356 
+357                         offset += (SIZEOF_INOTIFY_EVENT + len);
+358                     }
+359 
+360                     // process any pending requests
+361                     if ((nReady &gt; 1) || (nReady == 1 &amp;&amp; bytesRead == 0)) {
+362                         try {
+363                             read(socketpair[0], address, BUFFER_SIZE);
+364                             boolean shutdown = processRequests();
+365                             if (shutdown)
+366                                 break;
+367                         } catch (UnixException x) {
+368                             if (x.errno() != EAGAIN &amp;&amp; x.errno() != EWOULDBLOCK)
+369                                 throw x;
+370                         }
+371                     }
+372                 }
+373             } catch (UnixException x) {
+374                 x.printStackTrace();
+375             }
+376         }
+377 
+378 
+379         /**
+380          * map inotify event to WatchEvent.Kind
+381          */
+382         private WatchEvent.Kind&lt;?&gt; maskToEventKind(int mask) {
+383             if ((mask &amp; IN_MODIFY) &gt; 0)
+384                 return StandardWatchEventKinds.ENTRY_MODIFY;
+385             if ((mask &amp; IN_ATTRIB) &gt; 0)
+386                 return StandardWatchEventKinds.ENTRY_MODIFY;
+387             if ((mask &amp; IN_CREATE) &gt; 0)
+388                 return StandardWatchEventKinds.ENTRY_CREATE;
+389             if ((mask &amp; IN_MOVED_TO) &gt; 0)
+390                 return StandardWatchEventKinds.ENTRY_CREATE;
+391             if ((mask &amp; IN_DELETE) &gt; 0)
+392                 return StandardWatchEventKinds.ENTRY_DELETE;
+393             if ((mask &amp; IN_MOVED_FROM) &gt; 0)
+394                 return StandardWatchEventKinds.ENTRY_DELETE;
+395             return null;
+396         }
+397 
+398         /**
+399          * Process event from inotify
+400          */
+401         private void processEvent(int wd, int mask, final UnixPath name) {
+402             // overflow - signal all keys
+403             if ((mask &amp; IN_Q_OVERFLOW) &gt; 0) {
+404                 for (Map.Entry&lt;Integer,LinuxWatchKey&gt; entry: wdToKey.entrySet()) {
+405                     entry.getValue()
+406                         .signalEvent(StandardWatchEventKinds.OVERFLOW, null);
+407                 }
+408                 return;
+409             }
+410 
+411             // lookup wd to get key
+412             LinuxWatchKey key = wdToKey.get(wd);
+413             if (key == null)
+414                 return; // should not happen
+415 
+416             // file deleted
+417             if ((mask &amp; IN_IGNORED) &gt; 0) {
+418                 wdToKey.remove(wd);
+419                 key.invalidate(false);
+420                 key.signal();
+421                 return;
+422             }
+423 
+424             // event for directory itself
+425             if (name == null)
+426                 return;
+427 
+428             // map to event and queue to key
+429             WatchEvent.Kind&lt;?&gt; kind = maskToEventKind(mask);
+430             if (kind != null) {
+431                 key.signalEvent(kind, name);
+432             }
+433         }
+434     }
+435 
+436     // -- native methods --
+437 
+438     // sizeof inotify_event
+439     private static native int eventSize();
+440 
+441     // offsets of inotify_event
+442     private static native int[] eventOffsets();
+443 
+444     private static native int inotifyInit() throws UnixException;
+445 
+446     private static native int inotifyAddWatch(int fd, long pathAddress, int mask)
+447         throws UnixException;
+448 
+449     private static native void inotifyRmWatch(int fd, int wd)
+450         throws UnixException;
+451 
+452     private static native void configureBlocking(int fd, boolean blocking)
+453         throws UnixException;
+454 
+455     private static native void socketpair(int[] sv) throws UnixException;
+456 
+457     private static native int poll(int fd1, int fd2) throws UnixException;
+458 
+459     static {
+460         jdk.internal.loader.BootLoader.loadLibrary(&quot;nio&quot;);
+461     }
+462 }
+    </pre>
+  </body>
+</html>

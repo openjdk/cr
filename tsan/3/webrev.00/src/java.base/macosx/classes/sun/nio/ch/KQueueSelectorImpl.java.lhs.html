@@ -1,0 +1,405 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Frames src/java.base/macosx/classes/sun/nio/ch/KQueueSelectorImpl.java</title>
+    <link rel="stylesheet" href="../../../../../../../style.css" />
+    <script type="text/javascript" src="../../../../../../../navigation.js"></script>
+  </head>
+<body onkeypress="keypress(event);">
+<a name="0"></a>
+<hr />
+<pre>  1 /*
+  2  * Copyright (c) 2011, 2018, Oracle and/or its affiliates. All rights reserved.
+  3  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  4  *
+  5  * This code is free software; you can redistribute it and/or modify it
+  6  * under the terms of the GNU General Public License version 2 only, as
+  7  * published by the Free Software Foundation.  Oracle designates this
+  8  * particular file as subject to the &quot;Classpath&quot; exception as provided
+  9  * by Oracle in the LICENSE file that accompanied this code.
+ 10  *
+ 11  * This code is distributed in the hope that it will be useful, but WITHOUT
+ 12  * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ 13  * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ 14  * version 2 for more details (a copy is included in the LICENSE file that
+ 15  * accompanied this code).
+ 16  *
+ 17  * You should have received a copy of the GNU General Public License version
+ 18  * 2 along with this work; if not, write to the Free Software Foundation,
+ 19  * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ 20  *
+ 21  * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ 22  * or visit www.oracle.com if you need additional information or have any
+ 23  * questions.
+ 24  */
+ 25 
+ 26 package sun.nio.ch;
+ 27 
+ 28 import java.io.IOException;
+ 29 import java.nio.channels.ClosedSelectorException;
+ 30 import java.nio.channels.SelectionKey;
+ 31 import java.nio.channels.Selector;
+ 32 import java.nio.channels.spi.SelectorProvider;
+ 33 import java.util.ArrayDeque;
+ 34 import java.util.Deque;
+ 35 import java.util.HashMap;
+ 36 import java.util.Map;
+ 37 import java.util.concurrent.TimeUnit;
+ 38 import java.util.function.Consumer;
+ 39 
+ 40 import static sun.nio.ch.KQueue.EVFILT_READ;
+ 41 import static sun.nio.ch.KQueue.EVFILT_WRITE;
+ 42 import static sun.nio.ch.KQueue.EV_ADD;
+ 43 import static sun.nio.ch.KQueue.EV_DELETE;
+ 44 
+ 45 /**
+ 46  * KQueue based Selector implementation for macOS
+ 47  */
+ 48 
+ 49 class KQueueSelectorImpl extends SelectorImpl {
+ 50 
+ 51     // maximum number of events to poll in one call to kqueue
+ 52     private static final int MAX_KEVENTS = 256;
+ 53 
+ 54     // kqueue file descriptor
+ 55     private final int kqfd;
+ 56 
+ 57     // address of poll array (event list) when polling for pending events
+ 58     private final long pollArrayAddress;
+ 59 
+ 60     // file descriptors used for interrupt
+ 61     private final int fd0;
+ 62     private final int fd1;
+ 63 
+ 64     // maps file descriptor to selection key, synchronize on selector
+ 65     private final Map&lt;Integer, SelectionKeyImpl&gt; fdToKey = new HashMap&lt;&gt;();
+ 66 
+ 67     // pending new registrations/updates, queued by setEventOps
+ 68     private final Object updateLock = new Object();
+ 69     private final Deque&lt;SelectionKeyImpl&gt; updateKeys = new ArrayDeque&lt;&gt;();
+ 70 
+ 71     // interrupt triggering and clearing
+ 72     private final Object interruptLock = new Object();
+ 73     private boolean interruptTriggered;
+ 74 
+ 75     // used by updateSelectedKeys to handle cases where the same file
+ 76     // descriptor is polled by more than one filter
+ 77     private int pollCount;
+ 78 
+ 79     KQueueSelectorImpl(SelectorProvider sp) throws IOException {
+ 80         super(sp);
+ 81 
+ 82         this.kqfd = KQueue.create();
+ 83         this.pollArrayAddress = KQueue.allocatePollArray(MAX_KEVENTS);
+ 84 
+ 85         try {
+ 86             long fds = IOUtil.makePipe(false);
+ 87             this.fd0 = (int) (fds &gt;&gt;&gt; 32);
+ 88             this.fd1 = (int) fds;
+ 89         } catch (IOException ioe) {
+ 90             KQueue.freePollArray(pollArrayAddress);
+ 91             FileDispatcherImpl.closeIntFD(kqfd);
+ 92             throw ioe;
+ 93         }
+ 94 
+ 95         // register one end of the socket pair for wakeups
+ 96         KQueue.register(kqfd, fd0, EVFILT_READ, EV_ADD);
+ 97     }
+ 98 
+ 99     private void ensureOpen() {
+100         if (!isOpen())
+101             throw new ClosedSelectorException();
+102     }
+103 
+104     @Override
+105     protected int doSelect(Consumer&lt;SelectionKey&gt; action, long timeout)
+106         throws IOException
+107     {
+108         assert Thread.holdsLock(this);
+109 
+110         long to = Math.min(timeout, Integer.MAX_VALUE);  // max kqueue timeout
+111         boolean blocking = (to != 0);
+112         boolean timedPoll = (to &gt; 0);
+113 
+114         int numEntries;
+115         processUpdateQueue();
+116         processDeregisterQueue();
+117         try {
+118             begin(blocking);
+119 
+120             do {
+121                 long startTime = timedPoll ? System.nanoTime() : 0;
+122                 numEntries = KQueue.poll(kqfd, pollArrayAddress, MAX_KEVENTS, to);
+123                 if (numEntries == IOStatus.INTERRUPTED &amp;&amp; timedPoll) {
+124                     // timed poll interrupted so need to adjust timeout
+125                     long adjust = System.nanoTime() - startTime;
+126                     to -= TimeUnit.MILLISECONDS.convert(adjust, TimeUnit.NANOSECONDS);
+127                     if (to &lt;= 0) {
+128                         // timeout expired so no retry
+129                         numEntries = 0;
+130                     }
+131                 }
+132             } while (numEntries == IOStatus.INTERRUPTED);
+133             assert IOStatus.check(numEntries);
+134 
+135         } finally {
+136             end(blocking);
+137         }
+138         processDeregisterQueue();
+139         return processEvents(numEntries, action);
+140     }
+141 
+142     /**
+143      * Process changes to the interest ops.
+144      */
+145     private void processUpdateQueue() {
+146         assert Thread.holdsLock(this);
+147 
+148         synchronized (updateLock) {
+149             SelectionKeyImpl ski;
+150             while ((ski = updateKeys.pollFirst()) != null) {
+151                 if (ski.isValid()) {
+152                     int fd = ski.getFDVal();
+153                     // add to fdToKey if needed
+154                     SelectionKeyImpl previous = fdToKey.putIfAbsent(fd, ski);
+155                     assert (previous == null) || (previous == ski);
+156 
+157                     int newEvents = ski.translateInterestOps();
+158                     int registeredEvents = ski.registeredEvents();
+<a name="1" id="anc1"></a>
+
+
+
+
+
+
+159                     if (newEvents != registeredEvents) {
+160 
+161                         // add or delete interest in read events
+162                         if ((registeredEvents &amp; Net.POLLIN) != 0) {
+163                             if ((newEvents &amp; Net.POLLIN) == 0) {
+164                                 KQueue.register(kqfd, fd, EVFILT_READ, EV_DELETE);
+165                             }
+166                         } else if ((newEvents &amp; Net.POLLIN) != 0) {
+167                             KQueue.register(kqfd, fd, EVFILT_READ, EV_ADD);
+168                         }
+169 
+170                         // add or delete interest in write events
+171                         if ((registeredEvents &amp; Net.POLLOUT) != 0) {
+172                             if ((newEvents &amp; Net.POLLOUT) == 0) {
+173                                 KQueue.register(kqfd, fd, EVFILT_WRITE, EV_DELETE);
+174                             }
+175                         } else if ((newEvents &amp; Net.POLLOUT) != 0) {
+176                             KQueue.register(kqfd, fd, EVFILT_WRITE, EV_ADD);
+177                         }
+178 
+179                         ski.registeredEvents(newEvents);
+180                     }
+181                 }
+182             }
+183         }
+184     }
+185 
+186     /**
+187      * Process the polled events.
+188      * If the interrupt fd has been selected, drain it and clear the interrupt.
+189      */
+190     private int processEvents(int numEntries, Consumer&lt;SelectionKey&gt; action)
+191         throws IOException
+192     {
+193         assert Thread.holdsLock(this);
+194 
+195         int numKeysUpdated = 0;
+196         boolean interrupted = false;
+197 
+198         // A file descriptor may be registered with kqueue with more than one
+199         // filter and so there may be more than one event for a fd. The poll
+200         // count is incremented here and compared against the SelectionKey&#39;s
+201         // &quot;lastPolled&quot; field. This ensures that the ready ops is updated rather
+202         // than replaced when a file descriptor is polled by both the read and
+203         // write filter.
+204         pollCount++;
+205 
+206         for (int i = 0; i &lt; numEntries; i++) {
+207             long kevent = KQueue.getEvent(pollArrayAddress, i);
+208             int fd = KQueue.getDescriptor(kevent);
+209             if (fd == fd0) {
+210                 interrupted = true;
+211             } else {
+212                 SelectionKeyImpl ski = fdToKey.get(fd);
+213                 if (ski != null) {
+214                     int rOps = 0;
+215                     short filter = KQueue.getFilter(kevent);
+216                     if (filter == EVFILT_READ) {
+217                         rOps |= Net.POLLIN;
+218                     } else if (filter == EVFILT_WRITE) {
+219                         rOps |= Net.POLLOUT;
+220                     }
+221                     int updated = processReadyEvents(rOps, ski, action);
+222                     if (updated &gt; 0 &amp;&amp; ski.lastPolled != pollCount) {
+223                         numKeysUpdated++;
+224                         ski.lastPolled = pollCount;
+225                     }
+226                 }
+227             }
+228         }
+229 
+230         if (interrupted) {
+231             clearInterrupt();
+232         }
+233         return numKeysUpdated;
+234     }
+235 
+236     @Override
+237     protected void implClose() throws IOException {
+238         assert !isOpen();
+239         assert Thread.holdsLock(this);
+240 
+241         // prevent further wakeup
+242         synchronized (interruptLock) {
+243             interruptTriggered = true;
+244         }
+245 
+246         FileDispatcherImpl.closeIntFD(kqfd);
+247         KQueue.freePollArray(pollArrayAddress);
+248 
+249         FileDispatcherImpl.closeIntFD(fd0);
+250         FileDispatcherImpl.closeIntFD(fd1);
+251     }
+252 
+253     @Override
+254     protected void implDereg(SelectionKeyImpl ski) throws IOException {
+255         assert !ski.isValid();
+256         assert Thread.holdsLock(this);
+257 
+258         int fd = ski.getFDVal();
+259         int registeredEvents = ski.registeredEvents();
+260         if (fdToKey.remove(fd) != null) {
+261             if (registeredEvents != 0) {
+262                 if ((registeredEvents &amp; Net.POLLIN) != 0)
+263                     KQueue.register(kqfd, fd, EVFILT_READ, EV_DELETE);
+264                 if ((registeredEvents &amp; Net.POLLOUT) != 0)
+265                     KQueue.register(kqfd, fd, EVFILT_WRITE, EV_DELETE);
+266                 ski.registeredEvents(0);
+267             }
+268         } else {
+269             assert registeredEvents == 0;
+270         }
+271     }
+272 
+273     @Override
+274     public void setEventOps(SelectionKeyImpl ski) {
+275         ensureOpen();
+276         synchronized (updateLock) {
+277             updateKeys.addLast(ski);
+278         }
+279     }
+280 
+281     @Override
+282     public Selector wakeup() {
+283         synchronized (interruptLock) {
+284             if (!interruptTriggered) {
+285                 try {
+286                     IOUtil.write1(fd1, (byte)0);
+287                 } catch (IOException ioe) {
+288                     throw new InternalError(ioe);
+289                 }
+290                 interruptTriggered = true;
+291             }
+292         }
+293         return this;
+294     }
+295 
+296     private void clearInterrupt() throws IOException {
+297         synchronized (interruptLock) {
+298             IOUtil.drain(fd0);
+299             interruptTriggered = false;
+300         }
+301     }
+302 }
+<a name="2" id="anc2"></a><b style="font-size: large; color: red">--- EOF ---</b>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+</pre>
+<input id="eof" value="2" type="hidden" />
+</body>
+</html>

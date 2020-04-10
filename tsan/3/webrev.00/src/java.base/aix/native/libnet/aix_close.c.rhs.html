@@ -1,0 +1,644 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Frames src/java.base/aix/native/libnet/aix_close.c</title>
+    <link rel="stylesheet" href="../../../../../style.css" />
+    <script type="text/javascript" src="../../../../../navigation.js"></script>
+  </head>
+<body onkeypress="keypress(event);">
+<a name="0"></a>
+<hr />
+<pre>  1 /*
+  2  * Copyright (c) 2001, 2019, Oracle and/or its affiliates. All rights reserved.
+<a name="1" id="anc1"></a><span class="line-modified">  3  * Copyright (c) 2016, 2019, SAP SE and/or its affiliates. All rights reserved.</span>
+  4  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  5  *
+  6  * This code is free software; you can redistribute it and/or modify it
+  7  * under the terms of the GNU General Public License version 2 only, as
+  8  * published by the Free Software Foundation.  Oracle designates this
+  9  * particular file as subject to the &quot;Classpath&quot; exception as provided
+ 10  * by Oracle in the LICENSE file that accompanied this code.
+ 11  *
+ 12  * This code is distributed in the hope that it will be useful, but WITHOUT
+ 13  * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ 14  * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ 15  * version 2 for more details (a copy is included in the LICENSE file that
+ 16  * accompanied this code).
+ 17  *
+ 18  * You should have received a copy of the GNU General Public License version
+ 19  * 2 along with this work; if not, write to the Free Software Foundation,
+ 20  * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ 21  *
+ 22  * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ 23  * or visit www.oracle.com if you need additional information or have any
+ 24  * questions.
+ 25  */
+ 26 
+ 27 /*
+ 28  * This file contains implementations of NET_... functions. The NET_.. functions are
+ 29  * wrappers for common file- and socket functions plus provisions for non-blocking IO.
+ 30  *
+ 31  * (basically, the layers remember all  file descriptors waiting for a particular fd;
+ 32  *  all threads waiting on a certain fd can be woken up by sending them a signal; this
+ 33  *  is done e.g. when the fd is closed.)
+ 34  *
+ 35  * This was originally copied from the linux_close.c implementation.
+ 36  *
+ 37  * Side Note: This coding needs initialization. Under Linux this is done
+ 38  * automatically via __attribute((constructor)), on AIX this is done manually
+ 39  * (see aix_close_init).
+ 40  *
+ 41  */
+ 42 
+ 43 /*
+ 44    AIX needs a workaround for I/O cancellation, see:
+ 45    http://publib.boulder.ibm.com/infocenter/pseries/v5r3/index.jsp?topic=/com.ibm.aix.basetechref/doc/basetrf1/close.htm
+ 46    ...
+ 47    The close subroutine is blocked until all subroutines which use the file
+ 48    descriptor return to usr space. For example, when a thread is calling close
+ 49    and another thread is calling select with the same file descriptor, the
+ 50    close subroutine does not return until the select call returns.
+ 51    ...
+ 52 */
+ 53 
+ 54 #include &lt;assert.h&gt;
+ 55 #include &lt;limits.h&gt;
+ 56 #include &lt;stdio.h&gt;
+ 57 #include &lt;stdlib.h&gt;
+ 58 #include &lt;signal.h&gt;
+ 59 #include &lt;pthread.h&gt;
+ 60 #include &lt;sys/types.h&gt;
+ 61 #include &lt;sys/socket.h&gt;
+ 62 #include &lt;sys/time.h&gt;
+ 63 #include &lt;sys/resource.h&gt;
+ 64 #include &lt;sys/uio.h&gt;
+ 65 #include &lt;unistd.h&gt;
+ 66 #include &lt;errno.h&gt;
+ 67 #include &lt;poll.h&gt;
+ 68 #include &quot;jvm.h&quot;
+ 69 #include &quot;net_util.h&quot;
+ 70 
+ 71 /*
+ 72  * Stack allocated by thread when doing blocking operation
+ 73  */
+ 74 typedef struct threadEntry {
+ 75     pthread_t thr;                      /* this thread */
+ 76     struct threadEntry *next;           /* next thread */
+ 77     int intr;                           /* interrupted */
+ 78 } threadEntry_t;
+ 79 
+ 80 /*
+ 81  * Heap allocated during initialized - one entry per fd
+ 82  */
+ 83 typedef struct {
+ 84     pthread_mutex_t lock;               /* fd lock */
+ 85     threadEntry_t *threads;             /* threads blocked on fd */
+ 86 } fdEntry_t;
+ 87 
+ 88 /*
+ 89  * Signal to unblock thread
+ 90  */
+ 91 static int sigWakeup = (SIGRTMAX - 1);
+ 92 
+ 93 /*
+ 94  * fdTable holds one entry per file descriptor, up to a certain
+ 95  * maximum.
+ 96  * Theoretically, the number of possible file descriptors can get
+ 97  * large, though usually it does not. Entries for small value file
+ 98  * descriptors are kept in a simple table, which covers most scenarios.
+ 99  * Entries for large value file descriptors are kept in an overflow
+100  * table, which is organized as a sparse two dimensional array whose
+101  * slabs are allocated on demand. This covers all corner cases while
+102  * keeping memory consumption reasonable.
+103  */
+104 
+105 /* Base table for low value file descriptors */
+106 static fdEntry_t* fdTable = NULL;
+107 /* Maximum size of base table (in number of entries). */
+108 static const int fdTableMaxSize = 0x1000; /* 4K */
+109 /* Actual size of base table (in number of entries) */
+110 static int fdTableLen = 0;
+111 /* Max. theoretical number of file descriptors on system. */
+112 static int fdLimit = 0;
+113 
+114 /* Overflow table, should base table not be large enough. Organized as
+115  *   an array of n slabs, each holding 64k entries.
+116  */
+117 static fdEntry_t** fdOverflowTable = NULL;
+118 /* Number of slabs in the overflow table */
+119 static int fdOverflowTableLen = 0;
+120 /* Number of entries in one slab */
+121 static const int fdOverflowTableSlabSize = 0x10000; /* 64k */
+122 pthread_mutex_t fdOverflowTableLock = PTHREAD_MUTEX_INITIALIZER;
+123 
+124 /*
+125  * Null signal handler
+126  */
+127 static void sig_wakeup(int sig) {
+128 }
+129 
+130 /*
+131  * Initialization routine (executed when library is loaded)
+132  * Allocate fd tables and sets up signal handler.
+133  *
+134  * On AIX we don&#39;t have __attribute((constructor)) so we need to initialize
+135  * manually (from JNI_OnLoad() in &#39;src/share/native/java/net/net_util.c&#39;)
+136  */
+137 void aix_close_init() {
+138     struct rlimit nbr_files;
+139     sigset_t sigset;
+140     struct sigaction sa;
+141     int i = 0;
+142 
+143     /* Determine the maximum number of possible file descriptors. */
+144     if (-1 == getrlimit(RLIMIT_NOFILE, &amp;nbr_files)) {
+145         fprintf(stderr, &quot;library initialization failed - &quot;
+146                 &quot;unable to get max # of allocated fds\n&quot;);
+147         abort();
+148     }
+149     if (nbr_files.rlim_max != RLIM_INFINITY) {
+150         fdLimit = nbr_files.rlim_max;
+151     } else {
+152         /* We just do not know. */
+153         fdLimit = INT_MAX;
+154     }
+155 
+156     /* Allocate table for low value file descriptors. */
+157     fdTableLen = fdLimit &lt; fdTableMaxSize ? fdLimit : fdTableMaxSize;
+158     fdTable = (fdEntry_t*) calloc(fdTableLen, sizeof(fdEntry_t));
+159     if (fdTable == NULL) {
+160         fprintf(stderr, &quot;library initialization failed - &quot;
+161                 &quot;unable to allocate file descriptor table - out of memory&quot;);
+162         abort();
+163     } else {
+164         for (i = 0; i &lt; fdTableLen; i ++) {
+165             pthread_mutex_init(&amp;fdTable[i].lock, NULL);
+166         }
+167     }
+168 
+169     /* Allocate overflow table, if needed */
+170     if (fdLimit &gt; fdTableMaxSize) {
+171         fdOverflowTableLen = ((fdLimit - fdTableMaxSize) / fdOverflowTableSlabSize) + 1;
+172         fdOverflowTable = (fdEntry_t**) calloc(fdOverflowTableLen, sizeof(fdEntry_t*));
+173         if (fdOverflowTable == NULL) {
+174             fprintf(stderr, &quot;library initialization failed - &quot;
+175                     &quot;unable to allocate file descriptor overflow table - out of memory&quot;);
+176             abort();
+177         }
+178     }
+179 
+180     /*
+181      * Setup the signal handler
+182      */
+183     sa.sa_handler = sig_wakeup;
+184     sa.sa_flags   = 0;
+185     sigemptyset(&amp;sa.sa_mask);
+186     sigaction(sigWakeup, &amp;sa, NULL);
+187 
+188     sigemptyset(&amp;sigset);
+189     sigaddset(&amp;sigset, sigWakeup);
+190     sigprocmask(SIG_UNBLOCK, &amp;sigset, NULL);
+191 }
+192 
+193 /*
+194  * Return the fd table for this fd.
+195  */
+196 static inline fdEntry_t *getFdEntry(int fd)
+197 {
+198     fdEntry_t* result = NULL;
+199 
+200     if (fd &lt; 0) {
+201         return NULL;
+202     }
+203 
+204     /* This should not happen. If it does, our assumption about
+205      * max. fd value was wrong. */
+206     assert(fd &lt; fdLimit);
+207 
+208     if (fd &lt; fdTableMaxSize) {
+209         /* fd is in base table. */
+210         assert(fd &lt; fdTableLen);
+211         result = &amp;fdTable[fd];
+212     } else {
+213         /* fd is in overflow table. */
+214         const int indexInOverflowTable = fd - fdTableMaxSize;
+215         const int rootindex = indexInOverflowTable / fdOverflowTableSlabSize;
+216         const int slabindex = indexInOverflowTable % fdOverflowTableSlabSize;
+217         fdEntry_t* slab = NULL;
+218         assert(rootindex &lt; fdOverflowTableLen);
+219         assert(slabindex &lt; fdOverflowTableSlabSize);
+220         pthread_mutex_lock(&amp;fdOverflowTableLock);
+221         /* Allocate new slab in overflow table if needed */
+222         if (fdOverflowTable[rootindex] == NULL) {
+223             fdEntry_t* const newSlab =
+224                 (fdEntry_t*)calloc(fdOverflowTableSlabSize, sizeof(fdEntry_t));
+225             if (newSlab == NULL) {
+226                 fprintf(stderr, &quot;Unable to allocate file descriptor overflow&quot;
+227                         &quot; table slab - out of memory&quot;);
+228                 pthread_mutex_unlock(&amp;fdOverflowTableLock);
+229                 abort();
+230             } else {
+231                 int i;
+232                 for (i = 0; i &lt; fdOverflowTableSlabSize; i ++) {
+233                     pthread_mutex_init(&amp;newSlab[i].lock, NULL);
+234                 }
+235                 fdOverflowTable[rootindex] = newSlab;
+236             }
+237         }
+238         pthread_mutex_unlock(&amp;fdOverflowTableLock);
+239         slab = fdOverflowTable[rootindex];
+240         result = &amp;slab[slabindex];
+241     }
+242 
+243     return result;
+244 
+245 }
+246 
+247 
+248 /*
+249  * Start a blocking operation :-
+250  *    Insert thread onto thread list for the fd.
+251  */
+252 static inline void startOp(fdEntry_t *fdEntry, threadEntry_t *self)
+253 {
+254     self-&gt;thr = pthread_self();
+255     self-&gt;intr = 0;
+256 
+257     pthread_mutex_lock(&amp;(fdEntry-&gt;lock));
+258     {
+259         self-&gt;next = fdEntry-&gt;threads;
+260         fdEntry-&gt;threads = self;
+261     }
+262     pthread_mutex_unlock(&amp;(fdEntry-&gt;lock));
+263 }
+264 
+265 /*
+266  * End a blocking operation :-
+267  *     Remove thread from thread list for the fd
+268  *     If fd has been interrupted then set errno to EBADF
+269  */
+270 static inline void endOp
+271     (fdEntry_t *fdEntry, threadEntry_t *self)
+272 {
+273     int orig_errno = errno;
+274     pthread_mutex_lock(&amp;(fdEntry-&gt;lock));
+275     {
+276         threadEntry_t *curr, *prev=NULL;
+277         curr = fdEntry-&gt;threads;
+278         while (curr != NULL) {
+279             if (curr == self) {
+280                 if (curr-&gt;intr) {
+281                     orig_errno = EBADF;
+282                 }
+283                 if (prev == NULL) {
+284                     fdEntry-&gt;threads = curr-&gt;next;
+285                 } else {
+286                     prev-&gt;next = curr-&gt;next;
+287                 }
+288                 break;
+289             }
+290             prev = curr;
+291             curr = curr-&gt;next;
+292         }
+293     }
+294     pthread_mutex_unlock(&amp;(fdEntry-&gt;lock));
+295     errno = orig_errno;
+296 }
+297 
+298 /*
+299  * Close or dup2 a file descriptor ensuring that all threads blocked on
+300  * the file descriptor are notified via a wakeup signal.
+301  *
+302  *      fd1 &lt; 0    =&gt; close(fd2)
+303  *      fd1 &gt;= 0   =&gt; dup2(fd1, fd2)
+304  *
+305  * Returns -1 with errno set if operation fails.
+306  */
+307 static int closefd(int fd1, int fd2) {
+308     int rv, orig_errno;
+309     fdEntry_t *fdEntry = getFdEntry(fd2);
+310     if (fdEntry == NULL) {
+311         errno = EBADF;
+312         return -1;
+313     }
+314 
+315     /*
+316      * Lock the fd to hold-off additional I/O on this fd.
+317      */
+318     pthread_mutex_lock(&amp;(fdEntry-&gt;lock));
+319 
+320     {
+321         /* On fast machines we see that we enter dup2 before the
+322          * accepting thread had a chance to get and process the signal.
+323          * So in case we woke a thread up, give it some time to cope.
+324          * Also see https://bugs.openjdk.java.net/browse/JDK-8006395 */
+325         int num_woken = 0;
+326 
+327         /*
+328          * Send a wakeup signal to all threads blocked on this
+329          * file descriptor.
+330          */
+331         threadEntry_t *curr = fdEntry-&gt;threads;
+332         while (curr != NULL) {
+333             curr-&gt;intr = 1;
+334             pthread_kill( curr-&gt;thr, sigWakeup );
+335             num_woken ++;
+336             curr = curr-&gt;next;
+337         }
+338 
+339         if (num_woken &gt; 0) {
+340           usleep(num_woken * 50);
+341         }
+342 
+343         /*
+344          * And close/dup the file descriptor
+345          * (restart if interrupted by signal)
+346          */
+347         do {
+348             if (fd1 &lt; 0) {
+349                 rv = close(fd2);
+350             } else {
+351                 rv = dup2(fd1, fd2);
+352             }
+353         } while (rv == -1 &amp;&amp; errno == EINTR);
+354     }
+355 
+356     /*
+357      * Unlock without destroying errno
+358      */
+359     orig_errno = errno;
+360     pthread_mutex_unlock(&amp;(fdEntry-&gt;lock));
+361     errno = orig_errno;
+362 
+363     return rv;
+364 }
+365 
+366 /*
+367  * Wrapper for dup2 - same semantics as dup2 system call except
+368  * that any threads blocked in an I/O system call on fd2 will be
+369  * preempted and return -1/EBADF;
+370  */
+371 int NET_Dup2(int fd, int fd2) {
+372     if (fd &lt; 0) {
+373         errno = EBADF;
+374         return -1;
+375     }
+376     return closefd(fd, fd2);
+377 }
+378 
+379 /*
+380  * Wrapper for close - same semantics as close system call
+381  * except that any threads blocked in an I/O on fd will be
+382  * preempted and the I/O system call will return -1/EBADF.
+383  */
+384 int NET_SocketClose(int fd) {
+385     return closefd(-1, fd);
+386 }
+387 
+388 /************** Basic I/O operations here ***************/
+389 
+390 /*
+391  * Macro to perform a blocking IO operation. Restarts
+392  * automatically if interrupted by signal (other than
+393  * our wakeup signal)
+394  */
+395 #define BLOCKING_IO_RETURN_INT(FD, FUNC) {      \
+396     int ret;                                    \
+397     threadEntry_t self;                         \
+398     fdEntry_t *fdEntry = getFdEntry(FD);        \
+399     if (fdEntry == NULL) {                      \
+400         errno = EBADF;                          \
+401         return -1;                              \
+402     }                                           \
+403     do {                                        \
+404         startOp(fdEntry, &amp;self);                \
+405         ret = FUNC;                             \
+406         endOp(fdEntry, &amp;self);                  \
+407     } while (ret == -1 &amp;&amp; errno == EINTR);      \
+408     return ret;                                 \
+409 }
+410 
+411 int NET_Read(int s, void* buf, size_t len) {
+412     BLOCKING_IO_RETURN_INT( s, recv(s, buf, len, 0) );
+413 }
+414 
+415 int NET_NonBlockingRead(int s, void* buf, size_t len) {
+416     BLOCKING_IO_RETURN_INT(s, recv(s, buf, len, MSG_NONBLOCK));
+417 }
+418 
+<a name="2" id="anc2"></a>
+
+
+
+419 int NET_RecvFrom(int s, void *buf, int len, unsigned int flags,
+420        struct sockaddr *from, socklen_t *fromlen) {
+421     BLOCKING_IO_RETURN_INT( s, recvfrom(s, buf, len, flags, from, fromlen) );
+422 }
+423 
+424 int NET_Send(int s, void *msg, int len, unsigned int flags) {
+425     BLOCKING_IO_RETURN_INT( s, send(s, msg, len, flags) );
+426 }
+427 
+428 int NET_SendTo(int s, const void *msg, int len,  unsigned  int
+429        flags, const struct sockaddr *to, int tolen) {
+430     BLOCKING_IO_RETURN_INT( s, sendto(s, msg, len, flags, to, tolen) );
+431 }
+432 
+433 int NET_Accept(int s, struct sockaddr *addr, socklen_t *addrlen) {
+434     BLOCKING_IO_RETURN_INT( s, accept(s, addr, addrlen) );
+435 }
+436 
+437 int NET_Connect(int s, struct sockaddr *addr, int addrlen) {
+438     int crc = -1, prc = -1;
+439     threadEntry_t self;
+440     fdEntry_t* fdEntry = getFdEntry(s);
+441 
+442     if (fdEntry == NULL) {
+443         errno = EBADF;
+444         return -1;
+445     }
+446 
+447     /* On AIX, when the system call connect() is interrupted, the connection
+448      * is not aborted and it will be established asynchronously by the kernel.
+449      * Hence, no need to restart connect() when EINTR is received
+450      */
+451     startOp(fdEntry, &amp;self);
+452     crc = connect(s, addr, addrlen);
+453     endOp(fdEntry, &amp;self);
+454 
+455     if (crc == -1 &amp;&amp; errno == EINTR) {
+456         struct pollfd s_pollfd;
+457         int sockopt_arg = 0;
+458         socklen_t len;
+459 
+460         s_pollfd.fd = s;
+461         s_pollfd.events = POLLOUT | POLLERR;
+462 
+463         /* poll the file descriptor */
+464         do {
+465             startOp(fdEntry, &amp;self);
+466             prc = poll(&amp;s_pollfd, 1, -1);
+467             endOp(fdEntry, &amp;self);
+468         } while (prc == -1  &amp;&amp; errno == EINTR);
+469 
+470         if (prc &lt; 0)
+471             return prc;
+472 
+473         len = sizeof(sockopt_arg);
+474 
+475         /* Check whether the connection has been established */
+476         if (getsockopt(s, SOL_SOCKET, SO_ERROR, &amp;sockopt_arg, &amp;len) == -1)
+477             return -1;
+478 
+479         if (sockopt_arg != 0 ) {
+480             errno = sockopt_arg;
+481             return -1;
+482         }
+483     } else {
+484         return crc;
+485     }
+486 
+487     /* At this point, fd is connected. Set successful return code */
+488     return 0;
+489 }
+490 
+491 int NET_Poll(struct pollfd *ufds, unsigned int nfds, int timeout) {
+492     BLOCKING_IO_RETURN_INT( ufds[0].fd, poll(ufds, nfds, timeout) );
+493 }
+494 
+495 /*
+496  * Wrapper for poll(s, timeout).
+497  * Auto restarts with adjusted timeout if interrupted by
+498  * signal other than our wakeup signal.
+499  */
+500 int NET_Timeout(JNIEnv *env, int s, long timeout, jlong nanoTimeStamp) {
+501     jlong prevNanoTime = nanoTimeStamp;
+502     jlong nanoTimeout = (jlong) timeout * NET_NSEC_PER_MSEC;
+503     fdEntry_t *fdEntry = getFdEntry(s);
+504 
+505     /*
+506      * Check that fd hasn&#39;t been closed.
+507      */
+508     if (fdEntry == NULL) {
+509         errno = EBADF;
+510         return -1;
+511     }
+512 
+513     for(;;) {
+514         struct pollfd pfd;
+515         int rv;
+516         threadEntry_t self;
+517 
+518         /*
+519          * Poll the fd. If interrupted by our wakeup signal
+520          * errno will be set to EBADF.
+521          */
+522         pfd.fd = s;
+523         pfd.events = POLLIN | POLLERR;
+524 
+525         startOp(fdEntry, &amp;self);
+526         rv = poll(&amp;pfd, 1, nanoTimeout / NET_NSEC_PER_MSEC);
+527         endOp(fdEntry, &amp;self);
+528 
+529         /*
+530          * If interrupted then adjust timeout. If timeout
+531          * has expired return 0 (indicating timeout expired).
+532          */
+533         if (rv &lt; 0 &amp;&amp; errno == EINTR) {
+534             jlong newNanoTime = JVM_NanoTime(env, 0);
+535             nanoTimeout -= newNanoTime - prevNanoTime;
+536             if (nanoTimeout &lt; NET_NSEC_PER_MSEC) {
+537                 return 0;
+538             }
+539             prevNanoTime = newNanoTime;
+540         } else {
+541             return rv;
+542         }
+543     }
+544 }
+<a name="3" id="anc3"></a><b style="font-size: large; color: red">--- EOF ---</b>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+</pre>
+<input id="eof" value="3" type="hidden" />
+</body>
+</html>
