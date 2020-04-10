@@ -1,0 +1,1453 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>New src/hotspot/share/opto/reg_split.cpp</title>
+    <link rel="stylesheet" href="../../../../style.css" />
+  </head>
+  <body>
+    <pre>
+   1 /*
+   2  * Copyright (c) 2000, 2018, Oracle and/or its affiliates. All rights reserved.
+   3  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+   4  *
+   5  * This code is free software; you can redistribute it and/or modify it
+   6  * under the terms of the GNU General Public License version 2 only, as
+   7  * published by the Free Software Foundation.
+   8  *
+   9  * This code is distributed in the hope that it will be useful, but WITHOUT
+  10  * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+  11  * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+  12  * version 2 for more details (a copy is included in the LICENSE file that
+  13  * accompanied this code).
+  14  *
+  15  * You should have received a copy of the GNU General Public License version
+  16  * 2 along with this work; if not, write to the Free Software Foundation,
+  17  * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+  18  *
+  19  * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+  20  * or visit www.oracle.com if you need additional information or have any
+  21  * questions.
+  22  *
+  23  */
+  24 
+  25 #include &quot;precompiled.hpp&quot;
+  26 #include &quot;libadt/vectset.hpp&quot;
+  27 #include &quot;memory/allocation.inline.hpp&quot;
+  28 #include &quot;memory/resourceArea.inline.hpp&quot;
+  29 #include &quot;opto/addnode.hpp&quot;
+  30 #include &quot;opto/c2compiler.hpp&quot;
+  31 #include &quot;opto/callnode.hpp&quot;
+  32 #include &quot;opto/cfgnode.hpp&quot;
+  33 #include &quot;opto/chaitin.hpp&quot;
+  34 #include &quot;opto/loopnode.hpp&quot;
+  35 #include &quot;opto/machnode.hpp&quot;
+  36 
+  37 //------------------------------Split--------------------------------------
+  38 // Walk the graph in RPO and for each lrg which spills, propagate reaching
+  39 // definitions.  During propagation, split the live range around regions of
+  40 // High Register Pressure (HRP).  If a Def is in a region of Low Register
+  41 // Pressure (LRP), it will not get spilled until we encounter a region of
+  42 // HRP between it and one of its uses.  We will spill at the transition
+  43 // point between LRP and HRP.  Uses in the HRP region will use the spilled
+  44 // Def.  The first Use outside the HRP region will generate a SpillCopy to
+  45 // hoist the live range back up into a register, and all subsequent uses
+  46 // will use that new Def until another HRP region is encountered.  Defs in
+  47 // HRP regions will get trailing SpillCopies to push the LRG down into the
+  48 // stack immediately.
+  49 //
+  50 // As a side effect, unlink from (hence make dead) coalesced copies.
+  51 //
+  52 
+  53 static const char out_of_nodes[] = &quot;out of nodes during split&quot;;
+  54 
+  55 //------------------------------get_spillcopy_wide-----------------------------
+  56 // Get a SpillCopy node with wide-enough masks.  Use the &#39;wide-mask&#39;, the
+  57 // wide ideal-register spill-mask if possible.  If the &#39;wide-mask&#39; does
+  58 // not cover the input (or output), use the input (or output) mask instead.
+  59 Node *PhaseChaitin::get_spillcopy_wide(MachSpillCopyNode::SpillType spill_type, Node *def, Node *use, uint uidx) {
+  60   // If ideal reg doesn&#39;t exist we&#39;ve got a bad schedule happening
+  61   // that is forcing us to spill something that isn&#39;t spillable.
+  62   // Bail rather than abort
+  63   uint ireg = def-&gt;ideal_reg();
+  64   if (ireg == 0 || ireg == Op_RegFlags) {
+  65     assert(false, &quot;attempted to spill a non-spillable item: %d: %s &lt;- %d: %s, ireg = %u, spill_type: %s&quot;,
+  66            def-&gt;_idx, def-&gt;Name(), use-&gt;_idx, use-&gt;Name(), ireg,
+  67            MachSpillCopyNode::spill_type(spill_type));
+  68     C-&gt;record_method_not_compilable(&quot;attempted to spill a non-spillable item&quot;);
+  69     return NULL;
+  70   }
+  71   if (C-&gt;check_node_count(NodeLimitFudgeFactor, out_of_nodes)) {
+  72     return NULL;
+  73   }
+  74   const RegMask *i_mask = &amp;def-&gt;out_RegMask();
+  75   const RegMask *w_mask = C-&gt;matcher()-&gt;idealreg2spillmask[ireg];
+  76   const RegMask *o_mask = use ? &amp;use-&gt;in_RegMask(uidx) : w_mask;
+  77   const RegMask *w_i_mask = w_mask-&gt;overlap( *i_mask ) ? w_mask : i_mask;
+  78   const RegMask *w_o_mask;
+  79 
+  80   int num_regs = RegMask::num_registers(ireg);
+  81   bool is_vect = RegMask::is_vector(ireg);
+  82   if( w_mask-&gt;overlap( *o_mask ) &amp;&amp; // Overlap AND
+  83       (num_regs == 1  // Single use or aligned
+  84         || is_vect    // or vector
+  85         || (!is_vect &amp;&amp; o_mask-&gt;is_aligned_pairs())) ) {
+  86     assert(!is_vect || o_mask-&gt;is_aligned_sets(num_regs), &quot;vectors are aligned&quot;);
+  87     // Don&#39;t come here for mis-aligned doubles
+  88     w_o_mask = w_mask;
+  89   } else {                      // wide ideal mask does not overlap with o_mask
+  90     // Mis-aligned doubles come here and XMM-&gt;FPR moves on x86.
+  91     w_o_mask = o_mask;          // Must target desired registers
+  92     // Does the ideal-reg-mask overlap with o_mask?  I.e., can I use
+  93     // a reg-reg move or do I need a trip across register classes
+  94     // (and thus through memory)?
+  95     if( !C-&gt;matcher()-&gt;idealreg2regmask[ireg]-&gt;overlap( *o_mask) &amp;&amp; o_mask-&gt;is_UP() )
+  96       // Here we assume a trip through memory is required.
+  97       w_i_mask = &amp;C-&gt;FIRST_STACK_mask();
+  98   }
+  99   return new MachSpillCopyNode(spill_type, def, *w_i_mask, *w_o_mask );
+ 100 }
+ 101 
+ 102 //------------------------------insert_proj------------------------------------
+ 103 // Insert the spill at chosen location.  Skip over any intervening Proj&#39;s or
+ 104 // Phis.  Skip over a CatchNode and projs, inserting in the fall-through block
+ 105 // instead.  Update high-pressure indices.  Create a new live range.
+ 106 void PhaseChaitin::insert_proj( Block *b, uint i, Node *spill, uint maxlrg ) {
+ 107   // Skip intervening ProjNodes.  Do not insert between a ProjNode and
+ 108   // its definer.
+ 109   while( i &lt; b-&gt;number_of_nodes() &amp;&amp;
+ 110          (b-&gt;get_node(i)-&gt;is_Proj() ||
+ 111           b-&gt;get_node(i)-&gt;is_Phi() ) )
+ 112     i++;
+ 113 
+ 114   // Do not insert between a call and his Catch
+ 115   if( b-&gt;get_node(i)-&gt;is_Catch() ) {
+ 116     // Put the instruction at the top of the fall-thru block.
+ 117     // Find the fall-thru projection
+ 118     while( 1 ) {
+ 119       const CatchProjNode *cp = b-&gt;get_node(++i)-&gt;as_CatchProj();
+ 120       if( cp-&gt;_con == CatchProjNode::fall_through_index )
+ 121         break;
+ 122     }
+ 123     int sidx = i - b-&gt;end_idx()-1;
+ 124     b = b-&gt;_succs[sidx];        // Switch to successor block
+ 125     i = 1;                      // Right at start of block
+ 126   }
+ 127 
+ 128   b-&gt;insert_node(spill, i);    // Insert node in block
+ 129   _cfg.map_node_to_block(spill,  b); // Update node-&gt;block mapping to reflect
+ 130   // Adjust the point where we go hi-pressure
+ 131   if( i &lt;= b-&gt;_ihrp_index ) b-&gt;_ihrp_index++;
+ 132   if( i &lt;= b-&gt;_fhrp_index ) b-&gt;_fhrp_index++;
+ 133 
+ 134   // Assign a new Live Range Number to the SpillCopy and grow
+ 135   // the node-&gt;live range mapping.
+ 136   new_lrg(spill,maxlrg);
+ 137 }
+ 138 
+ 139 //------------------------------split_DEF--------------------------------------
+ 140 // There are four categories of Split; UP/DOWN x DEF/USE
+ 141 // Only three of these really occur as DOWN/USE will always color
+ 142 // Any Split with a DEF cannot CISC-Spill now.  Thus we need
+ 143 // two helper routines, one for Split DEFS (insert after instruction),
+ 144 // one for Split USES (insert before instruction).  DEF insertion
+ 145 // happens inside Split, where the Leaveblock array is updated.
+ 146 uint PhaseChaitin::split_DEF( Node *def, Block *b, int loc, uint maxlrg, Node **Reachblock, Node **debug_defs, GrowableArray&lt;uint&gt; splits, int slidx ) {
+ 147 #ifdef ASSERT
+ 148   // Increment the counter for this lrg
+ 149   splits.at_put(slidx, splits.at(slidx)+1);
+ 150 #endif
+ 151   // If we are spilling the memory op for an implicit null check, at the
+ 152   // null check location (ie - null check is in HRP block) we need to do
+ 153   // the null-check first, then spill-down in the following block.
+ 154   // (The implicit_null_check function ensures the use is also dominated
+ 155   // by the branch-not-taken block.)
+ 156   Node *be = b-&gt;end();
+ 157   if( be-&gt;is_MachNullCheck() &amp;&amp; be-&gt;in(1) == def &amp;&amp; def == b-&gt;get_node(loc)) {
+ 158     // Spill goes in the branch-not-taken block
+ 159     b = b-&gt;_succs[b-&gt;get_node(b-&gt;end_idx()+1)-&gt;Opcode() == Op_IfTrue];
+ 160     loc = 0;                    // Just past the Region
+ 161   }
+ 162   assert( loc &gt;= 0, &quot;must insert past block head&quot; );
+ 163 
+ 164   // Get a def-side SpillCopy
+ 165   Node *spill = get_spillcopy_wide(MachSpillCopyNode::Definition, def, NULL, 0);
+ 166   // Did we fail to split?, then bail
+ 167   if (!spill) {
+ 168     return 0;
+ 169   }
+ 170 
+ 171   // Insert the spill at chosen location
+ 172   insert_proj( b, loc+1, spill, maxlrg++);
+ 173 
+ 174   // Insert new node into Reaches array
+ 175   Reachblock[slidx] = spill;
+ 176   // Update debug list of reaching down definitions by adding this one
+ 177   debug_defs[slidx] = spill;
+ 178 
+ 179   // return updated count of live ranges
+ 180   return maxlrg;
+ 181 }
+ 182 
+ 183 //------------------------------split_USE--------------------------------------
+ 184 // Splits at uses can involve redeffing the LRG, so no CISC Spilling there.
+ 185 // Debug uses want to know if def is already stack enabled.
+ 186 uint PhaseChaitin::split_USE(MachSpillCopyNode::SpillType spill_type, Node *def, Block *b, Node *use, uint useidx, uint maxlrg, bool def_down, bool cisc_sp, GrowableArray&lt;uint&gt; splits, int slidx ) {
+ 187 #ifdef ASSERT
+ 188   // Increment the counter for this lrg
+ 189   splits.at_put(slidx, splits.at(slidx)+1);
+ 190 #endif
+ 191 
+ 192   // Some setup stuff for handling debug node uses
+ 193   JVMState* jvms = use-&gt;jvms();
+ 194   uint debug_start = jvms ? jvms-&gt;debug_start() : 999999;
+ 195   uint debug_end   = jvms ? jvms-&gt;debug_end()   : 999999;
+ 196 
+ 197   //-------------------------------------------
+ 198   // Check for use of debug info
+ 199   if (useidx &gt;= debug_start &amp;&amp; useidx &lt; debug_end) {
+ 200     // Actually it&#39;s perfectly legal for constant debug info to appear
+ 201     // just unlikely.  In this case the optimizer left a ConI of a 4
+ 202     // as both inputs to a Phi with only a debug use.  It&#39;s a single-def
+ 203     // live range of a rematerializable value.  The live range spills,
+ 204     // rematerializes and now the ConI directly feeds into the debug info.
+ 205     // assert(!def-&gt;is_Con(), &quot;constant debug info already constructed directly&quot;);
+ 206 
+ 207     // Special split handling for Debug Info
+ 208     // If DEF is DOWN, just hook the edge and return
+ 209     // If DEF is UP, Split it DOWN for this USE.
+ 210     if( def-&gt;is_Mach() ) {
+ 211       if( def_down ) {
+ 212         // DEF is DOWN, so connect USE directly to the DEF
+ 213         use-&gt;set_req(useidx, def);
+ 214       } else {
+ 215         // Block and index where the use occurs.
+ 216         Block *b = _cfg.get_block_for_node(use);
+ 217         // Put the clone just prior to use
+ 218         int bindex = b-&gt;find_node(use);
+ 219         // DEF is UP, so must copy it DOWN and hook in USE
+ 220         // Insert SpillCopy before the USE, which uses DEF as its input,
+ 221         // and defs a new live range, which is used by this node.
+ 222         Node *spill = get_spillcopy_wide(spill_type, def,use,useidx);
+ 223         // did we fail to split?
+ 224         if (!spill) {
+ 225           // Bail
+ 226           return 0;
+ 227         }
+ 228         // insert into basic block
+ 229         insert_proj( b, bindex, spill, maxlrg++ );
+ 230         // Use the new split
+ 231         use-&gt;set_req(useidx,spill);
+ 232       }
+ 233       // No further split handling needed for this use
+ 234       return maxlrg;
+ 235     }  // End special splitting for debug info live range
+ 236   }  // If debug info
+ 237 
+ 238   // CISC-SPILLING
+ 239   // Finally, check to see if USE is CISC-Spillable, and if so,
+ 240   // gather_lrg_masks will add the flags bit to its mask, and
+ 241   // no use side copy is needed.  This frees up the live range
+ 242   // register choices without causing copy coalescing, etc.
+ 243   if( UseCISCSpill &amp;&amp; cisc_sp ) {
+ 244     int inp = use-&gt;cisc_operand();
+ 245     if( inp != AdlcVMDeps::Not_cisc_spillable )
+ 246       // Convert operand number to edge index number
+ 247       inp = use-&gt;as_Mach()-&gt;operand_index(inp);
+ 248     if( inp == (int)useidx ) {
+ 249       use-&gt;set_req(useidx, def);
+ 250 #ifndef PRODUCT
+ 251       if( TraceCISCSpill ) {
+ 252         tty-&gt;print(&quot;  set_split: &quot;);
+ 253         use-&gt;dump();
+ 254       }
+ 255 #endif
+ 256       return maxlrg;
+ 257     }
+ 258   }
+ 259 
+ 260   //-------------------------------------------
+ 261   // Insert a Copy before the use
+ 262 
+ 263   // Block and index where the use occurs.
+ 264   int bindex;
+ 265   // Phi input spill-copys belong at the end of the prior block
+ 266   if( use-&gt;is_Phi() ) {
+ 267     b = _cfg.get_block_for_node(b-&gt;pred(useidx));
+ 268     bindex = b-&gt;end_idx();
+ 269   } else {
+ 270     // Put the clone just prior to use
+ 271     bindex = b-&gt;find_node(use);
+ 272   }
+ 273 
+ 274   Node *spill = get_spillcopy_wide(spill_type, def, use, useidx );
+ 275   if( !spill ) return 0;        // Bailed out
+ 276   // Insert SpillCopy before the USE, which uses the reaching DEF as
+ 277   // its input, and defs a new live range, which is used by this node.
+ 278   insert_proj( b, bindex, spill, maxlrg++ );
+ 279   // Use the spill/clone
+ 280   use-&gt;set_req(useidx,spill);
+ 281 
+ 282   // return updated live range count
+ 283   return maxlrg;
+ 284 }
+ 285 
+ 286 //------------------------------clone_node----------------------------
+ 287 // Clone node with anti dependence check.
+ 288 Node* clone_node(Node* def, Block *b, Compile* C) {
+ 289   if (def-&gt;needs_anti_dependence_check()) {
+ 290 #ifdef ASSERT
+ 291     if (PrintOpto &amp;&amp; WizardMode) {
+ 292       tty-&gt;print_cr(&quot;RA attempts to clone node with anti_dependence:&quot;);
+ 293       def-&gt;dump(-1); tty-&gt;cr();
+ 294       tty-&gt;print_cr(&quot;into block:&quot;);
+ 295       b-&gt;dump();
+ 296     }
+ 297 #endif
+ 298     if (C-&gt;subsume_loads() == true &amp;&amp; !C-&gt;failing()) {
+ 299       // Retry with subsume_loads == false
+ 300       // If this is the first failure, the sentinel string will &quot;stick&quot;
+ 301       // to the Compile object, and the C2Compiler will see it and retry.
+ 302       C-&gt;record_failure(C2Compiler::retry_no_subsuming_loads());
+ 303     } else {
+ 304       // Bailout without retry
+ 305       C-&gt;record_method_not_compilable(&quot;RA Split failed: attempt to clone node with anti_dependence&quot;);
+ 306     }
+ 307     return 0;
+ 308   }
+ 309   return def-&gt;clone();
+ 310 }
+ 311 
+ 312 //------------------------------split_Rematerialize----------------------------
+ 313 // Clone a local copy of the def.
+ 314 Node *PhaseChaitin::split_Rematerialize(Node *def, Block *b, uint insidx, uint &amp;maxlrg,
+ 315                                         GrowableArray&lt;uint&gt; splits, int slidx, uint *lrg2reach,
+ 316                                         Node **Reachblock, bool walkThru) {
+ 317   // The input live ranges will be stretched to the site of the new
+ 318   // instruction.  They might be stretched past a def and will thus
+ 319   // have the old and new values of the same live range alive at the
+ 320   // same time - a definite no-no.  Split out private copies of
+ 321   // the inputs.
+ 322   if (def-&gt;req() &gt; 1) {
+ 323     for (uint i = 1; i &lt; def-&gt;req(); i++) {
+ 324       Node *in = def-&gt;in(i);
+ 325       uint lidx = _lrg_map.live_range_id(in);
+ 326       // We do not need this for live ranges that are only defined once.
+ 327       // However, this is not true for spill copies that are added in this
+ 328       // Split() pass, since they might get coalesced later on in this pass.
+ 329       if (lidx &lt; _lrg_map.max_lrg_id() &amp;&amp; lrgs(lidx).is_singledef()) {
+ 330         continue;
+ 331       }
+ 332 
+ 333       Block *b_def = _cfg.get_block_for_node(def);
+ 334       int idx_def = b_def-&gt;find_node(def);
+ 335       // Cannot spill Op_RegFlags.
+ 336       Node *in_spill;
+ 337       if (in-&gt;ideal_reg() != Op_RegFlags) {
+ 338         in_spill = get_spillcopy_wide(MachSpillCopyNode::InputToRematerialization, in, def, i);
+ 339         if (!in_spill) { return 0; } // Bailed out
+ 340         insert_proj(b_def, idx_def, in_spill, maxlrg++);
+ 341         if (b_def == b) {
+ 342           insidx++;
+ 343         }
+ 344         def-&gt;set_req(i, in_spill);
+ 345       } else {
+ 346         // The &#39;in&#39; defines a flag register. Flag registers can not be spilled.
+ 347         // Register allocation handles live ranges with flag registers
+ 348         // by rematerializing the def (in this case &#39;in&#39;). Thus, this is not
+ 349         // critical if the input can be rematerialized, too.
+ 350         if (!in-&gt;rematerialize()) {
+ 351           assert(false, &quot;Can not rematerialize %d: %s. Prolongs RegFlags live&quot;
+ 352                  &quot; range and defining node %d: %s may not be rematerialized.&quot;,
+ 353                  def-&gt;_idx, def-&gt;Name(), in-&gt;_idx, in-&gt;Name());
+ 354           C-&gt;record_method_not_compilable(&quot;attempted to spill a non-spillable item with RegFlags input&quot;);
+ 355           return 0; // Bailed out
+ 356         }
+ 357       }
+ 358     }
+ 359   }
+ 360 
+ 361   Node *spill = clone_node(def, b, C);
+ 362   if (spill == NULL || C-&gt;check_node_count(NodeLimitFudgeFactor, out_of_nodes)) {
+ 363     // Check when generating nodes
+ 364     return 0;
+ 365   }
+ 366 
+ 367   // See if any inputs are currently being spilled, and take the
+ 368   // latest copy of spilled inputs.
+ 369   if( spill-&gt;req() &gt; 1 ) {
+ 370     for( uint i = 1; i &lt; spill-&gt;req(); i++ ) {
+ 371       Node *in = spill-&gt;in(i);
+ 372       uint lidx = _lrg_map.find_id(in);
+ 373 
+ 374       // Walk backwards thru spill copy node intermediates
+ 375       if (walkThru) {
+ 376         while (in-&gt;is_SpillCopy() &amp;&amp; lidx &gt;= _lrg_map.max_lrg_id()) {
+ 377           in = in-&gt;in(1);
+ 378           lidx = _lrg_map.find_id(in);
+ 379         }
+ 380 
+ 381         if (lidx &lt; _lrg_map.max_lrg_id() &amp;&amp; lrgs(lidx).is_multidef()) {
+ 382           // walkThru found a multidef LRG, which is unsafe to use, so
+ 383           // just keep the original def used in the clone.
+ 384           in = spill-&gt;in(i);
+ 385           lidx = _lrg_map.find_id(in);
+ 386         }
+ 387       }
+ 388 
+ 389       if (lidx &lt; _lrg_map.max_lrg_id() &amp;&amp; lrgs(lidx).reg() &gt;= LRG::SPILL_REG) {
+ 390         Node *rdef = Reachblock[lrg2reach[lidx]];
+ 391         if (rdef) {
+ 392           spill-&gt;set_req(i, rdef);
+ 393         }
+ 394       }
+ 395     }
+ 396   }
+ 397 
+ 398 
+ 399   assert( spill-&gt;out_RegMask().is_UP(), &quot;rematerialize to a reg&quot; );
+ 400   // Rematerialized op is def-&gt;spilled+1
+ 401   set_was_spilled(spill);
+ 402   if( _spilled_once.test(def-&gt;_idx) )
+ 403     set_was_spilled(spill);
+ 404 
+ 405   insert_proj( b, insidx, spill, maxlrg++ );
+ 406 #ifdef ASSERT
+ 407   // Increment the counter for this lrg
+ 408   splits.at_put(slidx, splits.at(slidx)+1);
+ 409 #endif
+ 410   // See if the cloned def kills any flags, and copy those kills as well
+ 411   uint i = insidx+1;
+ 412   int found_projs = clone_projs( b, i, def, spill, maxlrg);
+ 413   if (found_projs &gt; 0) {
+ 414     // Adjust the point where we go hi-pressure
+ 415     if (i &lt;= b-&gt;_ihrp_index) {
+ 416       b-&gt;_ihrp_index += found_projs;
+ 417     }
+ 418     if (i &lt;= b-&gt;_fhrp_index) {
+ 419       b-&gt;_fhrp_index += found_projs;
+ 420     }
+ 421   }
+ 422 
+ 423   return spill;
+ 424 }
+ 425 
+ 426 //------------------------------is_high_pressure-------------------------------
+ 427 // Function to compute whether or not this live range is &quot;high pressure&quot;
+ 428 // in this block - whether it spills eagerly or not.
+ 429 bool PhaseChaitin::is_high_pressure( Block *b, LRG *lrg, uint insidx ) {
+ 430   if( lrg-&gt;_was_spilled1 ) return true;
+ 431   // Forced spilling due to conflict?  Then split only at binding uses
+ 432   // or defs, not for supposed capacity problems.
+ 433   // CNC - Turned off 7/8/99, causes too much spilling
+ 434   // if( lrg-&gt;_is_bound ) return false;
+ 435 
+ 436   // Use float pressure numbers for vectors.
+ 437   bool is_float_or_vector = lrg-&gt;_is_float || lrg-&gt;_is_vector;
+ 438   // Not yet reached the high-pressure cutoff point, so low pressure
+ 439   uint hrp_idx = is_float_or_vector ? b-&gt;_fhrp_index : b-&gt;_ihrp_index;
+ 440   if( insidx &lt; hrp_idx ) return false;
+ 441   // Register pressure for the block as a whole depends on reg class
+ 442   int block_pres = is_float_or_vector ? b-&gt;_freg_pressure : b-&gt;_reg_pressure;
+ 443   // Bound live ranges will split at the binding points first;
+ 444   // Intermediate splits should assume the live range&#39;s register set
+ 445   // got &quot;freed up&quot; and that num_regs will become INT_PRESSURE.
+ 446   int bound_pres = is_float_or_vector ? FLOATPRESSURE : INTPRESSURE;
+ 447   // Effective register pressure limit.
+ 448   int lrg_pres = (lrg-&gt;get_invalid_mask_size() &gt; lrg-&gt;num_regs())
+ 449     ? (lrg-&gt;get_invalid_mask_size() &gt;&gt; (lrg-&gt;num_regs()-1)) : bound_pres;
+ 450   // High pressure if block pressure requires more register freedom
+ 451   // than live range has.
+ 452   return block_pres &gt;= lrg_pres;
+ 453 }
+ 454 
+ 455 
+ 456 //------------------------------prompt_use---------------------------------
+ 457 // True if lidx is used before any real register is def&#39;d in the block
+ 458 bool PhaseChaitin::prompt_use( Block *b, uint lidx ) {
+ 459   if (lrgs(lidx)._was_spilled2) {
+ 460     return false;
+ 461   }
+ 462 
+ 463   // Scan block for 1st use.
+ 464   for( uint i = 1; i &lt;= b-&gt;end_idx(); i++ ) {
+ 465     Node *n = b-&gt;get_node(i);
+ 466     // Ignore PHI use, these can be up or down
+ 467     if (n-&gt;is_Phi()) {
+ 468       continue;
+ 469     }
+ 470     for (uint j = 1; j &lt; n-&gt;req(); j++) {
+ 471       if (_lrg_map.find_id(n-&gt;in(j)) == lidx) {
+ 472         return true;          // Found 1st use!
+ 473       }
+ 474     }
+ 475     if (n-&gt;out_RegMask().is_NotEmpty()) {
+ 476       return false;
+ 477     }
+ 478   }
+ 479   return false;
+ 480 }
+ 481 
+ 482 //------------------------------Split--------------------------------------
+ 483 //----------Split Routine----------
+ 484 // ***** NEW SPLITTING HEURISTIC *****
+ 485 // DEFS: If the DEF is in a High Register Pressure(HRP) Block, split there.
+ 486 //        Else, no split unless there is a HRP block between a DEF and
+ 487 //        one of its uses, and then split at the HRP block.
+ 488 //
+ 489 // USES: If USE is in HRP, split at use to leave main LRG on stack.
+ 490 //       Else, hoist LRG back up to register only (ie - split is also DEF)
+ 491 // We will compute a new maxlrg as we go
+ 492 uint PhaseChaitin::Split(uint maxlrg, ResourceArea* split_arena) {
+ 493   Compile::TracePhase tp(&quot;regAllocSplit&quot;, &amp;timers[_t_regAllocSplit]);
+ 494 
+ 495   // Free thread local resources used by this method on exit.
+ 496   ResourceMark rm(split_arena);
+ 497 
+ 498   uint                 bidx, pidx, slidx, insidx, inpidx, twoidx;
+ 499   uint                 non_phi = 1, spill_cnt = 0;
+ 500   Node                *n1, *n2, *n3;
+ 501   Node_List           *defs,*phis;
+ 502   bool                *UPblock;
+ 503   bool                 u1, u2, u3;
+ 504   Block               *b, *pred;
+ 505   PhiNode             *phi;
+ 506   GrowableArray&lt;uint&gt;  lidxs(split_arena, maxlrg, 0, 0);
+ 507 
+ 508   // Array of counters to count splits per live range
+ 509   GrowableArray&lt;uint&gt;  splits(split_arena, maxlrg, 0, 0);
+ 510 
+ 511 #define NEW_SPLIT_ARRAY(type, size)\
+ 512   (type*) split_arena-&gt;allocate_bytes((size) * sizeof(type))
+ 513 
+ 514   //----------Setup Code----------
+ 515   // Create a convenient mapping from lrg numbers to reaches/leaves indices
+ 516   uint *lrg2reach = NEW_SPLIT_ARRAY(uint, maxlrg);
+ 517   // Keep track of DEFS &amp; Phis for later passes
+ 518   defs = new Node_List();
+ 519   phis = new Node_List();
+ 520   // Gather info on which LRG&#39;s are spilling, and build maps
+ 521   for (bidx = 1; bidx &lt; maxlrg; bidx++) {
+ 522     if (lrgs(bidx).alive() &amp;&amp; lrgs(bidx).reg() &gt;= LRG::SPILL_REG) {
+ 523       assert(!lrgs(bidx).mask().is_AllStack(),&quot;AllStack should color&quot;);
+ 524       lrg2reach[bidx] = spill_cnt;
+ 525       spill_cnt++;
+ 526       lidxs.append(bidx);
+ 527 #ifdef ASSERT
+ 528       // Initialize the split counts to zero
+ 529       splits.append(0);
+ 530 #endif
+ 531       if (PrintOpto &amp;&amp; WizardMode &amp;&amp; lrgs(bidx)._was_spilled1) {
+ 532         tty-&gt;print_cr(&quot;Warning, 2nd spill of L%d&quot;,bidx);
+ 533       }
+ 534     }
+ 535   }
+ 536 
+ 537   // Create side arrays for propagating reaching defs info.
+ 538   // Each block needs a node pointer for each spilling live range for the
+ 539   // Def which is live into the block.  Phi nodes handle multiple input
+ 540   // Defs by querying the output of their predecessor blocks and resolving
+ 541   // them to a single Def at the phi.  The pointer is updated for each
+ 542   // Def in the block, and then becomes the output for the block when
+ 543   // processing of the block is complete.  We also need to track whether
+ 544   // a Def is UP or DOWN.  UP means that it should get a register (ie -
+ 545   // it is always in LRP regions), and DOWN means that it is probably
+ 546   // on the stack (ie - it crosses HRP regions).
+ 547   Node ***Reaches     = NEW_SPLIT_ARRAY( Node**, _cfg.number_of_blocks() + 1);
+ 548   bool  **UP          = NEW_SPLIT_ARRAY( bool*, _cfg.number_of_blocks() + 1);
+ 549   Node  **debug_defs  = NEW_SPLIT_ARRAY( Node*, spill_cnt );
+ 550   VectorSet **UP_entry= NEW_SPLIT_ARRAY( VectorSet*, spill_cnt );
+ 551 
+ 552   // Initialize Reaches &amp; UP
+ 553   for (bidx = 0; bidx &lt; _cfg.number_of_blocks() + 1; bidx++) {
+ 554     Reaches[bidx]     = NEW_SPLIT_ARRAY( Node*, spill_cnt );
+ 555     UP[bidx]          = NEW_SPLIT_ARRAY( bool, spill_cnt );
+ 556     Node **Reachblock = Reaches[bidx];
+ 557     bool *UPblock     = UP[bidx];
+ 558     for( slidx = 0; slidx &lt; spill_cnt; slidx++ ) {
+ 559       UPblock[slidx] = true;     // Assume they start in registers
+ 560       Reachblock[slidx] = NULL;  // Assume that no def is present
+ 561     }
+ 562   }
+ 563 
+ 564 #undef NEW_SPLIT_ARRAY
+ 565 
+ 566   // Initialize to array of empty vectorsets
+ 567   for( slidx = 0; slidx &lt; spill_cnt; slidx++ )
+ 568     UP_entry[slidx] = new VectorSet(split_arena);
+ 569 
+ 570   //----------PASS 1----------
+ 571   //----------Propagation &amp; Node Insertion Code----------
+ 572   // Walk the Blocks in RPO for DEF &amp; USE info
+ 573   for( bidx = 0; bidx &lt; _cfg.number_of_blocks(); bidx++ ) {
+ 574 
+ 575     if (C-&gt;check_node_count(spill_cnt, out_of_nodes)) {
+ 576       return 0;
+ 577     }
+ 578 
+ 579     b  = _cfg.get_block(bidx);
+ 580     // Reaches &amp; UP arrays for this block
+ 581     Node** Reachblock = Reaches[b-&gt;_pre_order];
+ 582     UPblock    = UP[b-&gt;_pre_order];
+ 583     // Reset counter of start of non-Phi nodes in block
+ 584     non_phi = 1;
+ 585     //----------Block Entry Handling----------
+ 586     // Check for need to insert a new phi
+ 587     // Cycle through this block&#39;s predecessors, collecting Reaches
+ 588     // info for each spilled LRG.  If they are identical, no phi is
+ 589     // needed.  If they differ, check for a phi, and insert if missing,
+ 590     // or update edges if present.  Set current block&#39;s Reaches set to
+ 591     // be either the phi&#39;s or the reaching def, as appropriate.
+ 592     // If no Phi is needed, check if the LRG needs to spill on entry
+ 593     // to the block due to HRP.
+ 594     for( slidx = 0; slidx &lt; spill_cnt; slidx++ ) {
+ 595       // Grab the live range number
+ 596       uint lidx = lidxs.at(slidx);
+ 597       // Do not bother splitting or putting in Phis for single-def
+ 598       // rematerialized live ranges.  This happens alot to constants
+ 599       // with long live ranges.
+ 600       if( lrgs(lidx).is_singledef() &amp;&amp;
+ 601           lrgs(lidx)._def-&gt;rematerialize() ) {
+ 602         // reset the Reaches &amp; UP entries
+ 603         Reachblock[slidx] = lrgs(lidx)._def;
+ 604         UPblock[slidx] = true;
+ 605         // Record following instruction in case &#39;n&#39; rematerializes and
+ 606         // kills flags
+ 607         Block *pred1 = _cfg.get_block_for_node(b-&gt;pred(1));
+ 608         continue;
+ 609       }
+ 610 
+ 611       // Initialize needs_phi and needs_split
+ 612       bool needs_phi = false;
+ 613       bool needs_split = false;
+ 614       bool has_phi = false;
+ 615       // Walk the predecessor blocks to check inputs for that live range
+ 616       // Grab predecessor block header
+ 617       n1 = b-&gt;pred(1);
+ 618       // Grab the appropriate reaching def info for inpidx
+ 619       pred = _cfg.get_block_for_node(n1);
+ 620       pidx = pred-&gt;_pre_order;
+ 621       Node **Ltmp = Reaches[pidx];
+ 622       bool  *Utmp = UP[pidx];
+ 623       n1 = Ltmp[slidx];
+ 624       u1 = Utmp[slidx];
+ 625       // Initialize node for saving type info
+ 626       n3 = n1;
+ 627       u3 = u1;
+ 628 
+ 629       // Compare inputs to see if a Phi is needed
+ 630       for( inpidx = 2; inpidx &lt; b-&gt;num_preds(); inpidx++ ) {
+ 631         // Grab predecessor block headers
+ 632         n2 = b-&gt;pred(inpidx);
+ 633         // Grab the appropriate reaching def info for inpidx
+ 634         pred = _cfg.get_block_for_node(n2);
+ 635         pidx = pred-&gt;_pre_order;
+ 636         Ltmp = Reaches[pidx];
+ 637         Utmp = UP[pidx];
+ 638         n2 = Ltmp[slidx];
+ 639         u2 = Utmp[slidx];
+ 640         // For each LRG, decide if a phi is necessary
+ 641         if( n1 != n2 ) {
+ 642           needs_phi = true;
+ 643         }
+ 644         // See if the phi has mismatched inputs, UP vs. DOWN
+ 645         if( n1 &amp;&amp; n2 &amp;&amp; (u1 != u2) ) {
+ 646           needs_split = true;
+ 647         }
+ 648         // Move n2/u2 to n1/u1 for next iteration
+ 649         n1 = n2;
+ 650         u1 = u2;
+ 651         // Preserve a non-NULL predecessor for later type referencing
+ 652         if( (n3 == NULL) &amp;&amp; (n2 != NULL) ){
+ 653           n3 = n2;
+ 654           u3 = u2;
+ 655         }
+ 656       }  // End for all potential Phi inputs
+ 657 
+ 658       // check block for appropriate phinode &amp; update edges
+ 659       for( insidx = 1; insidx &lt;= b-&gt;end_idx(); insidx++ ) {
+ 660         n1 = b-&gt;get_node(insidx);
+ 661         // bail if this is not a phi
+ 662         phi = n1-&gt;is_Phi() ? n1-&gt;as_Phi() : NULL;
+ 663         if( phi == NULL ) {
+ 664           // Keep track of index of first non-PhiNode instruction in block
+ 665           non_phi = insidx;
+ 666           // break out of the for loop as we have handled all phi nodes
+ 667           break;
+ 668         }
+ 669         // must be looking at a phi
+ 670         if (_lrg_map.find_id(n1) == lidxs.at(slidx)) {
+ 671           // found the necessary phi
+ 672           needs_phi = false;
+ 673           has_phi = true;
+ 674           // initialize the Reaches entry for this LRG
+ 675           Reachblock[slidx] = phi;
+ 676           break;
+ 677         }  // end if found correct phi
+ 678       }  // end for all phi&#39;s
+ 679 
+ 680       // If a phi is needed or exist, check for it
+ 681       if( needs_phi || has_phi ) {
+ 682         // add new phinode if one not already found
+ 683         if( needs_phi ) {
+ 684           // create a new phi node and insert it into the block
+ 685           // type is taken from left over pointer to a predecessor
+ 686           guarantee(n3, &quot;No non-NULL reaching DEF for a Phi&quot;);
+ 687           phi = new PhiNode(b-&gt;head(), n3-&gt;bottom_type());
+ 688           // initialize the Reaches entry for this LRG
+ 689           Reachblock[slidx] = phi;
+ 690 
+ 691           // add node to block &amp; node_to_block mapping
+ 692           insert_proj(b, insidx++, phi, maxlrg++);
+ 693           non_phi++;
+ 694           // Reset new phi&#39;s mapping to be the spilling live range
+ 695           _lrg_map.map(phi-&gt;_idx, lidx);
+ 696           assert(_lrg_map.find_id(phi) == lidx, &quot;Bad update on Union-Find mapping&quot;);
+ 697         }  // end if not found correct phi
+ 698         // Here you have either found or created the Phi, so record it
+ 699         assert(phi != NULL,&quot;Must have a Phi Node here&quot;);
+ 700         phis-&gt;push(phi);
+ 701         // PhiNodes should either force the LRG UP or DOWN depending
+ 702         // on its inputs and the register pressure in the Phi&#39;s block.
+ 703         UPblock[slidx] = true;  // Assume new DEF is UP
+ 704         // If entering a high-pressure area with no immediate use,
+ 705         // assume Phi is DOWN
+ 706         if( is_high_pressure( b, &amp;lrgs(lidx), b-&gt;end_idx()) &amp;&amp; !prompt_use(b,lidx) )
+ 707           UPblock[slidx] = false;
+ 708         // If we are not split up/down and all inputs are down, then we
+ 709         // are down
+ 710         if( !needs_split &amp;&amp; !u3 )
+ 711           UPblock[slidx] = false;
+ 712       }  // end if phi is needed
+ 713 
+ 714       // Do not need a phi, so grab the reaching DEF
+ 715       else {
+ 716         // Grab predecessor block header
+ 717         n1 = b-&gt;pred(1);
+ 718         // Grab the appropriate reaching def info for k
+ 719         pred = _cfg.get_block_for_node(n1);
+ 720         pidx = pred-&gt;_pre_order;
+ 721         Node **Ltmp = Reaches[pidx];
+ 722         bool  *Utmp = UP[pidx];
+ 723         // reset the Reaches &amp; UP entries
+ 724         Reachblock[slidx] = Ltmp[slidx];
+ 725         UPblock[slidx] = Utmp[slidx];
+ 726       }  // end else no Phi is needed
+ 727     }  // end for all spilling live ranges
+ 728     // DEBUG
+ 729 #ifndef PRODUCT
+ 730     if(trace_spilling()) {
+ 731       tty-&gt;print(&quot;/`\nBlock %d: &quot;, b-&gt;_pre_order);
+ 732       tty-&gt;print(&quot;Reaching Definitions after Phi handling\n&quot;);
+ 733       for( uint x = 0; x &lt; spill_cnt; x++ ) {
+ 734         tty-&gt;print(&quot;Spill Idx %d: UP %d: Node\n&quot;,x,UPblock[x]);
+ 735         if( Reachblock[x] )
+ 736           Reachblock[x]-&gt;dump();
+ 737         else
+ 738           tty-&gt;print(&quot;Undefined\n&quot;);
+ 739       }
+ 740     }
+ 741 #endif
+ 742 
+ 743     //----------Non-Phi Node Splitting----------
+ 744     // Since phi-nodes have now been handled, the Reachblock array for this
+ 745     // block is initialized with the correct starting value for the defs which
+ 746     // reach non-phi instructions in this block.  Thus, process non-phi
+ 747     // instructions normally, inserting SpillCopy nodes for all spill
+ 748     // locations.
+ 749 
+ 750     // Memoize any DOWN reaching definitions for use as DEBUG info
+ 751     for( insidx = 0; insidx &lt; spill_cnt; insidx++ ) {
+ 752       debug_defs[insidx] = (UPblock[insidx]) ? NULL : Reachblock[insidx];
+ 753       if( UPblock[insidx] )     // Memoize UP decision at block start
+ 754         UP_entry[insidx]-&gt;set( b-&gt;_pre_order );
+ 755     }
+ 756 
+ 757     //----------Walk Instructions in the Block and Split----------
+ 758     // For all non-phi instructions in the block
+ 759     for( insidx = 1; insidx &lt;= b-&gt;end_idx(); insidx++ ) {
+ 760       Node *n = b-&gt;get_node(insidx);
+ 761       // Find the defining Node&#39;s live range index
+ 762       uint defidx = _lrg_map.find_id(n);
+ 763       uint cnt = n-&gt;req();
+ 764 
+ 765       if (n-&gt;is_Phi()) {
+ 766         // Skip phi nodes after removing dead copies.
+ 767         if (defidx &lt; _lrg_map.max_lrg_id()) {
+ 768           // Check for useless Phis.  These appear if we spill, then
+ 769           // coalesce away copies.  Dont touch Phis in spilling live
+ 770           // ranges; they are busy getting modifed in this pass.
+ 771           if( lrgs(defidx).reg() &lt; LRG::SPILL_REG ) {
+ 772             uint i;
+ 773             Node *u = NULL;
+ 774             // Look for the Phi merging 2 unique inputs
+ 775             for( i = 1; i &lt; cnt; i++ ) {
+ 776               // Ignore repeats and self
+ 777               if( n-&gt;in(i) != u &amp;&amp; n-&gt;in(i) != n ) {
+ 778                 // Found a unique input
+ 779                 if( u != NULL ) // If it&#39;s the 2nd, bail out
+ 780                   break;
+ 781                 u = n-&gt;in(i);   // Else record it
+ 782               }
+ 783             }
+ 784             assert( u, &quot;at least 1 valid input expected&quot; );
+ 785             if (i &gt;= cnt) {    // Found one unique input
+ 786               assert(_lrg_map.find_id(n) == _lrg_map.find_id(u), &quot;should be the same lrg&quot;);
+ 787               n-&gt;replace_by(u); // Then replace with unique input
+ 788               n-&gt;disconnect_inputs(NULL, C);
+ 789               b-&gt;remove_node(insidx);
+ 790               insidx--;
+ 791               b-&gt;_ihrp_index--;
+ 792               b-&gt;_fhrp_index--;
+ 793             }
+ 794           }
+ 795         }
+ 796         continue;
+ 797       }
+ 798       assert( insidx &gt; b-&gt;_ihrp_index ||
+ 799               (b-&gt;_reg_pressure &lt; (uint)INTPRESSURE) ||
+ 800               b-&gt;_ihrp_index &gt; 4000000 ||
+ 801               b-&gt;_ihrp_index &gt;= b-&gt;end_idx() ||
+ 802               !b-&gt;get_node(b-&gt;_ihrp_index)-&gt;is_Proj(), &quot;&quot; );
+ 803       assert( insidx &gt; b-&gt;_fhrp_index ||
+ 804               (b-&gt;_freg_pressure &lt; (uint)FLOATPRESSURE) ||
+ 805               b-&gt;_fhrp_index &gt; 4000000 ||
+ 806               b-&gt;_fhrp_index &gt;= b-&gt;end_idx() ||
+ 807               !b-&gt;get_node(b-&gt;_fhrp_index)-&gt;is_Proj(), &quot;&quot; );
+ 808 
+ 809       // ********** Handle Crossing HRP Boundry **********
+ 810       if( (insidx == b-&gt;_ihrp_index) || (insidx == b-&gt;_fhrp_index) ) {
+ 811         for( slidx = 0; slidx &lt; spill_cnt; slidx++ ) {
+ 812           // Check for need to split at HRP boundary - split if UP
+ 813           n1 = Reachblock[slidx];
+ 814           // bail out if no reaching DEF
+ 815           if( n1 == NULL ) continue;
+ 816           // bail out if live range is &#39;isolated&#39; around inner loop
+ 817           uint lidx = lidxs.at(slidx);
+ 818           // If live range is currently UP
+ 819           if( UPblock[slidx] ) {
+ 820             // set location to insert spills at
+ 821             // SPLIT DOWN HERE - NO CISC SPILL
+ 822             if( is_high_pressure( b, &amp;lrgs(lidx), insidx ) &amp;&amp;
+ 823                 !n1-&gt;rematerialize() ) {
+ 824               // If there is already a valid stack definition available, use it
+ 825               if( debug_defs[slidx] != NULL ) {
+ 826                 Reachblock[slidx] = debug_defs[slidx];
+ 827               }
+ 828               else {
+ 829                 // Insert point is just past last use or def in the block
+ 830                 int insert_point = insidx-1;
+ 831                 while( insert_point &gt; 0 ) {
+ 832                   Node *n = b-&gt;get_node(insert_point);
+ 833                   // Hit top of block?  Quit going backwards
+ 834                   if (n-&gt;is_Phi()) {
+ 835                     break;
+ 836                   }
+ 837                   // Found a def?  Better split after it.
+ 838                   if (_lrg_map.live_range_id(n) == lidx) {
+ 839                     break;
+ 840                   }
+ 841                   // Look for a use
+ 842                   uint i;
+ 843                   for( i = 1; i &lt; n-&gt;req(); i++ ) {
+ 844                     if (_lrg_map.live_range_id(n-&gt;in(i)) == lidx) {
+ 845                       break;
+ 846                     }
+ 847                   }
+ 848                   // Found a use?  Better split after it.
+ 849                   if (i &lt; n-&gt;req()) {
+ 850                     break;
+ 851                   }
+ 852                   insert_point--;
+ 853                 }
+ 854                 uint orig_eidx = b-&gt;end_idx();
+ 855                 maxlrg = split_DEF( n1, b, insert_point, maxlrg, Reachblock, debug_defs, splits, slidx);
+ 856                 // If it wasn&#39;t split bail
+ 857                 if (!maxlrg) {
+ 858                   return 0;
+ 859                 }
+ 860                 // Spill of NULL check mem op goes into the following block.
+ 861                 if (b-&gt;end_idx() &gt; orig_eidx) {
+ 862                   insidx++;
+ 863                 }
+ 864               }
+ 865               // This is a new DEF, so update UP
+ 866               UPblock[slidx] = false;
+ 867 #ifndef PRODUCT
+ 868               // DEBUG
+ 869               if( trace_spilling() ) {
+ 870                 tty-&gt;print(&quot;\nNew Split DOWN DEF of Spill Idx &quot;);
+ 871                 tty-&gt;print(&quot;%d, UP %d:\n&quot;,slidx,false);
+ 872                 n1-&gt;dump();
+ 873               }
+ 874 #endif
+ 875             }
+ 876           }  // end if LRG is UP
+ 877         }  // end for all spilling live ranges
+ 878         assert( b-&gt;get_node(insidx) == n, &quot;got insidx set incorrectly&quot; );
+ 879       }  // end if crossing HRP Boundry
+ 880 
+ 881       // If the LRG index is oob, then this is a new spillcopy, skip it.
+ 882       if (defidx &gt;= _lrg_map.max_lrg_id()) {
+ 883         continue;
+ 884       }
+ 885       LRG &amp;deflrg = lrgs(defidx);
+ 886       uint copyidx = n-&gt;is_Copy();
+ 887       // Remove coalesced copy from CFG
+ 888       if (copyidx &amp;&amp; defidx == _lrg_map.live_range_id(n-&gt;in(copyidx))) {
+ 889         n-&gt;replace_by( n-&gt;in(copyidx) );
+ 890         n-&gt;set_req( copyidx, NULL );
+ 891         b-&gt;remove_node(insidx--);
+ 892         b-&gt;_ihrp_index--; // Adjust the point where we go hi-pressure
+ 893         b-&gt;_fhrp_index--;
+ 894         continue;
+ 895       }
+ 896 
+ 897 #define DERIVED 0
+ 898 
+ 899       // ********** Handle USES **********
+ 900       bool nullcheck = false;
+ 901       // Implicit null checks never use the spilled value
+ 902       if( n-&gt;is_MachNullCheck() )
+ 903         nullcheck = true;
+ 904       if( !nullcheck ) {
+ 905         // Search all inputs for a Spill-USE
+ 906         JVMState* jvms = n-&gt;jvms();
+ 907         uint oopoff = jvms ? jvms-&gt;oopoff() : cnt;
+ 908         uint old_last = cnt - 1;
+ 909         for( inpidx = 1; inpidx &lt; cnt; inpidx++ ) {
+ 910           // Derived/base pairs may be added to our inputs during this loop.
+ 911           // If inpidx &gt; old_last, then one of these new inputs is being
+ 912           // handled. Skip the derived part of the pair, but process
+ 913           // the base like any other input.
+ 914           if (inpidx &gt; old_last &amp;&amp; ((inpidx - oopoff) &amp; 1) == DERIVED) {
+ 915             continue;  // skip derived_debug added below
+ 916           }
+ 917           // Get lidx of input
+ 918           uint useidx = _lrg_map.find_id(n-&gt;in(inpidx));
+ 919           // Not a brand-new split, and it is a spill use
+ 920           if (useidx &lt; _lrg_map.max_lrg_id() &amp;&amp; lrgs(useidx).reg() &gt;= LRG::SPILL_REG) {
+ 921             // Check for valid reaching DEF
+ 922             slidx = lrg2reach[useidx];
+ 923             Node *def = Reachblock[slidx];
+ 924             assert( def != NULL, &quot;Using Undefined Value in Split()\n&quot;);
+ 925 
+ 926             // (+++) %%%% remove this in favor of pre-pass in matcher.cpp
+ 927             // monitor references do not care where they live, so just hook
+ 928             if ( jvms &amp;&amp; jvms-&gt;is_monitor_use(inpidx) ) {
+ 929               // The effect of this clone is to drop the node out of the block,
+ 930               // so that the allocator does not see it anymore, and therefore
+ 931               // does not attempt to assign it a register.
+ 932               def = clone_node(def, b, C);
+ 933               if (def == NULL || C-&gt;check_node_count(NodeLimitFudgeFactor, out_of_nodes)) {
+ 934                 return 0;
+ 935               }
+ 936               _lrg_map.extend(def-&gt;_idx, 0);
+ 937               _cfg.map_node_to_block(def, b);
+ 938               n-&gt;set_req(inpidx, def);
+ 939               continue;
+ 940             }
+ 941 
+ 942             // Rematerializable?  Then clone def at use site instead
+ 943             // of store/load
+ 944             if( def-&gt;rematerialize() ) {
+ 945               int old_size = b-&gt;number_of_nodes();
+ 946               def = split_Rematerialize( def, b, insidx, maxlrg, splits, slidx, lrg2reach, Reachblock, true );
+ 947               if( !def ) return 0; // Bail out
+ 948               insidx += b-&gt;number_of_nodes()-old_size;
+ 949             }
+ 950 
+ 951             MachNode *mach = n-&gt;is_Mach() ? n-&gt;as_Mach() : NULL;
+ 952             // Base pointers and oopmap references do not care where they live.
+ 953             if ((inpidx &gt;= oopoff) ||
+ 954                 (mach &amp;&amp; mach-&gt;ideal_Opcode() == Op_AddP &amp;&amp; inpidx == AddPNode::Base)) {
+ 955               if (def-&gt;rematerialize() &amp;&amp; lrgs(useidx)._was_spilled2) {
+ 956                 // This def has been rematerialized a couple of times without
+ 957                 // progress. It doesn&#39;t care if it lives UP or DOWN, so
+ 958                 // spill it down now.
+ 959                 maxlrg = split_USE(MachSpillCopyNode::BasePointerToMem, def,b,n,inpidx,maxlrg,false,false,splits,slidx);
+ 960                 // If it wasn&#39;t split bail
+ 961                 if (!maxlrg) {
+ 962                   return 0;
+ 963                 }
+ 964                 insidx++;  // Reset iterator to skip USE side split
+ 965               } else {
+ 966                 // Just hook the def edge
+ 967                 n-&gt;set_req(inpidx, def);
+ 968               }
+ 969 
+ 970               if (inpidx &gt;= oopoff) {
+ 971                 // After oopoff, we have derived/base pairs.  We must mention all
+ 972                 // derived pointers here as derived/base pairs for GC.  If the
+ 973                 // derived value is spilling and we have a copy both in Reachblock
+ 974                 // (called here &#39;def&#39;) and debug_defs[slidx] we need to mention
+ 975                 // both in derived/base pairs or kill one.
+ 976                 Node *derived_debug = debug_defs[slidx];
+ 977                 if( ((inpidx - oopoff) &amp; 1) == DERIVED &amp;&amp; // derived vs base?
+ 978                     mach &amp;&amp; mach-&gt;ideal_Opcode() != Op_Halt &amp;&amp;
+ 979                     derived_debug != NULL &amp;&amp;
+ 980                     derived_debug != def ) { // Actual 2nd value appears
+ 981                   // We have already set &#39;def&#39; as a derived value.
+ 982                   // Also set debug_defs[slidx] as a derived value.
+ 983                   uint k;
+ 984                   for( k = oopoff; k &lt; cnt; k += 2 )
+ 985                     if( n-&gt;in(k) == derived_debug )
+ 986                       break;      // Found an instance of debug derived
+ 987                   if( k == cnt ) {// No instance of debug_defs[slidx]
+ 988                     // Add a derived/base pair to cover the debug info.
+ 989                     // We have to process the added base later since it is not
+ 990                     // handled yet at this point but skip derived part.
+ 991                     assert(((n-&gt;req() - oopoff) &amp; 1) == DERIVED,
+ 992                            &quot;must match skip condition above&quot;);
+ 993                     n-&gt;add_req( derived_debug );   // this will be skipped above
+ 994                     n-&gt;add_req( n-&gt;in(inpidx+1) ); // this will be processed
+ 995                     // Increment cnt to handle added input edges on
+ 996                     // subsequent iterations.
+ 997                     cnt += 2;
+ 998                   }
+ 999                 }
+1000               }
+1001               continue;
+1002             }
+1003             // Special logic for DEBUG info
+1004             if( jvms &amp;&amp; b-&gt;_freq &gt; BLOCK_FREQUENCY(0.5) ) {
+1005               uint debug_start = jvms-&gt;debug_start();
+1006               // If this is debug info use &amp; there is a reaching DOWN def
+1007               if ((debug_start &lt;= inpidx) &amp;&amp; (debug_defs[slidx] != NULL)) {
+1008                 assert(inpidx &lt; oopoff, &quot;handle only debug info here&quot;);
+1009                 // Just hook it in &amp; move on
+1010                 n-&gt;set_req(inpidx, debug_defs[slidx]);
+1011                 // (Note that this can make two sides of a split live at the
+1012                 // same time: The debug def on stack, and another def in a
+1013                 // register.  The GC needs to know about both of them, but any
+1014                 // derived pointers after oopoff will refer to only one of the
+1015                 // two defs and the GC would therefore miss the other.  Thus
+1016                 // this hack is only allowed for debug info which is Java state
+1017                 // and therefore never a derived pointer.)
+1018                 continue;
+1019               }
+1020             }
+1021             // Grab register mask info
+1022             const RegMask &amp;dmask = def-&gt;out_RegMask();
+1023             const RegMask &amp;umask = n-&gt;in_RegMask(inpidx);
+1024             bool is_vect = RegMask::is_vector(def-&gt;ideal_reg());
+1025             assert(inpidx &lt; oopoff, &quot;cannot use-split oop map info&quot;);
+1026 
+1027             bool dup = UPblock[slidx];
+1028             bool uup = umask.is_UP();
+1029 
+1030             // Need special logic to handle bound USES. Insert a split at this
+1031             // bound use if we can&#39;t rematerialize the def, or if we need the
+1032             // split to form a misaligned pair.
+1033             if( !umask.is_AllStack() &amp;&amp;
+1034                 (int)umask.Size() &lt;= lrgs(useidx).num_regs() &amp;&amp;
+1035                 (!def-&gt;rematerialize() ||
+1036                  (!is_vect &amp;&amp; umask.is_misaligned_pair()))) {
+1037               // These need a Split regardless of overlap or pressure
+1038               // SPLIT - NO DEF - NO CISC SPILL
+1039               maxlrg = split_USE(MachSpillCopyNode::Bound, def,b,n,inpidx,maxlrg,dup,false, splits,slidx);
+1040               // If it wasn&#39;t split bail
+1041               if (!maxlrg) {
+1042                 return 0;
+1043               }
+1044               insidx++;  // Reset iterator to skip USE side split
+1045               continue;
+1046             }
+1047 
+1048             if (UseFPUForSpilling &amp;&amp; n-&gt;is_MachCall() &amp;&amp; !uup &amp;&amp; !dup ) {
+1049               // The use at the call can force the def down so insert
+1050               // a split before the use to allow the def more freedom.
+1051               maxlrg = split_USE(MachSpillCopyNode::CallUse, def,b,n,inpidx,maxlrg,dup,false, splits,slidx);
+1052               // If it wasn&#39;t split bail
+1053               if (!maxlrg) {
+1054                 return 0;
+1055               }
+1056               insidx++;  // Reset iterator to skip USE side split
+1057               continue;
+1058             }
+1059 
+1060             // Here is the logic chart which describes USE Splitting:
+1061             // 0 = false or DOWN, 1 = true or UP
+1062             //
+1063             // Overlap | DEF | USE | Action
+1064             //-------------------------------------------------------
+1065             //    0    |  0  |  0  | Copy - mem -&gt; mem
+1066             //    0    |  0  |  1  | Split-UP - Check HRP
+1067             //    0    |  1  |  0  | Split-DOWN - Debug Info?
+1068             //    0    |  1  |  1  | Copy - reg -&gt; reg
+1069             //    1    |  0  |  0  | Reset Input Edge (no Split)
+1070             //    1    |  0  |  1  | Split-UP - Check HRP
+1071             //    1    |  1  |  0  | Split-DOWN - Debug Info?
+1072             //    1    |  1  |  1  | Reset Input Edge (no Split)
+1073             //
+1074             // So, if (dup == uup), then overlap test determines action,
+1075             // with true being no split, and false being copy. Else,
+1076             // if DEF is DOWN, Split-UP, and check HRP to decide on
+1077             // resetting DEF. Finally if DEF is UP, Split-DOWN, with
+1078             // special handling for Debug Info.
+1079             if( dup == uup ) {
+1080               if( dmask.overlap(umask) ) {
+1081                 // Both are either up or down, and there is overlap, No Split
+1082                 n-&gt;set_req(inpidx, def);
+1083               }
+1084               else {  // Both are either up or down, and there is no overlap
+1085                 if( dup ) {  // If UP, reg-&gt;reg copy
+1086                   // COPY ACROSS HERE - NO DEF - NO CISC SPILL
+1087                   maxlrg = split_USE(MachSpillCopyNode::RegToReg, def,b,n,inpidx,maxlrg,false,false, splits,slidx);
+1088                   // If it wasn&#39;t split bail
+1089                   if (!maxlrg) {
+1090                     return 0;
+1091                   }
+1092                   insidx++;  // Reset iterator to skip USE side split
+1093                 }
+1094                 else {       // DOWN, mem-&gt;mem copy
+1095                   // COPY UP &amp; DOWN HERE - NO DEF - NO CISC SPILL
+1096                   // First Split-UP to move value into Register
+1097                   uint def_ideal = def-&gt;ideal_reg();
+1098                   const RegMask* tmp_rm = Matcher::idealreg2regmask[def_ideal];
+1099                   Node *spill = new MachSpillCopyNode(MachSpillCopyNode::MemToReg, def, dmask, *tmp_rm);
+1100                   insert_proj( b, insidx, spill, maxlrg );
+1101                   // Then Split-DOWN as if previous Split was DEF
+1102                   maxlrg = split_USE(MachSpillCopyNode::RegToMem, spill,b,n,inpidx,maxlrg,false,false, splits,slidx);
+1103                   // If it wasn&#39;t split bail
+1104                   if (!maxlrg) {
+1105                     return 0;
+1106                   }
+1107                   insidx += 2;  // Reset iterator to skip USE side splits
+1108                 }
+1109               }  // End else no overlap
+1110             }  // End if dup == uup
+1111             // dup != uup, so check dup for direction of Split
+1112             else {
+1113               if( dup ) {  // If UP, Split-DOWN and check Debug Info
+1114                 // If this node is already a SpillCopy, just patch the edge
+1115                 // except the case of spilling to stack.
+1116                 if( n-&gt;is_SpillCopy() ) {
+1117                   RegMask tmp_rm(umask);
+1118                   tmp_rm.SUBTRACT(Matcher::STACK_ONLY_mask);
+1119                   if( dmask.overlap(tmp_rm) ) {
+1120                     if( def != n-&gt;in(inpidx) ) {
+1121                       n-&gt;set_req(inpidx, def);
+1122                     }
+1123                     continue;
+1124                   }
+1125                 }
+1126                 // COPY DOWN HERE - NO DEF - NO CISC SPILL
+1127                 maxlrg = split_USE(MachSpillCopyNode::RegToMem, def,b,n,inpidx,maxlrg,false,false, splits,slidx);
+1128                 // If it wasn&#39;t split bail
+1129                 if (!maxlrg) {
+1130                   return 0;
+1131                 }
+1132                 insidx++;  // Reset iterator to skip USE side split
+1133                 // Check for debug-info split.  Capture it for later
+1134                 // debug splits of the same value
+1135                 if (jvms &amp;&amp; jvms-&gt;debug_start() &lt;= inpidx &amp;&amp; inpidx &lt; oopoff)
+1136                   debug_defs[slidx] = n-&gt;in(inpidx);
+1137 
+1138               }
+1139               else {       // DOWN, Split-UP and check register pressure
+1140                 if( is_high_pressure( b, &amp;lrgs(useidx), insidx ) ) {
+1141                   // COPY UP HERE - NO DEF - CISC SPILL
+1142                   maxlrg = split_USE(MachSpillCopyNode::MemToReg, def,b,n,inpidx,maxlrg,true,true, splits,slidx);
+1143                   // If it wasn&#39;t split bail
+1144                   if (!maxlrg) {
+1145                     return 0;
+1146                   }
+1147                   insidx++;  // Reset iterator to skip USE side split
+1148                 } else {                          // LRP
+1149                   // COPY UP HERE - WITH DEF - NO CISC SPILL
+1150                   maxlrg = split_USE(MachSpillCopyNode::MemToReg, def,b,n,inpidx,maxlrg,true,false, splits,slidx);
+1151                   // If it wasn&#39;t split bail
+1152                   if (!maxlrg) {
+1153                     return 0;
+1154                   }
+1155                   // Flag this lift-up in a low-pressure block as
+1156                   // already-spilled, so if it spills again it will
+1157                   // spill hard (instead of not spilling hard and
+1158                   // coalescing away).
+1159                   set_was_spilled(n-&gt;in(inpidx));
+1160                   // Since this is a new DEF, update Reachblock &amp; UP
+1161                   Reachblock[slidx] = n-&gt;in(inpidx);
+1162                   UPblock[slidx] = true;
+1163                   insidx++;  // Reset iterator to skip USE side split
+1164                 }
+1165               }  // End else DOWN
+1166             }  // End dup != uup
+1167           }  // End if Spill USE
+1168         }  // End For All Inputs
+1169       }  // End If not nullcheck
+1170 
+1171       // ********** Handle DEFS **********
+1172       // DEFS either Split DOWN in HRP regions or when the LRG is bound, or
+1173       // just reset the Reaches info in LRP regions.  DEFS must always update
+1174       // UP info.
+1175       if( deflrg.reg() &gt;= LRG::SPILL_REG ) {    // Spilled?
+1176         uint slidx = lrg2reach[defidx];
+1177         // Add to defs list for later assignment of new live range number
+1178         defs-&gt;push(n);
+1179         // Set a flag on the Node indicating it has already spilled.
+1180         // Only do it for capacity spills not conflict spills.
+1181         if( !deflrg._direct_conflict )
+1182           set_was_spilled(n);
+1183         assert(!n-&gt;is_Phi(),&quot;Cannot insert Phi into DEFS list&quot;);
+1184         // Grab UP info for DEF
+1185         const RegMask &amp;dmask = n-&gt;out_RegMask();
+1186         bool defup = dmask.is_UP();
+1187         uint ireg = n-&gt;ideal_reg();
+1188         bool is_vect = RegMask::is_vector(ireg);
+1189         // Only split at Def if this is a HRP block or bound (and spilled once)
+1190         if( !n-&gt;rematerialize() &amp;&amp;
+1191             (((dmask.is_bound(ireg) || (!is_vect &amp;&amp; dmask.is_misaligned_pair())) &amp;&amp;
+1192               (deflrg._direct_conflict || deflrg._must_spill)) ||
+1193              // Check for LRG being up in a register and we are inside a high
+1194              // pressure area.  Spill it down immediately.
+1195              (defup &amp;&amp; is_high_pressure(b,&amp;deflrg,insidx) &amp;&amp; !n-&gt;is_SpillCopy())) ) {
+1196           assert( !n-&gt;rematerialize(), &quot;&quot; );
+1197           // Do a split at the def site.
+1198           maxlrg = split_DEF( n, b, insidx, maxlrg, Reachblock, debug_defs, splits, slidx );
+1199           // If it wasn&#39;t split bail
+1200           if (!maxlrg) {
+1201             return 0;
+1202           }
+1203           // Split DEF&#39;s Down
+1204           UPblock[slidx] = 0;
+1205 #ifndef PRODUCT
+1206           // DEBUG
+1207           if( trace_spilling() ) {
+1208             tty-&gt;print(&quot;\nNew Split DOWN DEF of Spill Idx &quot;);
+1209             tty-&gt;print(&quot;%d, UP %d:\n&quot;,slidx,false);
+1210             n-&gt;dump();
+1211           }
+1212 #endif
+1213         }
+1214         else {                  // Neither bound nor HRP, must be LRP
+1215           // otherwise, just record the def
+1216           Reachblock[slidx] = n;
+1217           // UP should come from the outRegmask() of the DEF
+1218           UPblock[slidx] = defup;
+1219           // Update debug list of reaching down definitions, kill if DEF is UP
+1220           debug_defs[slidx] = defup ? NULL : n;
+1221 #ifndef PRODUCT
+1222           // DEBUG
+1223           if( trace_spilling() ) {
+1224             tty-&gt;print(&quot;\nNew DEF of Spill Idx &quot;);
+1225             tty-&gt;print(&quot;%d, UP %d:\n&quot;,slidx,defup);
+1226             n-&gt;dump();
+1227           }
+1228 #endif
+1229         }  // End else LRP
+1230       }  // End if spill def
+1231 
+1232       // ********** Split Left Over Mem-Mem Moves **********
+1233       // Check for mem-mem copies and split them now.  Do not do this
+1234       // to copies about to be spilled; they will be Split shortly.
+1235       if (copyidx) {
+1236         Node *use = n-&gt;in(copyidx);
+1237         uint useidx = _lrg_map.find_id(use);
+1238         if (useidx &lt; _lrg_map.max_lrg_id() &amp;&amp;       // This is not a new split
+1239             OptoReg::is_stack(deflrg.reg()) &amp;&amp;
+1240             deflrg.reg() &lt; LRG::SPILL_REG ) { // And DEF is from stack
+1241           LRG &amp;uselrg = lrgs(useidx);
+1242           if( OptoReg::is_stack(uselrg.reg()) &amp;&amp;
+1243               uselrg.reg() &lt; LRG::SPILL_REG &amp;&amp; // USE is from stack
+1244               deflrg.reg() != uselrg.reg() ) { // Not trivially removed
+1245             uint def_ideal_reg = n-&gt;bottom_type()-&gt;ideal_reg();
+1246             const RegMask &amp;def_rm = *Matcher::idealreg2regmask[def_ideal_reg];
+1247             const RegMask &amp;use_rm = n-&gt;in_RegMask(copyidx);
+1248             if( def_rm.overlap(use_rm) &amp;&amp; n-&gt;is_SpillCopy() ) {  // Bug 4707800, &#39;n&#39; may be a storeSSL
+1249               if (C-&gt;check_node_count(NodeLimitFudgeFactor, out_of_nodes)) {  // Check when generating nodes
+1250                 return 0;
+1251               }
+1252               Node *spill = new MachSpillCopyNode(MachSpillCopyNode::MemToReg, use,use_rm,def_rm);
+1253               n-&gt;set_req(copyidx,spill);
+1254               n-&gt;as_MachSpillCopy()-&gt;set_in_RegMask(def_rm);
+1255               // Put the spill just before the copy
+1256               insert_proj( b, insidx++, spill, maxlrg++ );
+1257             }
+1258           }
+1259         }
+1260       }
+1261     }  // End For All Instructions in Block - Non-PHI Pass
+1262 
+1263     // Check if each LRG is live out of this block so as not to propagate
+1264     // beyond the last use of a LRG.
+1265     for( slidx = 0; slidx &lt; spill_cnt; slidx++ ) {
+1266       uint defidx = lidxs.at(slidx);
+1267       IndexSet *liveout = _live-&gt;live(b);
+1268       if( !liveout-&gt;member(defidx) ) {
+1269 #ifdef ASSERT
+1270         // The index defidx is not live.  Check the liveout array to ensure that
+1271         // it contains no members which compress to defidx.  Finding such an
+1272         // instance may be a case to add liveout adjustment in compress_uf_map().
+1273         // See 5063219.
+1274         if (!liveout-&gt;is_empty()) {
+1275           uint member;
+1276           IndexSetIterator isi(liveout);
+1277           while ((member = isi.next()) != 0) {
+1278             assert(defidx != _lrg_map.find_const(member), &quot;Live out member has not been compressed&quot;);
+1279           }
+1280         }
+1281 #endif
+1282         Reachblock[slidx] = NULL;
+1283       } else {
+1284         assert(Reachblock[slidx] != NULL,&quot;No reaching definition for liveout value&quot;);
+1285       }
+1286     }
+1287 #ifndef PRODUCT
+1288     if( trace_spilling() )
+1289       b-&gt;dump();
+1290 #endif
+1291   }  // End For All Blocks
+1292 
+1293   //----------PASS 2----------
+1294   // Reset all DEF live range numbers here
+1295   for( insidx = 0; insidx &lt; defs-&gt;size(); insidx++ ) {
+1296     // Grab the def
+1297     n1 = defs-&gt;at(insidx);
+1298     // Set new lidx for DEF
+1299     new_lrg(n1, maxlrg++);
+1300   }
+1301   //----------Phi Node Splitting----------
+1302   // Clean up a phi here, and assign a new live range number
+1303   // Cycle through this block&#39;s predecessors, collecting Reaches
+1304   // info for each spilled LRG and update edges.
+1305   // Walk the phis list to patch inputs, split phis, and name phis
+1306   uint lrgs_before_phi_split = maxlrg;
+1307   for( insidx = 0; insidx &lt; phis-&gt;size(); insidx++ ) {
+1308     Node *phi = phis-&gt;at(insidx);
+1309     assert(phi-&gt;is_Phi(),&quot;This list must only contain Phi Nodes&quot;);
+1310     Block *b = _cfg.get_block_for_node(phi);
+1311     // Grab the live range number
+1312     uint lidx = _lrg_map.find_id(phi);
+1313     uint slidx = lrg2reach[lidx];
+1314     // Update node to lidx map
+1315     new_lrg(phi, maxlrg++);
+1316     // Get PASS1&#39;s up/down decision for the block.
+1317     int phi_up = !!UP_entry[slidx]-&gt;test(b-&gt;_pre_order);
+1318 
+1319     // Force down if double-spilling live range
+1320     if( lrgs(lidx)._was_spilled1 )
+1321       phi_up = false;
+1322 
+1323     // When splitting a Phi we an split it normal or &quot;inverted&quot;.
+1324     // An inverted split makes the splits target the Phi&#39;s UP/DOWN
+1325     // sense inverted; then the Phi is followed by a final def-side
+1326     // split to invert back.  It changes which blocks the spill code
+1327     // goes in.
+1328 
+1329     // Walk the predecessor blocks and assign the reaching def to the Phi.
+1330     // Split Phi nodes by placing USE side splits wherever the reaching
+1331     // DEF has the wrong UP/DOWN value.
+1332     for( uint i = 1; i &lt; b-&gt;num_preds(); i++ ) {
+1333       // Get predecessor block pre-order number
+1334       Block *pred = _cfg.get_block_for_node(b-&gt;pred(i));
+1335       pidx = pred-&gt;_pre_order;
+1336       // Grab reaching def
+1337       Node *def = Reaches[pidx][slidx];
+1338       Node** Reachblock = Reaches[pidx];
+1339       assert( def, &quot;must have reaching def&quot; );
+1340       // If input up/down sense and reg-pressure DISagree
+1341       if (def-&gt;rematerialize()) {
+1342         // Place the rematerialized node above any MSCs created during
+1343         // phi node splitting.  end_idx points at the insertion point
+1344         // so look at the node before it.
+1345         int insert = pred-&gt;end_idx();
+1346         while (insert &gt;= 1 &amp;&amp;
+1347                pred-&gt;get_node(insert - 1)-&gt;is_SpillCopy() &amp;&amp;
+1348                _lrg_map.find(pred-&gt;get_node(insert - 1)) &gt;= lrgs_before_phi_split) {
+1349           insert--;
+1350         }
+1351         def = split_Rematerialize(def, pred, insert, maxlrg, splits, slidx, lrg2reach, Reachblock, false);
+1352         if (!def) {
+1353           return 0;    // Bail out
+1354         }
+1355       }
+1356       // Update the Phi&#39;s input edge array
+1357       phi-&gt;set_req(i,def);
+1358       // Grab the UP/DOWN sense for the input
+1359       u1 = UP[pidx][slidx];
+1360       if( u1 != (phi_up != 0)) {
+1361         maxlrg = split_USE(MachSpillCopyNode::PhiLocationDifferToInputLocation, def, b, phi, i, maxlrg, !u1, false, splits,slidx);
+1362         // If it wasn&#39;t split bail
+1363         if (!maxlrg) {
+1364           return 0;
+1365         }
+1366       }
+1367     }  // End for all inputs to the Phi
+1368   }  // End for all Phi Nodes
+1369   // Update _maxlrg to save Union asserts
+1370   _lrg_map.set_max_lrg_id(maxlrg);
+1371 
+1372 
+1373   //----------PASS 3----------
+1374   // Pass over all Phi&#39;s to union the live ranges
+1375   for( insidx = 0; insidx &lt; phis-&gt;size(); insidx++ ) {
+1376     Node *phi = phis-&gt;at(insidx);
+1377     assert(phi-&gt;is_Phi(),&quot;This list must only contain Phi Nodes&quot;);
+1378     // Walk all inputs to Phi and Union input live range with Phi live range
+1379     for( uint i = 1; i &lt; phi-&gt;req(); i++ ) {
+1380       // Grab the input node
+1381       Node *n = phi-&gt;in(i);
+1382       assert(n, &quot;node should exist&quot;);
+1383       uint lidx = _lrg_map.find(n);
+1384       uint pidx = _lrg_map.find(phi);
+1385       if (lidx &lt; pidx) {
+1386         Union(n, phi);
+1387       }
+1388       else if(lidx &gt; pidx) {
+1389         Union(phi, n);
+1390       }
+1391     }  // End for all inputs to the Phi Node
+1392   }  // End for all Phi Nodes
+1393   // Now union all two address instructions
+1394   for (insidx = 0; insidx &lt; defs-&gt;size(); insidx++) {
+1395     // Grab the def
+1396     n1 = defs-&gt;at(insidx);
+1397     // Set new lidx for DEF &amp; handle 2-addr instructions
+1398     if (n1-&gt;is_Mach() &amp;&amp; ((twoidx = n1-&gt;as_Mach()-&gt;two_adr()) != 0)) {
+1399       assert(_lrg_map.find(n1-&gt;in(twoidx)) &lt; maxlrg,&quot;Assigning bad live range index&quot;);
+1400       // Union the input and output live ranges
+1401       uint lr1 = _lrg_map.find(n1);
+1402       uint lr2 = _lrg_map.find(n1-&gt;in(twoidx));
+1403       if (lr1 &lt; lr2) {
+1404         Union(n1, n1-&gt;in(twoidx));
+1405       }
+1406       else if (lr1 &gt; lr2) {
+1407         Union(n1-&gt;in(twoidx), n1);
+1408       }
+1409     }  // End if two address
+1410   }  // End for all defs
+1411   // DEBUG
+1412 #ifdef ASSERT
+1413   // Validate all live range index assignments
+1414   for (bidx = 0; bidx &lt; _cfg.number_of_blocks(); bidx++) {
+1415     b  = _cfg.get_block(bidx);
+1416     for (insidx = 0; insidx &lt;= b-&gt;end_idx(); insidx++) {
+1417       Node *n = b-&gt;get_node(insidx);
+1418       uint defidx = _lrg_map.find(n);
+1419       assert(defidx &lt; _lrg_map.max_lrg_id(), &quot;Bad live range index in Split&quot;);
+1420       assert(defidx &lt; maxlrg,&quot;Bad live range index in Split&quot;);
+1421     }
+1422   }
+1423   // Issue a warning if splitting made no progress
+1424   int noprogress = 0;
+1425   for (slidx = 0; slidx &lt; spill_cnt; slidx++) {
+1426     if (PrintOpto &amp;&amp; WizardMode &amp;&amp; splits.at(slidx) == 0) {
+1427       tty-&gt;print_cr(&quot;Failed to split live range %d&quot;, lidxs.at(slidx));
+1428       //BREAKPOINT;
+1429     }
+1430     else {
+1431       noprogress++;
+1432     }
+1433   }
+1434   if(!noprogress) {
+1435     tty-&gt;print_cr(&quot;Failed to make progress in Split&quot;);
+1436     //BREAKPOINT;
+1437   }
+1438 #endif
+1439   // Return updated count of live ranges
+1440   return maxlrg;
+1441 }
+    </pre>
+  </body>
+</html>
