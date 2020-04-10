@@ -1,0 +1,550 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>New src/java.net.http/share/classes/jdk/internal/net/http/ConnectionPool.java</title>
+    <link rel="stylesheet" href="../../../../../../../../style.css" />
+  </head>
+  <body>
+    <pre>
+  1 /*
+  2  * Copyright (c) 2015, 2020, Oracle and/or its affiliates. All rights reserved.
+  3  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  4  *
+  5  * This code is free software; you can redistribute it and/or modify it
+  6  * under the terms of the GNU General Public License version 2 only, as
+  7  * published by the Free Software Foundation.  Oracle designates this
+  8  * particular file as subject to the &quot;Classpath&quot; exception as provided
+  9  * by Oracle in the LICENSE file that accompanied this code.
+ 10  *
+ 11  * This code is distributed in the hope that it will be useful, but WITHOUT
+ 12  * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ 13  * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ 14  * version 2 for more details (a copy is included in the LICENSE file that
+ 15  * accompanied this code).
+ 16  *
+ 17  * You should have received a copy of the GNU General Public License version
+ 18  * 2 along with this work; if not, write to the Free Software Foundation,
+ 19  * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ 20  *
+ 21  * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ 22  * or visit www.oracle.com if you need additional information or have any
+ 23  * questions.
+ 24  */
+ 25 
+ 26 package jdk.internal.net.http;
+ 27 
+ 28 import java.io.IOException;
+ 29 import java.lang.System.Logger.Level;
+ 30 import java.net.InetSocketAddress;
+ 31 import java.nio.ByteBuffer;
+ 32 import java.time.Instant;
+ 33 import java.time.temporal.ChronoUnit;
+ 34 import java.util.ArrayList;
+ 35 import java.util.Collections;
+ 36 import java.util.HashMap;
+ 37 import java.util.Iterator;
+ 38 import java.util.LinkedList;
+ 39 import java.util.List;
+ 40 import java.util.ListIterator;
+ 41 import java.util.Objects;
+ 42 import java.util.Optional;
+ 43 import java.util.concurrent.Flow;
+ 44 import java.util.stream.Collectors;
+ 45 import jdk.internal.net.http.common.FlowTube;
+ 46 import jdk.internal.net.http.common.Logger;
+ 47 import jdk.internal.net.http.common.Utils;
+ 48 
+ 49 /**
+ 50  * Http 1.1 connection pool.
+ 51  */
+ 52 final class ConnectionPool {
+ 53 
+ 54     static final long KEEP_ALIVE = Utils.getIntegerNetProperty(
+ 55             &quot;jdk.httpclient.keepalive.timeout&quot;, 1200); // seconds
+ 56     static final long MAX_POOL_SIZE = Utils.getIntegerNetProperty(
+ 57             &quot;jdk.httpclient.connectionPoolSize&quot;, 0); // unbounded
+ 58     final Logger debug = Utils.getDebugLogger(this::dbgString, Utils.DEBUG);
+ 59 
+ 60     // Pools of idle connections
+ 61 
+ 62     private final HashMap&lt;CacheKey,LinkedList&lt;HttpConnection&gt;&gt; plainPool;
+ 63     private final HashMap&lt;CacheKey,LinkedList&lt;HttpConnection&gt;&gt; sslPool;
+ 64     private final ExpiryList expiryList;
+ 65     private final String dbgTag; // used for debug
+ 66     boolean stopped;
+ 67 
+ 68     /**
+ 69      * Entries in connection pool are keyed by destination address and/or
+ 70      * proxy address:
+ 71      * case 1: plain TCP not via proxy (destination only)
+ 72      * case 2: plain TCP via proxy (proxy only)
+ 73      * case 3: SSL not via proxy (destination only)
+ 74      * case 4: SSL over tunnel (destination and proxy)
+ 75      */
+ 76     static class CacheKey {
+ 77         final InetSocketAddress proxy;
+ 78         final InetSocketAddress destination;
+ 79 
+ 80         CacheKey(InetSocketAddress destination, InetSocketAddress proxy) {
+ 81             this.proxy = proxy;
+ 82             this.destination = destination;
+ 83         }
+ 84 
+ 85         @Override
+ 86         public boolean equals(Object obj) {
+ 87             if (obj == null) {
+ 88                 return false;
+ 89             }
+ 90             if (getClass() != obj.getClass()) {
+ 91                 return false;
+ 92             }
+ 93             final CacheKey other = (CacheKey) obj;
+ 94             if (!Objects.equals(this.proxy, other.proxy)) {
+ 95                 return false;
+ 96             }
+ 97             if (!Objects.equals(this.destination, other.destination)) {
+ 98                 return false;
+ 99             }
+100             return true;
+101         }
+102 
+103         @Override
+104         public int hashCode() {
+105             return Objects.hash(proxy, destination);
+106         }
+107     }
+108 
+109     ConnectionPool(long clientId) {
+110         this(&quot;ConnectionPool(&quot;+clientId+&quot;)&quot;);
+111     }
+112 
+113     /**
+114      * There should be one of these per HttpClient.
+115      */
+116     private ConnectionPool(String tag) {
+117         dbgTag = tag;
+118         plainPool = new HashMap&lt;&gt;();
+119         sslPool = new HashMap&lt;&gt;();
+120         expiryList = new ExpiryList();
+121     }
+122 
+123     final String dbgString() {
+124         return dbgTag;
+125     }
+126 
+127     synchronized void start() {
+128         assert !stopped : &quot;Already stopped&quot;;
+129     }
+130 
+131     static CacheKey cacheKey(InetSocketAddress destination,
+132                              InetSocketAddress proxy)
+133     {
+134         return new CacheKey(destination, proxy);
+135     }
+136 
+137     synchronized HttpConnection getConnection(boolean secure,
+138                                               InetSocketAddress addr,
+139                                               InetSocketAddress proxy) {
+140         if (stopped) return null;
+141         // for plain (unsecure) proxy connection the destination address is irrelevant.
+142         addr = secure || proxy == null ? addr : null;
+143         CacheKey key = new CacheKey(addr, proxy);
+144         HttpConnection c = secure ? findConnection(key, sslPool)
+145                                   : findConnection(key, plainPool);
+146         //System.out.println (&quot;getConnection returning: &quot; + c);
+147         assert c == null || c.isSecure() == secure;
+148         return c;
+149     }
+150 
+151     /**
+152      * Returns the connection to the pool.
+153      */
+154     void returnToPool(HttpConnection conn) {
+155         returnToPool(conn, Instant.now(), KEEP_ALIVE);
+156     }
+157 
+158     // Called also by whitebox tests
+159     void returnToPool(HttpConnection conn, Instant now, long keepAlive) {
+160 
+161         assert (conn instanceof PlainHttpConnection) || conn.isSecure()
+162             : &quot;Attempting to return unsecure connection to SSL pool: &quot;
+163                 + conn.getClass();
+164 
+165         // Don&#39;t call registerCleanupTrigger while holding a lock,
+166         // but register it before the connection is added to the pool,
+167         // since we don&#39;t want to trigger the cleanup if the connection
+168         // is not in the pool.
+169         CleanupTrigger cleanup = registerCleanupTrigger(conn);
+170 
+171         // it&#39;s possible that cleanup may have been called.
+172         HttpConnection toClose = null;
+173         synchronized(this) {
+174             if (cleanup.isDone()) {
+175                 return;
+176             } else if (stopped) {
+177                 conn.close();
+178                 return;
+179             }
+180             if (MAX_POOL_SIZE &gt; 0 &amp;&amp; expiryList.size() &gt;= MAX_POOL_SIZE) {
+181                 toClose = expiryList.removeOldest();
+182                 if (toClose != null) removeFromPool(toClose);
+183             }
+184             if (conn instanceof PlainHttpConnection) {
+185                 putConnection(conn, plainPool);
+186             } else {
+187                 assert conn.isSecure();
+188                 putConnection(conn, sslPool);
+189             }
+190             expiryList.add(conn, now, keepAlive);
+191         }
+192         if (toClose != null) {
+193             if (debug.on()) {
+194                 debug.log(&quot;Maximum pool size reached: removing oldest connection %s&quot;,
+195                           toClose.dbgString());
+196             }
+197             close(toClose);
+198         }
+199         //System.out.println(&quot;Return to pool: &quot; + conn);
+200     }
+201 
+202     private CleanupTrigger registerCleanupTrigger(HttpConnection conn) {
+203         // Connect the connection flow to a pub/sub pair that will take the
+204         // connection out of the pool and close it if anything happens
+205         // while the connection is sitting in the pool.
+206         CleanupTrigger cleanup = new CleanupTrigger(conn);
+207         FlowTube flow = conn.getConnectionFlow();
+208         if (debug.on()) debug.log(&quot;registering %s&quot;, cleanup);
+209         flow.connectFlows(cleanup, cleanup);
+210         return cleanup;
+211     }
+212 
+213     private HttpConnection
+214     findConnection(CacheKey key,
+215                    HashMap&lt;CacheKey,LinkedList&lt;HttpConnection&gt;&gt; pool) {
+216         LinkedList&lt;HttpConnection&gt; l = pool.get(key);
+217         if (l == null || l.isEmpty()) {
+218             return null;
+219         } else {
+220             HttpConnection c = l.removeFirst();
+221             expiryList.remove(c);
+222             return c;
+223         }
+224     }
+225 
+226     /* called from cache cleaner only  */
+227     private boolean
+228     removeFromPool(HttpConnection c,
+229                    HashMap&lt;CacheKey,LinkedList&lt;HttpConnection&gt;&gt; pool) {
+230         //System.out.println(&quot;cacheCleaner removing: &quot; + c);
+231         assert Thread.holdsLock(this);
+232         CacheKey k = c.cacheKey();
+233         List&lt;HttpConnection&gt; l = pool.get(k);
+234         if (l == null || l.isEmpty()) {
+235             pool.remove(k);
+236             return false;
+237         }
+238         return l.remove(c);
+239     }
+240 
+241     private void
+242     putConnection(HttpConnection c,
+243                   HashMap&lt;CacheKey,LinkedList&lt;HttpConnection&gt;&gt; pool) {
+244         CacheKey key = c.cacheKey();
+245         LinkedList&lt;HttpConnection&gt; l = pool.get(key);
+246         if (l == null) {
+247             l = new LinkedList&lt;&gt;();
+248             pool.put(key, l);
+249         }
+250         l.add(c);
+251     }
+252 
+253     /**
+254      * Purge expired connection and return the number of milliseconds
+255      * in which the next connection is scheduled to expire.
+256      * If no connections are scheduled to be purged return 0.
+257      * @return the delay in milliseconds in which the next connection will
+258      *         expire.
+259      */
+260     long purgeExpiredConnectionsAndReturnNextDeadline() {
+261         if (!expiryList.purgeMaybeRequired()) return 0;
+262         return purgeExpiredConnectionsAndReturnNextDeadline(Instant.now());
+263     }
+264 
+265     // Used for whitebox testing
+266     long purgeExpiredConnectionsAndReturnNextDeadline(Instant now) {
+267         long nextPurge = 0;
+268 
+269         // We may be in the process of adding new elements
+270         // to the expiry list - but those elements will not
+271         // have outlast their keep alive timer yet since we&#39;re
+272         // just adding them.
+273         if (!expiryList.purgeMaybeRequired()) return nextPurge;
+274 
+275         List&lt;HttpConnection&gt; closelist;
+276         synchronized (this) {
+277             closelist = expiryList.purgeUntil(now);
+278             for (HttpConnection c : closelist) {
+279                 if (c instanceof PlainHttpConnection) {
+280                     boolean wasPresent = removeFromPool(c, plainPool);
+281                     assert wasPresent;
+282                 } else {
+283                     boolean wasPresent = removeFromPool(c, sslPool);
+284                     assert wasPresent;
+285                 }
+286             }
+287             nextPurge = now.until(
+288                     expiryList.nextExpiryDeadline().orElse(now),
+289                     ChronoUnit.MILLIS);
+290         }
+291         closelist.forEach(this::close);
+292         return nextPurge;
+293     }
+294 
+295     private void close(HttpConnection c) {
+296         try {
+297             c.close();
+298         } catch (Throwable e) {} // ignore
+299     }
+300 
+301     void stop() {
+302         List&lt;HttpConnection&gt; closelist = Collections.emptyList();
+303         try {
+304             synchronized (this) {
+305                 stopped = true;
+306                 closelist = expiryList.stream()
+307                     .map(e -&gt; e.connection)
+308                     .collect(Collectors.toList());
+309                 expiryList.clear();
+310                 plainPool.clear();
+311                 sslPool.clear();
+312             }
+313         } finally {
+314             closelist.forEach(this::close);
+315         }
+316     }
+317 
+318     static final class ExpiryEntry {
+319         final HttpConnection connection;
+320         final Instant expiry; // absolute time in seconds of expiry time
+321         ExpiryEntry(HttpConnection connection, Instant expiry) {
+322             this.connection = connection;
+323             this.expiry = expiry;
+324         }
+325     }
+326 
+327     /**
+328      * Manages a LinkedList of sorted ExpiryEntry. The entry with the closer
+329      * deadline is at the tail of the list, and the entry with the farther
+330      * deadline is at the head. In the most common situation, new elements
+331      * will need to be added at the head (or close to it), and expired elements
+332      * will need to be purged from the tail.
+333      */
+334     private static final class ExpiryList {
+335         private final LinkedList&lt;ExpiryEntry&gt; list = new LinkedList&lt;&gt;();
+336         private volatile boolean mayContainEntries;
+337 
+338         int size() { return list.size(); }
+339 
+340         // A loosely accurate boolean whose value is computed
+341         // at the end of each operation performed on ExpiryList;
+342         // Does not require synchronizing on the ConnectionPool.
+343         boolean purgeMaybeRequired() {
+344             return mayContainEntries;
+345         }
+346 
+347         // Returns the next expiry deadline
+348         // should only be called while holding a synchronization
+349         // lock on the ConnectionPool
+350         Optional&lt;Instant&gt; nextExpiryDeadline() {
+351             if (list.isEmpty()) return Optional.empty();
+352             else return Optional.of(list.getLast().expiry);
+353         }
+354 
+355         // should only be called while holding a synchronization
+356         // lock on the ConnectionPool
+357         HttpConnection removeOldest() {
+358             ExpiryEntry entry = list.pollLast();
+359             return entry == null ? null : entry.connection;
+360         }
+361 
+362         // should only be called while holding a synchronization
+363         // lock on the ConnectionPool
+364         void add(HttpConnection conn) {
+365             add(conn, Instant.now(), KEEP_ALIVE);
+366         }
+367 
+368         // Used by whitebox test.
+369         void add(HttpConnection conn, Instant now, long keepAlive) {
+370             Instant then = now.truncatedTo(ChronoUnit.SECONDS)
+371                     .plus(keepAlive, ChronoUnit.SECONDS);
+372 
+373             // Elements with the farther deadline are at the head of
+374             // the list. It&#39;s more likely that the new element will
+375             // have the farthest deadline, and will need to be inserted
+376             // at the head of the list, so we&#39;re using an ascending
+377             // list iterator to find the right insertion point.
+378             ListIterator&lt;ExpiryEntry&gt; li = list.listIterator();
+379             while (li.hasNext()) {
+380                 ExpiryEntry entry = li.next();
+381 
+382                 if (then.isAfter(entry.expiry)) {
+383                     li.previous();
+384                     // insert here
+385                     li.add(new ExpiryEntry(conn, then));
+386                     mayContainEntries = true;
+387                     return;
+388                 }
+389             }
+390             // last (or first) element of list (the last element is
+391             // the first when the list is empty)
+392             list.add(new ExpiryEntry(conn, then));
+393             mayContainEntries = true;
+394         }
+395 
+396         // should only be called while holding a synchronization
+397         // lock on the ConnectionPool
+398         void remove(HttpConnection c) {
+399             if (c == null || list.isEmpty()) return;
+400             ListIterator&lt;ExpiryEntry&gt; li = list.listIterator();
+401             while (li.hasNext()) {
+402                 ExpiryEntry e = li.next();
+403                 if (e.connection.equals(c)) {
+404                     li.remove();
+405                     mayContainEntries = !list.isEmpty();
+406                     return;
+407                 }
+408             }
+409         }
+410 
+411         // should only be called while holding a synchronization
+412         // lock on the ConnectionPool.
+413         // Purge all elements whose deadline is before now (now included).
+414         List&lt;HttpConnection&gt; purgeUntil(Instant now) {
+415             if (list.isEmpty()) return Collections.emptyList();
+416 
+417             List&lt;HttpConnection&gt; closelist = new ArrayList&lt;&gt;();
+418 
+419             // elements with the closest deadlines are at the tail
+420             // of the queue, so we&#39;re going to use a descending iterator
+421             // to remove them, and stop when we find the first element
+422             // that has not expired yet.
+423             Iterator&lt;ExpiryEntry&gt; li = list.descendingIterator();
+424             while (li.hasNext()) {
+425                 ExpiryEntry entry = li.next();
+426                 // use !isAfter instead of isBefore in order to
+427                 // remove the entry if its expiry == now
+428                 if (!entry.expiry.isAfter(now)) {
+429                     li.remove();
+430                     HttpConnection c = entry.connection;
+431                     closelist.add(c);
+432                 } else break; // the list is sorted
+433             }
+434             mayContainEntries = !list.isEmpty();
+435             return closelist;
+436         }
+437 
+438         // should only be called while holding a synchronization
+439         // lock on the ConnectionPool
+440         java.util.stream.Stream&lt;ExpiryEntry&gt; stream() {
+441             return list.stream();
+442         }
+443 
+444         // should only be called while holding a synchronization
+445         // lock on the ConnectionPool
+446         void clear() {
+447             list.clear();
+448             mayContainEntries = false;
+449         }
+450     }
+451 
+452     // Remove a connection from the pool.
+453     // should only be called while holding a synchronization
+454     // lock on the ConnectionPool
+455     private void removeFromPool(HttpConnection c) {
+456         assert Thread.holdsLock(this);
+457         if (c instanceof PlainHttpConnection) {
+458             removeFromPool(c, plainPool);
+459         } else {
+460             assert c.isSecure() : &quot;connection &quot; + c + &quot; is not secure!&quot;;
+461             removeFromPool(c, sslPool);
+462         }
+463     }
+464 
+465     // Used by tests
+466     synchronized boolean contains(HttpConnection c) {
+467         final CacheKey key = c.cacheKey();
+468         List&lt;HttpConnection&gt; list;
+469         if ((list = plainPool.get(key)) != null) {
+470             if (list.contains(c)) return true;
+471         }
+472         if ((list = sslPool.get(key)) != null) {
+473             if (list.contains(c)) return true;
+474         }
+475         return false;
+476     }
+477 
+478     void cleanup(HttpConnection c, Throwable error) {
+479         if (debug.on())
+480             debug.log(&quot;%s : ConnectionPool.cleanup(%s)&quot;,
+481                     String.valueOf(c.getConnectionFlow()), error);
+482         synchronized(this) {
+483             removeFromPool(c);
+484             expiryList.remove(c);
+485         }
+486         c.close();
+487     }
+488 
+489     /**
+490      * An object that subscribes to the flow while the connection is in
+491      * the pool. Anything that comes in will cause the connection to be closed
+492      * and removed from the pool.
+493      */
+494     private final class CleanupTrigger implements
+495             FlowTube.TubeSubscriber, FlowTube.TubePublisher,
+496             Flow.Subscription {
+497 
+498         private final HttpConnection connection;
+499         private volatile boolean done;
+500 
+501         public CleanupTrigger(HttpConnection connection) {
+502             this.connection = connection;
+503         }
+504 
+505         public boolean isDone() { return done;}
+506 
+507         private void triggerCleanup(Throwable error) {
+508             done = true;
+509             cleanup(connection, error);
+510         }
+511 
+512         @Override public void request(long n) {}
+513         @Override public void cancel() {}
+514 
+515         @Override
+516         public void onSubscribe(Flow.Subscription subscription) {
+517             subscription.request(1);
+518         }
+519         @Override
+520         public void onError(Throwable error) { triggerCleanup(error); }
+521         @Override
+522         public void onComplete() { triggerCleanup(null); }
+523         @Override
+524         public void onNext(List&lt;ByteBuffer&gt; item) {
+525             triggerCleanup(new IOException(&quot;Data received while in pool&quot;));
+526         }
+527 
+528         @Override
+529         public void subscribe(Flow.Subscriber&lt;? super List&lt;ByteBuffer&gt;&gt; subscriber) {
+530             subscriber.onSubscribe(this);
+531         }
+532 
+533         @Override
+534         public String toString() {
+535             return &quot;CleanupTrigger(&quot; + connection.getConnectionFlow() + &quot;)&quot;;
+536         }
+537     }
+538 }
+    </pre>
+  </body>
+</html>
