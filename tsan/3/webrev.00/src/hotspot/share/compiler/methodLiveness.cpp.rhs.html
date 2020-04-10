@@ -1,0 +1,984 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Frames src/hotspot/share/compiler/methodLiveness.cpp</title>
+    <link rel="stylesheet" href="../../../../style.css" />
+    <script type="text/javascript" src="../../../../navigation.js"></script>
+  </head>
+<body onkeypress="keypress(event);">
+<a name="0"></a>
+<hr />
+<pre>  1 /*
+  2  * Copyright (c) 1998, 2019, Oracle and/or its affiliates. All rights reserved.
+  3  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  4  *
+  5  * This code is free software; you can redistribute it and/or modify it
+  6  * under the terms of the GNU General Public License version 2 only, as
+  7  * published by the Free Software Foundation.
+  8  *
+  9  * This code is distributed in the hope that it will be useful, but WITHOUT
+ 10  * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ 11  * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ 12  * version 2 for more details (a copy is included in the LICENSE file that
+ 13  * accompanied this code).
+ 14  *
+ 15  * You should have received a copy of the GNU General Public License version
+ 16  * 2 along with this work; if not, write to the Free Software Foundation,
+ 17  * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ 18  *
+ 19  * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ 20  * or visit www.oracle.com if you need additional information or have any
+ 21  * questions.
+ 22  *
+ 23  */
+ 24 
+ 25 #include &quot;precompiled.hpp&quot;
+ 26 #include &quot;ci/ciMethod.hpp&quot;
+ 27 #include &quot;ci/ciMethodBlocks.hpp&quot;
+ 28 #include &quot;ci/ciStreams.hpp&quot;
+ 29 #include &quot;compiler/methodLiveness.hpp&quot;
+ 30 #include &quot;interpreter/bytecode.hpp&quot;
+ 31 #include &quot;interpreter/bytecodes.hpp&quot;
+ 32 #include &quot;memory/allocation.inline.hpp&quot;
+ 33 #include &quot;memory/resourceArea.hpp&quot;
+ 34 #include &quot;utilities/bitMap.inline.hpp&quot;
+ 35 
+ 36 // The MethodLiveness class performs a simple liveness analysis on a method
+ 37 // in order to decide which locals are live (that is, will be used again) at
+ 38 // a particular bytecode index (bci).
+ 39 //
+ 40 // The algorithm goes:
+ 41 //
+ 42 // 1. Break the method into a set of basic blocks.  For each basic block we
+ 43 //    also keep track of its set of predecessors through normal control flow
+ 44 //    and predecessors through exceptional control flow.
+ 45 //
+ 46 // 2. For each basic block, compute two sets, gen (the set of values used before
+ 47 //    they are defined) and kill (the set of values defined before they are used)
+ 48 //    in the basic block.  A basic block &quot;needs&quot; the locals in its gen set to
+ 49 //    perform its computation.  A basic block &quot;provides&quot; values for the locals in
+ 50 //    its kill set, allowing a need from a successor to be ignored.
+ 51 //
+ 52 // 3. Liveness information (the set of locals which are needed) is pushed backwards through
+ 53 //    the program, from blocks to their predecessors.  We compute and store liveness
+ 54 //    information for the normal/exceptional exit paths for each basic block.  When
+ 55 //    this process reaches a fixed point, we are done.
+ 56 //
+ 57 // 4. When we are asked about the liveness at a particular bci with a basic block, we
+ 58 //    compute gen/kill sets which represent execution from that bci to the exit of
+ 59 //    its blocks.  We then compose this range gen/kill information with the normal
+ 60 //    and exceptional exit information for the block to produce liveness information
+ 61 //    at that bci.
+ 62 //
+ 63 // The algorithm is approximate in many respects.  Notably:
+ 64 //
+ 65 // 1. We do not do the analysis necessary to match jsr&#39;s with the appropriate ret.
+ 66 //    Instead we make the conservative assumption that any ret can return to any
+ 67 //    jsr return site.
+ 68 // 2. Instead of computing the effects of exceptions at every instruction, we
+ 69 //    summarize the effects of all exceptional continuations from the block as
+ 70 //    a single set (_exception_exit), losing some information but simplifying the
+ 71 //    analysis.
+ 72 
+ 73 MethodLiveness::MethodLiveness(Arena* arena, ciMethod* method)
+ 74 #ifdef COMPILER1
+ 75   : _bci_block_start(arena, method-&gt;code_size())
+ 76 #endif
+ 77 {
+ 78   _arena = arena;
+ 79   _method = method;
+ 80   _bit_map_size_bits = method-&gt;max_locals();
+ 81 }
+ 82 
+ 83 void MethodLiveness::compute_liveness() {
+ 84 #ifndef PRODUCT
+ 85   if (TraceLivenessGen) {
+ 86     tty-&gt;print_cr(&quot;################################################################&quot;);
+ 87     tty-&gt;print(&quot;# Computing liveness information for &quot;);
+ 88     method()-&gt;print_short_name();
+ 89   }
+ 90 #endif
+ 91 
+ 92   init_basic_blocks();
+ 93   init_gen_kill();
+ 94   propagate_liveness();
+ 95 }
+ 96 
+ 97 
+ 98 void MethodLiveness::init_basic_blocks() {
+ 99   bool bailout = false;
+100 
+101   int method_len = method()-&gt;code_size();
+102   ciMethodBlocks *mblocks = method()-&gt;get_method_blocks();
+103 
+104   // Create an array to store the bci-&gt;BasicBlock mapping.
+105   _block_map = new (arena()) GrowableArray&lt;BasicBlock*&gt;(arena(), method_len, method_len, NULL);
+106 
+107   _block_count = mblocks-&gt;num_blocks();
+108   _block_list = (BasicBlock **) arena()-&gt;Amalloc(sizeof(BasicBlock *) * _block_count);
+109 
+110   // Used for patching up jsr/ret control flow.
+111   GrowableArray&lt;BasicBlock*&gt;* jsr_exit_list = new GrowableArray&lt;BasicBlock*&gt;(5);
+112   GrowableArray&lt;BasicBlock*&gt;* ret_list = new GrowableArray&lt;BasicBlock*&gt;(5);
+113 
+114   // generate our block list from ciMethodBlocks
+115   for (int blk = 0; blk &lt; _block_count; blk++) {
+116     ciBlock *cib = mblocks-&gt;block(blk);
+117      int start_bci = cib-&gt;start_bci();
+118     _block_list[blk] = new (arena()) BasicBlock(this, start_bci, cib-&gt;limit_bci());
+119     _block_map-&gt;at_put(start_bci, _block_list[blk]);
+120 #ifdef COMPILER1
+121     // mark all bcis where a new basic block starts
+122     _bci_block_start.set_bit(start_bci);
+123 #endif // COMPILER1
+124   }
+125   // fill in the predecessors of blocks
+126   ciBytecodeStream bytes(method());
+127 
+128   for (int blk = 0; blk &lt; _block_count; blk++) {
+129     BasicBlock *current_block = _block_list[blk];
+130     int bci =  mblocks-&gt;block(blk)-&gt;control_bci();
+131 
+132     if (bci == ciBlock::fall_through_bci) {
+133       int limit = current_block-&gt;limit_bci();
+134       if (limit &lt; method_len) {
+135         BasicBlock *next = _block_map-&gt;at(limit);
+136         assert( next != NULL, &quot;must be a block immediately following this one.&quot;);
+137         next-&gt;add_normal_predecessor(current_block);
+138       }
+139       continue;
+140     }
+141     bytes.reset_to_bci(bci);
+142     Bytecodes::Code code = bytes.next();
+143     BasicBlock *dest;
+144 
+145     // Now we need to interpret the instruction&#39;s effect
+146     // on control flow.
+147     assert (current_block != NULL, &quot;we must have a current block&quot;);
+148     switch (code) {
+149       case Bytecodes::_ifeq:
+150       case Bytecodes::_ifne:
+151       case Bytecodes::_iflt:
+152       case Bytecodes::_ifge:
+153       case Bytecodes::_ifgt:
+154       case Bytecodes::_ifle:
+155       case Bytecodes::_if_icmpeq:
+156       case Bytecodes::_if_icmpne:
+157       case Bytecodes::_if_icmplt:
+158       case Bytecodes::_if_icmpge:
+159       case Bytecodes::_if_icmpgt:
+160       case Bytecodes::_if_icmple:
+161       case Bytecodes::_if_acmpeq:
+162       case Bytecodes::_if_acmpne:
+163       case Bytecodes::_ifnull:
+164       case Bytecodes::_ifnonnull:
+165         // Two way branch.  Set predecessors at each destination.
+166         dest = _block_map-&gt;at(bytes.next_bci());
+167         assert(dest != NULL, &quot;must be a block immediately following this one.&quot;);
+168         dest-&gt;add_normal_predecessor(current_block);
+169 
+170         dest = _block_map-&gt;at(bytes.get_dest());
+171         assert(dest != NULL, &quot;branch desination must start a block.&quot;);
+172         dest-&gt;add_normal_predecessor(current_block);
+173         break;
+174       case Bytecodes::_goto:
+175         dest = _block_map-&gt;at(bytes.get_dest());
+176         assert(dest != NULL, &quot;branch desination must start a block.&quot;);
+177         dest-&gt;add_normal_predecessor(current_block);
+178         break;
+179       case Bytecodes::_goto_w:
+180         dest = _block_map-&gt;at(bytes.get_far_dest());
+181         assert(dest != NULL, &quot;branch desination must start a block.&quot;);
+182         dest-&gt;add_normal_predecessor(current_block);
+183         break;
+184       case Bytecodes::_tableswitch:
+185         {
+186           Bytecode_tableswitch tableswitch(&amp;bytes);
+187 
+188           int len = tableswitch.length();
+189 
+190           dest = _block_map-&gt;at(bci + tableswitch.default_offset());
+191           assert(dest != NULL, &quot;branch desination must start a block.&quot;);
+192           dest-&gt;add_normal_predecessor(current_block);
+193           while (--len &gt;= 0) {
+194             dest = _block_map-&gt;at(bci + tableswitch.dest_offset_at(len));
+195             assert(dest != NULL, &quot;branch desination must start a block.&quot;);
+196             dest-&gt;add_normal_predecessor(current_block);
+197           }
+198           break;
+199         }
+200 
+201       case Bytecodes::_lookupswitch:
+202         {
+203           Bytecode_lookupswitch lookupswitch(&amp;bytes);
+204 
+205           int npairs = lookupswitch.number_of_pairs();
+206 
+207           dest = _block_map-&gt;at(bci + lookupswitch.default_offset());
+208           assert(dest != NULL, &quot;branch desination must start a block.&quot;);
+209           dest-&gt;add_normal_predecessor(current_block);
+210           while(--npairs &gt;= 0) {
+211             LookupswitchPair pair = lookupswitch.pair_at(npairs);
+212             dest = _block_map-&gt;at( bci + pair.offset());
+213             assert(dest != NULL, &quot;branch desination must start a block.&quot;);
+214             dest-&gt;add_normal_predecessor(current_block);
+215           }
+216           break;
+217         }
+218 
+219       case Bytecodes::_jsr:
+220         {
+221           assert(bytes.is_wide()==false, &quot;sanity check&quot;);
+222           dest = _block_map-&gt;at(bytes.get_dest());
+223           assert(dest != NULL, &quot;branch desination must start a block.&quot;);
+224           dest-&gt;add_normal_predecessor(current_block);
+225           BasicBlock *jsrExit = _block_map-&gt;at(current_block-&gt;limit_bci());
+226           assert(jsrExit != NULL, &quot;jsr return bci must start a block.&quot;);
+227           jsr_exit_list-&gt;append(jsrExit);
+228           break;
+229         }
+230       case Bytecodes::_jsr_w:
+231         {
+232           dest = _block_map-&gt;at(bytes.get_far_dest());
+233           assert(dest != NULL, &quot;branch desination must start a block.&quot;);
+234           dest-&gt;add_normal_predecessor(current_block);
+235           BasicBlock *jsrExit = _block_map-&gt;at(current_block-&gt;limit_bci());
+236           assert(jsrExit != NULL, &quot;jsr return bci must start a block.&quot;);
+237           jsr_exit_list-&gt;append(jsrExit);
+238           break;
+239         }
+240 
+241       case Bytecodes::_wide:
+242         assert(false, &quot;wide opcodes should not be seen here&quot;);
+243         break;
+244       case Bytecodes::_athrow:
+245       case Bytecodes::_ireturn:
+246       case Bytecodes::_lreturn:
+247       case Bytecodes::_freturn:
+248       case Bytecodes::_dreturn:
+249       case Bytecodes::_areturn:
+250       case Bytecodes::_return:
+251         // These opcodes are  not the normal predecessors of any other opcodes.
+252         break;
+253       case Bytecodes::_ret:
+254         // We will patch up jsr/rets in a subsequent pass.
+255         ret_list-&gt;append(current_block);
+256         break;
+257       case Bytecodes::_breakpoint:
+258         // Bail out of there are breakpoints in here.
+259         bailout = true;
+260         break;
+261       default:
+262         // Do nothing.
+263         break;
+264     }
+265   }
+266   // Patch up the jsr/ret&#39;s.  We conservatively assume that any ret
+267   // can return to any jsr site.
+268   int ret_list_len = ret_list-&gt;length();
+269   int jsr_exit_list_len = jsr_exit_list-&gt;length();
+270   if (ret_list_len &gt; 0 &amp;&amp; jsr_exit_list_len &gt; 0) {
+271     for (int i = jsr_exit_list_len - 1; i &gt;= 0; i--) {
+272       BasicBlock *jsrExit = jsr_exit_list-&gt;at(i);
+273       for (int i = ret_list_len - 1; i &gt;= 0; i--) {
+274         jsrExit-&gt;add_normal_predecessor(ret_list-&gt;at(i));
+275       }
+276     }
+277   }
+278 
+279   // Compute exception edges.
+280   for (int b=_block_count-1; b &gt;= 0; b--) {
+281     BasicBlock *block = _block_list[b];
+282     int block_start = block-&gt;start_bci();
+283     int block_limit = block-&gt;limit_bci();
+284     ciExceptionHandlerStream handlers(method());
+285     for (; !handlers.is_done(); handlers.next()) {
+286       ciExceptionHandler* handler = handlers.handler();
+287       int start       = handler-&gt;start();
+288       int limit       = handler-&gt;limit();
+289       int handler_bci = handler-&gt;handler_bci();
+290 
+291       int intersect_start = MAX2(block_start, start);
+292       int intersect_limit = MIN2(block_limit, limit);
+293       if (intersect_start &lt; intersect_limit) {
+294         // The catch range has a nonempty intersection with this
+295         // basic block.  That means this basic block can be an
+296         // exceptional predecessor.
+297         _block_map-&gt;at(handler_bci)-&gt;add_exception_predecessor(block);
+298 
+299         if (handler-&gt;is_catch_all()) {
+300           // This is a catch-all block.
+301           if (intersect_start == block_start &amp;&amp; intersect_limit == block_limit) {
+302             // The basic block is entirely contained in this catch-all block.
+303             // Skip the rest of the exception handlers -- they can never be
+304             // reached in execution.
+305             break;
+306           }
+307         }
+308       }
+309     }
+310   }
+311 }
+312 
+313 void MethodLiveness::init_gen_kill() {
+314   for (int i=_block_count-1; i &gt;= 0; i--) {
+315     _block_list[i]-&gt;compute_gen_kill(method());
+316   }
+317 }
+318 
+319 void MethodLiveness::propagate_liveness() {
+320   int num_blocks = _block_count;
+321   BasicBlock *block;
+322 
+323   // We start our work list off with all blocks in it.
+324   // Alternately, we could start off the work list with the list of all
+325   // blocks which could exit the method directly, along with one block
+326   // from any infinite loop.  If this matters, it can be changed.  It
+327   // may not be clear from looking at the code, but the order of the
+328   // workList will be the opposite of the creation order of the basic
+329   // blocks, which should be decent for quick convergence (with the
+330   // possible exception of exception handlers, which are all created
+331   // early).
+332   _work_list = NULL;
+333   for (int i = 0; i &lt; num_blocks; i++) {
+334     block = _block_list[i];
+335     block-&gt;set_next(_work_list);
+336     block-&gt;set_on_work_list(true);
+337     _work_list = block;
+338   }
+339 
+340 
+341   while ((block = work_list_get()) != NULL) {
+342     block-&gt;propagate(this);
+343   }
+344 }
+345 
+346 void MethodLiveness::work_list_add(BasicBlock *block) {
+347   if (!block-&gt;on_work_list()) {
+348     block-&gt;set_next(_work_list);
+349     block-&gt;set_on_work_list(true);
+350     _work_list = block;
+351   }
+352 }
+353 
+354 MethodLiveness::BasicBlock *MethodLiveness::work_list_get() {
+355   BasicBlock *block = _work_list;
+356   if (block != NULL) {
+357     block-&gt;set_on_work_list(false);
+358     _work_list = block-&gt;next();
+359   }
+360   return block;
+361 }
+362 
+363 
+364 MethodLivenessResult MethodLiveness::get_liveness_at(int entry_bci) {
+365   int bci = entry_bci;
+366   bool is_entry = false;
+367   if (entry_bci == InvocationEntryBci) {
+368     is_entry = true;
+369     bci = 0;
+370   }
+371 
+372   MethodLivenessResult answer;
+373 
+374   if (_block_count &gt; 0) {
+375 
+376     assert( 0 &lt;= bci &amp;&amp; bci &lt; method()-&gt;code_size(), &quot;bci out of range&quot; );
+377     BasicBlock *block = _block_map-&gt;at(bci);
+378     // We may not be at the block start, so search backwards to find the block
+379     // containing bci.
+380     int t = bci;
+381     while (block == NULL &amp;&amp; t &gt; 0) {
+382      block = _block_map-&gt;at(--t);
+383     }
+384     guarantee(block != NULL, &quot;invalid bytecode index; must be instruction index&quot;);
+385     assert(bci &gt;= block-&gt;start_bci() &amp;&amp; bci &lt; block-&gt;limit_bci(), &quot;block must contain bci.&quot;);
+386 
+387     answer = block-&gt;get_liveness_at(method(), bci);
+388 
+389     if (is_entry &amp;&amp; method()-&gt;is_synchronized() &amp;&amp; !method()-&gt;is_static()) {
+390       // Synchronized methods use the receiver once on entry.
+391       answer.at_put(0, true);
+392     }
+393 
+394 #ifndef PRODUCT
+395     if (TraceLivenessQuery) {
+396       tty-&gt;print(&quot;Liveness query of &quot;);
+397       method()-&gt;print_short_name();
+398       tty-&gt;print(&quot; @ %d : result is &quot;, bci);
+399       answer.print_on(tty);
+400     }
+401 #endif
+402   }
+403 
+404   return answer;
+405 }
+406 
+407 MethodLiveness::BasicBlock::BasicBlock(MethodLiveness *analyzer, int start, int limit) :
+408          _entry(analyzer-&gt;arena(),          analyzer-&gt;bit_map_size_bits()),
+409          _normal_exit(analyzer-&gt;arena(),    analyzer-&gt;bit_map_size_bits()),
+410          _exception_exit(analyzer-&gt;arena(), analyzer-&gt;bit_map_size_bits()),
+411          _gen(analyzer-&gt;arena(),            analyzer-&gt;bit_map_size_bits()),
+412          _kill(analyzer-&gt;arena(),           analyzer-&gt;bit_map_size_bits()),
+413          _last_bci(-1) {
+414   _analyzer = analyzer;
+415   _start_bci = start;
+416   _limit_bci = limit;
+417   _normal_predecessors =
+418     new (analyzer-&gt;arena()) GrowableArray&lt;MethodLiveness::BasicBlock*&gt;(analyzer-&gt;arena(), 5, 0, NULL);
+419   _exception_predecessors =
+420     new (analyzer-&gt;arena()) GrowableArray&lt;MethodLiveness::BasicBlock*&gt;(analyzer-&gt;arena(), 5, 0, NULL);
+421 }
+422 
+423 
+424 
+425 MethodLiveness::BasicBlock *MethodLiveness::BasicBlock::split(int split_bci) {
+426   int start = _start_bci;
+427   int limit = _limit_bci;
+428 
+429   if (TraceLivenessGen) {
+430     tty-&gt;print_cr(&quot; ** Splitting block (%d,%d) at %d&quot;, start, limit, split_bci);
+431   }
+432 
+433   GrowableArray&lt;BasicBlock*&gt;* save_predecessors = _normal_predecessors;
+434 
+435   assert (start &lt; split_bci &amp;&amp; split_bci &lt; limit, &quot;improper split&quot;);
+436 
+437   // Make a new block to cover the first half of the range.
+438   BasicBlock *first_half = new (_analyzer-&gt;arena()) BasicBlock(_analyzer, start, split_bci);
+439 
+440   // Assign correct values to the second half (this)
+441   _normal_predecessors = first_half-&gt;_normal_predecessors;
+442   _start_bci = split_bci;
+443   add_normal_predecessor(first_half);
+444 
+445   // Assign correct predecessors to the new first half
+446   first_half-&gt;_normal_predecessors = save_predecessors;
+447 
+448   return first_half;
+449 }
+450 
+451 void MethodLiveness::BasicBlock::compute_gen_kill(ciMethod* method) {
+452   ciBytecodeStream bytes(method);
+453   bytes.reset_to_bci(start_bci());
+454   bytes.set_max_bci(limit_bci());
+455   compute_gen_kill_range(&amp;bytes);
+456 
+457 }
+458 
+459 void MethodLiveness::BasicBlock::compute_gen_kill_range(ciBytecodeStream *bytes) {
+460   _gen.clear();
+461   _kill.clear();
+462 
+463   while (bytes-&gt;next() != ciBytecodeStream::EOBC()) {
+464     compute_gen_kill_single(bytes);
+465   }
+466 }
+467 
+468 void MethodLiveness::BasicBlock::compute_gen_kill_single(ciBytecodeStream *instruction) {
+469   int localNum;
+470 
+471   // We prohibit _gen and _kill from having locals in common.  If we
+472   // know that one is definitely going to be applied before the other,
+473   // we could save some computation time by relaxing this prohibition.
+474 
+475   switch (instruction-&gt;cur_bc()) {
+476     case Bytecodes::_nop:
+477     case Bytecodes::_goto:
+478     case Bytecodes::_goto_w:
+479     case Bytecodes::_aconst_null:
+480     case Bytecodes::_new:
+481     case Bytecodes::_iconst_m1:
+482     case Bytecodes::_iconst_0:
+483     case Bytecodes::_iconst_1:
+484     case Bytecodes::_iconst_2:
+485     case Bytecodes::_iconst_3:
+486     case Bytecodes::_iconst_4:
+487     case Bytecodes::_iconst_5:
+488     case Bytecodes::_fconst_0:
+489     case Bytecodes::_fconst_1:
+490     case Bytecodes::_fconst_2:
+491     case Bytecodes::_bipush:
+492     case Bytecodes::_sipush:
+493     case Bytecodes::_lconst_0:
+494     case Bytecodes::_lconst_1:
+495     case Bytecodes::_dconst_0:
+496     case Bytecodes::_dconst_1:
+497     case Bytecodes::_ldc2_w:
+498     case Bytecodes::_ldc:
+499     case Bytecodes::_ldc_w:
+500     case Bytecodes::_iaload:
+501     case Bytecodes::_faload:
+502     case Bytecodes::_baload:
+503     case Bytecodes::_caload:
+504     case Bytecodes::_saload:
+505     case Bytecodes::_laload:
+506     case Bytecodes::_daload:
+507     case Bytecodes::_aaload:
+508     case Bytecodes::_iastore:
+509     case Bytecodes::_fastore:
+510     case Bytecodes::_bastore:
+511     case Bytecodes::_castore:
+512     case Bytecodes::_sastore:
+513     case Bytecodes::_lastore:
+514     case Bytecodes::_dastore:
+515     case Bytecodes::_aastore:
+516     case Bytecodes::_pop:
+517     case Bytecodes::_pop2:
+518     case Bytecodes::_dup:
+519     case Bytecodes::_dup_x1:
+520     case Bytecodes::_dup_x2:
+521     case Bytecodes::_dup2:
+522     case Bytecodes::_dup2_x1:
+523     case Bytecodes::_dup2_x2:
+524     case Bytecodes::_swap:
+525     case Bytecodes::_iadd:
+526     case Bytecodes::_fadd:
+527     case Bytecodes::_isub:
+528     case Bytecodes::_fsub:
+529     case Bytecodes::_imul:
+530     case Bytecodes::_fmul:
+531     case Bytecodes::_idiv:
+532     case Bytecodes::_fdiv:
+533     case Bytecodes::_irem:
+534     case Bytecodes::_frem:
+535     case Bytecodes::_ishl:
+536     case Bytecodes::_ishr:
+537     case Bytecodes::_iushr:
+538     case Bytecodes::_iand:
+539     case Bytecodes::_ior:
+540     case Bytecodes::_ixor:
+541     case Bytecodes::_l2f:
+542     case Bytecodes::_l2i:
+543     case Bytecodes::_d2f:
+544     case Bytecodes::_d2i:
+545     case Bytecodes::_fcmpl:
+546     case Bytecodes::_fcmpg:
+547     case Bytecodes::_ladd:
+548     case Bytecodes::_dadd:
+549     case Bytecodes::_lsub:
+550     case Bytecodes::_dsub:
+551     case Bytecodes::_lmul:
+552     case Bytecodes::_dmul:
+553     case Bytecodes::_ldiv:
+554     case Bytecodes::_ddiv:
+555     case Bytecodes::_lrem:
+556     case Bytecodes::_drem:
+557     case Bytecodes::_land:
+558     case Bytecodes::_lor:
+559     case Bytecodes::_lxor:
+560     case Bytecodes::_ineg:
+561     case Bytecodes::_fneg:
+562     case Bytecodes::_i2f:
+563     case Bytecodes::_f2i:
+564     case Bytecodes::_i2c:
+565     case Bytecodes::_i2s:
+566     case Bytecodes::_i2b:
+567     case Bytecodes::_lneg:
+568     case Bytecodes::_dneg:
+569     case Bytecodes::_l2d:
+570     case Bytecodes::_d2l:
+571     case Bytecodes::_lshl:
+572     case Bytecodes::_lshr:
+573     case Bytecodes::_lushr:
+574     case Bytecodes::_i2l:
+575     case Bytecodes::_i2d:
+576     case Bytecodes::_f2l:
+577     case Bytecodes::_f2d:
+578     case Bytecodes::_lcmp:
+579     case Bytecodes::_dcmpl:
+580     case Bytecodes::_dcmpg:
+581     case Bytecodes::_ifeq:
+582     case Bytecodes::_ifne:
+583     case Bytecodes::_iflt:
+584     case Bytecodes::_ifge:
+585     case Bytecodes::_ifgt:
+586     case Bytecodes::_ifle:
+587     case Bytecodes::_tableswitch:
+588     case Bytecodes::_ireturn:
+589     case Bytecodes::_freturn:
+590     case Bytecodes::_if_icmpeq:
+591     case Bytecodes::_if_icmpne:
+592     case Bytecodes::_if_icmplt:
+593     case Bytecodes::_if_icmpge:
+594     case Bytecodes::_if_icmpgt:
+595     case Bytecodes::_if_icmple:
+596     case Bytecodes::_lreturn:
+597     case Bytecodes::_dreturn:
+598     case Bytecodes::_if_acmpeq:
+599     case Bytecodes::_if_acmpne:
+600     case Bytecodes::_jsr:
+601     case Bytecodes::_jsr_w:
+602     case Bytecodes::_getstatic:
+603     case Bytecodes::_putstatic:
+604     case Bytecodes::_getfield:
+605     case Bytecodes::_putfield:
+606     case Bytecodes::_invokevirtual:
+607     case Bytecodes::_invokespecial:
+608     case Bytecodes::_invokestatic:
+609     case Bytecodes::_invokeinterface:
+610     case Bytecodes::_invokedynamic:
+611     case Bytecodes::_newarray:
+612     case Bytecodes::_anewarray:
+613     case Bytecodes::_checkcast:
+614     case Bytecodes::_arraylength:
+615     case Bytecodes::_instanceof:
+616     case Bytecodes::_athrow:
+617     case Bytecodes::_areturn:
+618     case Bytecodes::_monitorenter:
+619     case Bytecodes::_monitorexit:
+620     case Bytecodes::_ifnull:
+621     case Bytecodes::_ifnonnull:
+622     case Bytecodes::_multianewarray:
+623     case Bytecodes::_lookupswitch:
+624       // These bytecodes have no effect on the method&#39;s locals.
+625       break;
+626 
+627     case Bytecodes::_return:
+628       if (instruction-&gt;method()-&gt;intrinsic_id() == vmIntrinsics::_Object_init) {
+629         // return from Object.init implicitly registers a finalizer
+630         // for the receiver if needed, so keep it alive.
+631         load_one(0);
+632       }
+633       break;
+634 
+635 
+636     case Bytecodes::_lload:
+637     case Bytecodes::_dload:
+638       load_two(instruction-&gt;get_index());
+639       break;
+640 
+641     case Bytecodes::_lload_0:
+642     case Bytecodes::_dload_0:
+643       load_two(0);
+644       break;
+645 
+646     case Bytecodes::_lload_1:
+647     case Bytecodes::_dload_1:
+648       load_two(1);
+649       break;
+650 
+651     case Bytecodes::_lload_2:
+652     case Bytecodes::_dload_2:
+653       load_two(2);
+654       break;
+655 
+656     case Bytecodes::_lload_3:
+657     case Bytecodes::_dload_3:
+658       load_two(3);
+659       break;
+660 
+661     case Bytecodes::_iload:
+662     case Bytecodes::_iinc:
+663     case Bytecodes::_fload:
+664     case Bytecodes::_aload:
+665     case Bytecodes::_ret:
+666       load_one(instruction-&gt;get_index());
+667       break;
+668 
+669     case Bytecodes::_iload_0:
+670     case Bytecodes::_fload_0:
+671     case Bytecodes::_aload_0:
+672       load_one(0);
+673       break;
+674 
+675     case Bytecodes::_iload_1:
+676     case Bytecodes::_fload_1:
+677     case Bytecodes::_aload_1:
+678       load_one(1);
+679       break;
+680 
+681     case Bytecodes::_iload_2:
+682     case Bytecodes::_fload_2:
+683     case Bytecodes::_aload_2:
+684       load_one(2);
+685       break;
+686 
+687     case Bytecodes::_iload_3:
+688     case Bytecodes::_fload_3:
+689     case Bytecodes::_aload_3:
+690       load_one(3);
+691       break;
+692 
+693     case Bytecodes::_lstore:
+694     case Bytecodes::_dstore:
+695       store_two(localNum = instruction-&gt;get_index());
+696       break;
+697 
+698     case Bytecodes::_lstore_0:
+699     case Bytecodes::_dstore_0:
+700       store_two(0);
+701       break;
+702 
+703     case Bytecodes::_lstore_1:
+704     case Bytecodes::_dstore_1:
+705       store_two(1);
+706       break;
+707 
+708     case Bytecodes::_lstore_2:
+709     case Bytecodes::_dstore_2:
+710       store_two(2);
+711       break;
+712 
+713     case Bytecodes::_lstore_3:
+714     case Bytecodes::_dstore_3:
+715       store_two(3);
+716       break;
+717 
+718     case Bytecodes::_istore:
+719     case Bytecodes::_fstore:
+720     case Bytecodes::_astore:
+721       store_one(instruction-&gt;get_index());
+722       break;
+723 
+724     case Bytecodes::_istore_0:
+725     case Bytecodes::_fstore_0:
+726     case Bytecodes::_astore_0:
+727       store_one(0);
+728       break;
+729 
+730     case Bytecodes::_istore_1:
+731     case Bytecodes::_fstore_1:
+732     case Bytecodes::_astore_1:
+733       store_one(1);
+734       break;
+735 
+736     case Bytecodes::_istore_2:
+737     case Bytecodes::_fstore_2:
+738     case Bytecodes::_astore_2:
+739       store_one(2);
+740       break;
+741 
+742     case Bytecodes::_istore_3:
+743     case Bytecodes::_fstore_3:
+744     case Bytecodes::_astore_3:
+745       store_one(3);
+746       break;
+747 
+748     case Bytecodes::_wide:
+749       fatal(&quot;Iterator should skip this bytecode&quot;);
+750       break;
+751 
+752     default:
+753       tty-&gt;print(&quot;unexpected opcode: %d\n&quot;, instruction-&gt;cur_bc());
+754       ShouldNotReachHere();
+755       break;
+756   }
+757 }
+758 
+759 void MethodLiveness::BasicBlock::load_two(int local) {
+760   load_one(local);
+761   load_one(local+1);
+762 }
+763 
+764 void MethodLiveness::BasicBlock::load_one(int local) {
+765   if (!_kill.at(local)) {
+766     _gen.at_put(local, true);
+767   }
+768 }
+769 
+770 void MethodLiveness::BasicBlock::store_two(int local) {
+771   store_one(local);
+772   store_one(local+1);
+773 }
+774 
+775 void MethodLiveness::BasicBlock::store_one(int local) {
+776   if (!_gen.at(local)) {
+777     _kill.at_put(local, true);
+778   }
+779 }
+780 
+781 void MethodLiveness::BasicBlock::propagate(MethodLiveness *ml) {
+782   // These set operations could be combined for efficiency if the
+783   // performance of this analysis becomes an issue.
+784   _entry.set_union(_normal_exit);
+785   _entry.set_difference(_kill);
+786   _entry.set_union(_gen);
+787 
+788   // Note that we merge information from our exceptional successors
+789   // just once, rather than at individual bytecodes.
+790   _entry.set_union(_exception_exit);
+791 
+792   if (TraceLivenessGen) {
+793     tty-&gt;print_cr(&quot; ** Visiting block at %d **&quot;, start_bci());
+794     print_on(tty);
+795   }
+796 
+797   int i;
+798   for (i=_normal_predecessors-&gt;length()-1; i&gt;=0; i--) {
+799     BasicBlock *block = _normal_predecessors-&gt;at(i);
+800     if (block-&gt;merge_normal(_entry)) {
+801       ml-&gt;work_list_add(block);
+802     }
+803   }
+804   for (i=_exception_predecessors-&gt;length()-1; i&gt;=0; i--) {
+805     BasicBlock *block = _exception_predecessors-&gt;at(i);
+806     if (block-&gt;merge_exception(_entry)) {
+807       ml-&gt;work_list_add(block);
+808     }
+809   }
+810 }
+811 
+812 bool MethodLiveness::BasicBlock::merge_normal(const BitMap&amp; other) {
+813   return _normal_exit.set_union_with_result(other);
+814 }
+815 
+816 bool MethodLiveness::BasicBlock::merge_exception(const BitMap&amp; other) {
+817   return _exception_exit.set_union_with_result(other);
+818 }
+819 
+820 MethodLivenessResult MethodLiveness::BasicBlock::get_liveness_at(ciMethod* method, int bci) {
+821   MethodLivenessResult answer(_analyzer-&gt;bit_map_size_bits());
+822   answer.set_is_valid();
+823 
+824 #ifndef ASSERT
+825   if (bci == start_bci()) {
+826     answer.set_from(_entry);
+827     return answer;
+828   }
+829 #endif
+830 
+831 #ifdef ASSERT
+832   ResourceMark rm;
+<a name="1" id="anc1"></a><span class="line-modified">833   ResourceBitMap g(_gen.size(), false); g.set_from(_gen);</span>
+<span class="line-modified">834   ResourceBitMap k(_kill.size(), false); k.set_from(_kill);</span>
+835 #endif
+836   if (_last_bci != bci || trueInDebug) {
+837     ciBytecodeStream bytes(method);
+838     bytes.reset_to_bci(bci);
+839     bytes.set_max_bci(limit_bci());
+840     compute_gen_kill_range(&amp;bytes);
+841     assert(_last_bci != bci ||
+842            (g.is_same(_gen) &amp;&amp; k.is_same(_kill)), &quot;cached computation is incorrect&quot;);
+843     _last_bci = bci;
+844   }
+845 
+846   answer.set_union(_normal_exit);
+847   answer.set_difference(_kill);
+848   answer.set_union(_gen);
+849   answer.set_union(_exception_exit);
+850 
+851 #ifdef ASSERT
+852   if (bci == start_bci()) {
+853     assert(answer.is_same(_entry), &quot;optimized answer must be accurate&quot;);
+854   }
+855 #endif
+856 
+857   return answer;
+858 }
+859 
+860 #ifndef PRODUCT
+861 
+862 void MethodLiveness::BasicBlock::print_on(outputStream *os) const {
+863   os-&gt;print_cr(&quot;===================================================================&quot;);
+864   os-&gt;print_cr(&quot;    Block start: %4d, limit: %4d&quot;, _start_bci, _limit_bci);
+865   os-&gt;print   (&quot;    Normal predecessors (%2d)      @&quot;, _normal_predecessors-&gt;length());
+866   int i;
+867   for (i=0; i &lt; _normal_predecessors-&gt;length(); i++) {
+868     os-&gt;print(&quot; %4d&quot;, _normal_predecessors-&gt;at(i)-&gt;start_bci());
+869   }
+870   os-&gt;cr();
+871   os-&gt;print   (&quot;    Exceptional predecessors (%2d) @&quot;, _exception_predecessors-&gt;length());
+872   for (i=0; i &lt; _exception_predecessors-&gt;length(); i++) {
+873     os-&gt;print(&quot; %4d&quot;, _exception_predecessors-&gt;at(i)-&gt;start_bci());
+874   }
+875   os-&gt;cr();
+876   os-&gt;print (&quot;    Normal Exit   : &quot;);
+877   _normal_exit.print_on(os);
+878   os-&gt;print (&quot;    Gen           : &quot;);
+879   _gen.print_on(os);
+880   os-&gt;print (&quot;    Kill          : &quot;);
+881   _kill.print_on(os);
+882   os-&gt;print (&quot;    Exception Exit: &quot;);
+883   _exception_exit.print_on(os);
+884   os-&gt;print (&quot;    Entry         : &quot;);
+885   _entry.print_on(os);
+886 }
+887 
+888 #endif // PRODUCT
+<a name="2" id="anc2"></a><b style="font-size: large; color: red">--- EOF ---</b>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+</pre>
+<input id="eof" value="2" type="hidden" />
+</body>
+</html>
