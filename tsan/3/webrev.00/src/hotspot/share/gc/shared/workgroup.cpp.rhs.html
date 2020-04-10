@@ -1,0 +1,602 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Frames src/hotspot/share/gc/shared/workgroup.cpp</title>
+    <link rel="stylesheet" href="../../../../../style.css" />
+    <script type="text/javascript" src="../../../../../navigation.js"></script>
+  </head>
+<body onkeypress="keypress(event);">
+<a name="0"></a>
+<hr />
+<pre>  1 /*
+<a name="1" id="anc1"></a><span class="line-modified">  2  * Copyright (c) 2001, 2019, Oracle and/or its affiliates. All rights reserved.</span>
+  3  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  4  *
+  5  * This code is free software; you can redistribute it and/or modify it
+  6  * under the terms of the GNU General Public License version 2 only, as
+  7  * published by the Free Software Foundation.
+  8  *
+  9  * This code is distributed in the hope that it will be useful, but WITHOUT
+ 10  * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ 11  * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ 12  * version 2 for more details (a copy is included in the LICENSE file that
+ 13  * accompanied this code).
+ 14  *
+ 15  * You should have received a copy of the GNU General Public License version
+ 16  * 2 along with this work; if not, write to the Free Software Foundation,
+ 17  * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ 18  *
+ 19  * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ 20  * or visit www.oracle.com if you need additional information or have any
+ 21  * questions.
+ 22  *
+ 23  */
+ 24 
+ 25 #include &quot;precompiled.hpp&quot;
+ 26 #include &quot;gc/shared/gcId.hpp&quot;
+ 27 #include &quot;gc/shared/workgroup.hpp&quot;
+ 28 #include &quot;gc/shared/workerManager.hpp&quot;
+ 29 #include &quot;memory/allocation.hpp&quot;
+ 30 #include &quot;memory/allocation.inline.hpp&quot;
+<a name="2" id="anc2"></a><span class="line-added"> 31 #include &quot;memory/iterator.hpp&quot;</span>
+ 32 #include &quot;runtime/atomic.hpp&quot;
+ 33 #include &quot;runtime/os.hpp&quot;
+ 34 #include &quot;runtime/semaphore.hpp&quot;
+ 35 #include &quot;runtime/thread.inline.hpp&quot;
+ 36 
+ 37 // Definitions of WorkGang methods.
+ 38 
+ 39 // The current implementation will exit if the allocation
+ 40 // of any worker fails.
+ 41 void  AbstractWorkGang::initialize_workers() {
+ 42   log_develop_trace(gc, workgang)(&quot;Constructing work gang %s with %u threads&quot;, name(), total_workers());
+ 43   _workers = NEW_C_HEAP_ARRAY(AbstractGangWorker*, total_workers(), mtInternal);
+<a name="3" id="anc3"></a>
+
+
+
+ 44   add_workers(true);
+ 45 }
+ 46 
+ 47 
+ 48 AbstractGangWorker* AbstractWorkGang::install_worker(uint worker_id) {
+ 49   AbstractGangWorker* new_worker = allocate_worker(worker_id);
+ 50   set_thread(worker_id, new_worker);
+ 51   return new_worker;
+ 52 }
+ 53 
+ 54 void AbstractWorkGang::add_workers(bool initializing) {
+ 55   add_workers(_active_workers, initializing);
+ 56 }
+ 57 
+ 58 void AbstractWorkGang::add_workers(uint active_workers, bool initializing) {
+ 59 
+ 60   os::ThreadType worker_type;
+ 61   if (are_ConcurrentGC_threads()) {
+ 62     worker_type = os::cgc_thread;
+ 63   } else {
+ 64     worker_type = os::pgc_thread;
+ 65   }
+ 66   uint previous_created_workers = _created_workers;
+ 67 
+ 68   _created_workers = WorkerManager::add_workers(this,
+ 69                                                 active_workers,
+ 70                                                 _total_workers,
+ 71                                                 _created_workers,
+ 72                                                 worker_type,
+ 73                                                 initializing);
+ 74   _active_workers = MIN2(_created_workers, _active_workers);
+ 75 
+ 76   WorkerManager::log_worker_creation(this, previous_created_workers, _active_workers, _created_workers, initializing);
+ 77 }
+ 78 
+ 79 AbstractGangWorker* AbstractWorkGang::worker(uint i) const {
+ 80   // Array index bounds checking.
+ 81   AbstractGangWorker* result = NULL;
+ 82   assert(_workers != NULL, &quot;No workers for indexing&quot;);
+ 83   assert(i &lt; total_workers(), &quot;Worker index out of bounds&quot;);
+ 84   result = _workers[i];
+ 85   assert(result != NULL, &quot;Indexing to null worker&quot;);
+ 86   return result;
+ 87 }
+ 88 
+ 89 void AbstractWorkGang::print_worker_threads_on(outputStream* st) const {
+ 90   uint workers = created_workers();
+ 91   for (uint i = 0; i &lt; workers; i++) {
+ 92     worker(i)-&gt;print_on(st);
+ 93     st-&gt;cr();
+ 94   }
+ 95 }
+ 96 
+ 97 void AbstractWorkGang::threads_do(ThreadClosure* tc) const {
+ 98   assert(tc != NULL, &quot;Null ThreadClosure&quot;);
+ 99   uint workers = created_workers();
+100   for (uint i = 0; i &lt; workers; i++) {
+101     tc-&gt;do_thread(worker(i));
+102   }
+103 }
+104 
+105 // WorkGang dispatcher implemented with semaphores.
+106 //
+107 // Semaphores don&#39;t require the worker threads to re-claim the lock when they wake up.
+108 // This helps lowering the latency when starting and stopping the worker threads.
+109 class SemaphoreGangTaskDispatcher : public GangTaskDispatcher {
+110   // The task currently being dispatched to the GangWorkers.
+111   AbstractGangTask* _task;
+112 
+113   volatile uint _started;
+114   volatile uint _not_finished;
+115 
+116   // Semaphore used to start the GangWorkers.
+117   Semaphore* _start_semaphore;
+118   // Semaphore used to notify the coordinator that all workers are done.
+119   Semaphore* _end_semaphore;
+120 
+121 public:
+122   SemaphoreGangTaskDispatcher() :
+123       _task(NULL),
+124       _started(0),
+125       _not_finished(0),
+126       _start_semaphore(new Semaphore()),
+127       _end_semaphore(new Semaphore())
+128 { }
+129 
+130   ~SemaphoreGangTaskDispatcher() {
+131     delete _start_semaphore;
+132     delete _end_semaphore;
+133   }
+134 
+135   void coordinator_execute_on_workers(AbstractGangTask* task, uint num_workers) {
+136     // No workers are allowed to read the state variables until they have been signaled.
+137     _task         = task;
+138     _not_finished = num_workers;
+139 
+140     // Dispatch &#39;num_workers&#39; number of tasks.
+141     _start_semaphore-&gt;signal(num_workers);
+142 
+143     // Wait for the last worker to signal the coordinator.
+144     _end_semaphore-&gt;wait();
+145 
+146     // No workers are allowed to read the state variables after the coordinator has been signaled.
+147     assert(_not_finished == 0, &quot;%d not finished workers?&quot;, _not_finished);
+148     _task    = NULL;
+149     _started = 0;
+150 
+151   }
+152 
+153   WorkData worker_wait_for_task() {
+154     // Wait for the coordinator to dispatch a task.
+155     _start_semaphore-&gt;wait();
+156 
+<a name="4" id="anc4"></a><span class="line-modified">157     uint num_started = Atomic::add(&amp;_started, 1u);</span>
+158 
+159     // Subtract one to get a zero-indexed worker id.
+160     uint worker_id = num_started - 1;
+161 
+162     return WorkData(_task, worker_id);
+163   }
+164 
+165   void worker_done_with_task() {
+166     // Mark that the worker is done with the task.
+167     // The worker is not allowed to read the state variables after this line.
+<a name="5" id="anc5"></a><span class="line-modified">168     uint not_finished = Atomic::sub(&amp;_not_finished, 1u);</span>
+169 
+170     // The last worker signals to the coordinator that all work is completed.
+171     if (not_finished == 0) {
+172       _end_semaphore-&gt;signal();
+173     }
+174   }
+175 };
+176 
+177 class MutexGangTaskDispatcher : public GangTaskDispatcher {
+178   AbstractGangTask* _task;
+179 
+180   volatile uint _started;
+181   volatile uint _finished;
+182   volatile uint _num_workers;
+183 
+184   Monitor* _monitor;
+185 
+186  public:
+187   MutexGangTaskDispatcher() :
+188     _task(NULL),
+189     _started(0),
+190     _finished(0),
+191     _num_workers(0),
+192     _monitor(new Monitor(Monitor::leaf, &quot;WorkGang dispatcher lock&quot;, false, Monitor::_safepoint_check_never)) {
+193   }
+194 
+195   ~MutexGangTaskDispatcher() {
+196     delete _monitor;
+197   }
+198 
+199   void coordinator_execute_on_workers(AbstractGangTask* task, uint num_workers) {
+<a name="6" id="anc6"></a><span class="line-modified">200     MonitorLocker ml(_monitor, Mutex::_no_safepoint_check_flag);</span>
+201 
+202     _task        = task;
+203     _num_workers = num_workers;
+204 
+205     // Tell the workers to get to work.
+206     _monitor-&gt;notify_all();
+207 
+208     // Wait for them to finish.
+209     while (_finished &lt; _num_workers) {
+<a name="7" id="anc7"></a><span class="line-modified">210       ml.wait();</span>
+211     }
+212 
+213     _task        = NULL;
+214     _num_workers = 0;
+215     _started     = 0;
+216     _finished    = 0;
+217   }
+218 
+219   WorkData worker_wait_for_task() {
+<a name="8" id="anc8"></a><span class="line-modified">220     MonitorLocker ml(_monitor, Mutex::_no_safepoint_check_flag);</span>
+221 
+222     while (_num_workers == 0 || _started == _num_workers) {
+<a name="9" id="anc9"></a><span class="line-modified">223       _monitor-&gt;wait();</span>
+224     }
+225 
+226     _started++;
+227 
+228     // Subtract one to get a zero-indexed worker id.
+229     uint worker_id = _started - 1;
+230 
+231     return WorkData(_task, worker_id);
+232   }
+233 
+234   void worker_done_with_task() {
+<a name="10" id="anc10"></a><span class="line-modified">235     MonitorLocker ml(_monitor, Mutex::_no_safepoint_check_flag);</span>
+236 
+237     _finished++;
+238 
+239     if (_finished == _num_workers) {
+240       // This will wake up all workers and not only the coordinator.
+241       _monitor-&gt;notify_all();
+242     }
+243   }
+244 };
+245 
+246 static GangTaskDispatcher* create_dispatcher() {
+247   if (UseSemaphoreGCThreadsSynchronization) {
+248     return new SemaphoreGangTaskDispatcher();
+249   }
+250 
+251   return new MutexGangTaskDispatcher();
+252 }
+253 
+254 WorkGang::WorkGang(const char* name,
+255                    uint  workers,
+256                    bool  are_GC_task_threads,
+257                    bool  are_ConcurrentGC_threads) :
+258     AbstractWorkGang(name, workers, are_GC_task_threads, are_ConcurrentGC_threads),
+259     _dispatcher(create_dispatcher())
+260 { }
+261 
+262 WorkGang::~WorkGang() {
+263   delete _dispatcher;
+264 }
+265 
+266 AbstractGangWorker* WorkGang::allocate_worker(uint worker_id) {
+267   return new GangWorker(this, worker_id);
+268 }
+269 
+270 void WorkGang::run_task(AbstractGangTask* task) {
+271   run_task(task, active_workers());
+272 }
+273 
+274 void WorkGang::run_task(AbstractGangTask* task, uint num_workers) {
+275   guarantee(num_workers &lt;= total_workers(),
+276             &quot;Trying to execute task %s with %u workers which is more than the amount of total workers %u.&quot;,
+277             task-&gt;name(), num_workers, total_workers());
+278   guarantee(num_workers &gt; 0, &quot;Trying to execute task %s with zero workers&quot;, task-&gt;name());
+279   uint old_num_workers = _active_workers;
+280   update_active_workers(num_workers);
+281   _dispatcher-&gt;coordinator_execute_on_workers(task, num_workers);
+282   update_active_workers(old_num_workers);
+283 }
+284 
+285 AbstractGangWorker::AbstractGangWorker(AbstractWorkGang* gang, uint id) {
+286   _gang = gang;
+287   set_id(id);
+288   set_name(&quot;%s#%d&quot;, gang-&gt;name(), id);
+289 }
+290 
+291 void AbstractGangWorker::run() {
+292   initialize();
+293   loop();
+294 }
+295 
+296 void AbstractGangWorker::initialize() {
+297   assert(_gang != NULL, &quot;No gang to run in&quot;);
+298   os::set_priority(this, NearMaxPriority);
+299   log_develop_trace(gc, workgang)(&quot;Running gang worker for gang %s id %u&quot;, gang()-&gt;name(), id());
+<a name="11" id="anc11"></a>
+
+300   assert(!Thread::current()-&gt;is_VM_thread(), &quot;VM thread should not be part&quot;
+301          &quot; of a work gang&quot;);
+302 }
+303 
+304 bool AbstractGangWorker::is_GC_task_thread() const {
+305   return gang()-&gt;are_GC_task_threads();
+306 }
+307 
+308 bool AbstractGangWorker::is_ConcurrentGC_thread() const {
+309   return gang()-&gt;are_ConcurrentGC_threads();
+310 }
+311 
+312 void AbstractGangWorker::print_on(outputStream* st) const {
+313   st-&gt;print(&quot;\&quot;%s\&quot; &quot;, name());
+314   Thread::print_on(st);
+315   st-&gt;cr();
+316 }
+317 
+<a name="12" id="anc12"></a><span class="line-added">318 void AbstractGangWorker::print() const { print_on(tty); }</span>
+<span class="line-added">319 </span>
+320 WorkData GangWorker::wait_for_task() {
+321   return gang()-&gt;dispatcher()-&gt;worker_wait_for_task();
+322 }
+323 
+324 void GangWorker::signal_task_done() {
+325   gang()-&gt;dispatcher()-&gt;worker_done_with_task();
+326 }
+327 
+328 void GangWorker::run_task(WorkData data) {
+329   GCIdMark gc_id_mark(data._task-&gt;gc_id());
+330   log_develop_trace(gc, workgang)(&quot;Running work gang: %s task: %s worker: %u&quot;, name(), data._task-&gt;name(), data._worker_id);
+331 
+332   data._task-&gt;work(data._worker_id);
+333 
+334   log_develop_trace(gc, workgang)(&quot;Finished work gang: %s task: %s worker: %u thread: &quot; PTR_FORMAT,
+335                                   name(), data._task-&gt;name(), data._worker_id, p2i(Thread::current()));
+336 }
+337 
+338 void GangWorker::loop() {
+339   while (true) {
+340     WorkData data = wait_for_task();
+341 
+342     run_task(data);
+343 
+344     signal_task_done();
+345   }
+346 }
+347 
+348 // *** WorkGangBarrierSync
+349 
+350 WorkGangBarrierSync::WorkGangBarrierSync()
+351   : _monitor(Mutex::safepoint, &quot;work gang barrier sync&quot;, true,
+352              Monitor::_safepoint_check_never),
+353     _n_workers(0), _n_completed(0), _should_reset(false), _aborted(false) {
+354 }
+355 
+356 WorkGangBarrierSync::WorkGangBarrierSync(uint n_workers, const char* name)
+357   : _monitor(Mutex::safepoint, name, true, Monitor::_safepoint_check_never),
+358     _n_workers(n_workers), _n_completed(0), _should_reset(false), _aborted(false) {
+359 }
+360 
+361 void WorkGangBarrierSync::set_n_workers(uint n_workers) {
+362   _n_workers    = n_workers;
+363   _n_completed  = 0;
+364   _should_reset = false;
+365   _aborted      = false;
+366 }
+367 
+368 bool WorkGangBarrierSync::enter() {
+<a name="13" id="anc13"></a><span class="line-modified">369   MonitorLocker ml(monitor(), Mutex::_no_safepoint_check_flag);</span>
+370   if (should_reset()) {
+371     // The should_reset() was set and we are the first worker to enter
+372     // the sync barrier. We will zero the n_completed() count which
+373     // effectively resets the barrier.
+374     zero_completed();
+375     set_should_reset(false);
+376   }
+377   inc_completed();
+378   if (n_completed() == n_workers()) {
+379     // At this point we would like to reset the barrier to be ready in
+380     // case it is used again. However, we cannot set n_completed() to
+381     // 0, even after the notify_all(), given that some other workers
+382     // might still be waiting for n_completed() to become ==
+383     // n_workers(). So, if we set n_completed() to 0, those workers
+384     // will get stuck (as they will wake up, see that n_completed() !=
+385     // n_workers() and go back to sleep). Instead, we raise the
+386     // should_reset() flag and the barrier will be reset the first
+387     // time a worker enters it again.
+388     set_should_reset(true);
+<a name="14" id="anc14"></a><span class="line-modified">389     ml.notify_all();</span>
+390   } else {
+391     while (n_completed() != n_workers() &amp;&amp; !aborted()) {
+<a name="15" id="anc15"></a><span class="line-modified">392       ml.wait();</span>
+393     }
+394   }
+395   return !aborted();
+396 }
+397 
+398 void WorkGangBarrierSync::abort() {
+<a name="16" id="anc16"></a><span class="line-modified">399   MutexLocker x(monitor(), Mutex::_no_safepoint_check_flag);</span>
+400   set_aborted();
+401   monitor()-&gt;notify_all();
+402 }
+403 
+404 // SubTasksDone functions.
+405 
+406 SubTasksDone::SubTasksDone(uint n) :
+407   _tasks(NULL), _n_tasks(n), _threads_completed(0) {
+408   _tasks = NEW_C_HEAP_ARRAY(uint, n, mtInternal);
+<a name="17" id="anc17"></a>
+409   clear();
+410 }
+411 
+412 bool SubTasksDone::valid() {
+413   return _tasks != NULL;
+414 }
+415 
+416 void SubTasksDone::clear() {
+417   for (uint i = 0; i &lt; _n_tasks; i++) {
+418     _tasks[i] = 0;
+419   }
+420   _threads_completed = 0;
+421 #ifdef ASSERT
+422   _claimed = 0;
+423 #endif
+424 }
+425 
+426 bool SubTasksDone::try_claim_task(uint t) {
+427   assert(t &lt; _n_tasks, &quot;bad task id.&quot;);
+428   uint old = _tasks[t];
+429   if (old == 0) {
+<a name="18" id="anc18"></a><span class="line-modified">430     old = Atomic::cmpxchg(&amp;_tasks[t], 0u, 1u);</span>
+431   }
+<a name="19" id="anc19"></a>
+432   bool res = old == 0;
+433 #ifdef ASSERT
+434   if (res) {
+435     assert(_claimed &lt; _n_tasks, &quot;Too many tasks claimed; missing clear?&quot;);
+436     Atomic::inc(&amp;_claimed);
+437   }
+438 #endif
+439   return res;
+440 }
+441 
+442 void SubTasksDone::all_tasks_completed(uint n_threads) {
+443   uint observed = _threads_completed;
+444   uint old;
+445   do {
+446     old = observed;
+<a name="20" id="anc20"></a><span class="line-modified">447     observed = Atomic::cmpxchg(&amp;_threads_completed, old, old+1);</span>
+448   } while (observed != old);
+449   // If this was the last thread checking in, clear the tasks.
+450   uint adjusted_thread_count = (n_threads == 0 ? 1 : n_threads);
+451   if (observed + 1 == adjusted_thread_count) {
+452     clear();
+453   }
+454 }
+455 
+456 
+457 SubTasksDone::~SubTasksDone() {
+<a name="21" id="anc21"></a><span class="line-modified">458   FREE_C_HEAP_ARRAY(uint, _tasks);</span>
+459 }
+460 
+461 // *** SequentialSubTasksDone
+462 
+463 void SequentialSubTasksDone::clear() {
+464   _n_tasks   = _n_claimed   = 0;
+465   _n_threads = _n_completed = 0;
+466 }
+467 
+468 bool SequentialSubTasksDone::valid() {
+469   return _n_threads &gt; 0;
+470 }
+471 
+472 bool SequentialSubTasksDone::try_claim_task(uint&amp; t) {
+473   t = _n_claimed;
+474   while (t &lt; _n_tasks) {
+<a name="22" id="anc22"></a><span class="line-modified">475     uint res = Atomic::cmpxchg(&amp;_n_claimed, t, t+1);</span>
+476     if (res == t) {
+477       return true;
+478     }
+479     t = res;
+480   }
+481   return false;
+482 }
+483 
+484 bool SequentialSubTasksDone::all_tasks_completed() {
+485   uint complete = _n_completed;
+486   while (true) {
+<a name="23" id="anc23"></a><span class="line-modified">487     uint res = Atomic::cmpxchg(&amp;_n_completed, complete, complete+1);</span>
+488     if (res == complete) {
+489       break;
+490     }
+491     complete = res;
+492   }
+493   if (complete+1 == _n_threads) {
+494     clear();
+495     return true;
+496   }
+497   return false;
+498 }
+<a name="24" id="anc24"></a><b style="font-size: large; color: red">--- EOF ---</b>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+</pre>
+<input id="eof" value="24" type="hidden" />
+</body>
+</html>
