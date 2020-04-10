@@ -1,0 +1,1391 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Old src/hotspot/share/gc/z/zStat.cpp</title>
+    <link rel="stylesheet" href="../../../../../style.css" />
+  </head>
+  <body>
+    <pre>
+   1 /*
+   2  * Copyright (c) 2015, 2018, Oracle and/or its affiliates. All rights reserved.
+   3  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+   4  *
+   5  * This code is free software; you can redistribute it and/or modify it
+   6  * under the terms of the GNU General Public License version 2 only, as
+   7  * published by the Free Software Foundation.
+   8  *
+   9  * This code is distributed in the hope that it will be useful, but WITHOUT
+  10  * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+  11  * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+  12  * version 2 for more details (a copy is included in the LICENSE file that
+  13  * accompanied this code).
+  14  *
+  15  * You should have received a copy of the GNU General Public License version
+  16  * 2 along with this work; if not, write to the Free Software Foundation,
+  17  * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+  18  *
+  19  * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+  20  * or visit www.oracle.com if you need additional information or have any
+  21  * questions.
+  22  */
+  23 
+  24 #include &quot;precompiled.hpp&quot;
+  25 #include &quot;gc/z/zCollectedHeap.hpp&quot;
+  26 #include &quot;gc/z/zCPU.hpp&quot;
+  27 #include &quot;gc/z/zGlobals.hpp&quot;
+  28 #include &quot;gc/z/zHeap.inline.hpp&quot;
+  29 #include &quot;gc/z/zLargePages.inline.hpp&quot;
+  30 #include &quot;gc/z/zNMethodTable.hpp&quot;
+  31 #include &quot;gc/z/zNUMA.hpp&quot;
+  32 #include &quot;gc/z/zStat.hpp&quot;
+  33 #include &quot;gc/z/zTracer.inline.hpp&quot;
+  34 #include &quot;gc/z/zUtils.hpp&quot;
+  35 #include &quot;memory/resourceArea.hpp&quot;
+  36 #include &quot;runtime/atomic.hpp&quot;
+  37 #include &quot;runtime/os.hpp&quot;
+  38 #include &quot;runtime/timer.hpp&quot;
+  39 #include &quot;utilities/align.hpp&quot;
+  40 #include &quot;utilities/compilerWarnings.hpp&quot;
+  41 #include &quot;utilities/debug.hpp&quot;
+  42 #include &quot;utilities/ticks.hpp&quot;
+  43 
+  44 //
+  45 // Stat sampler/counter data
+  46 //
+  47 struct ZStatSamplerData {
+  48   uint64_t _nsamples;
+  49   uint64_t _sum;
+  50   uint64_t _max;
+  51 
+  52   ZStatSamplerData() :
+  53     _nsamples(0),
+  54     _sum(0),
+  55     _max(0) {}
+  56 
+  57   void add(const ZStatSamplerData&amp; new_sample) {
+  58     _nsamples += new_sample._nsamples;
+  59     _sum += new_sample._nsamples;
+  60     _max = MAX2(_max, new_sample._max);
+  61   }
+  62 };
+  63 
+  64 struct ZStatCounterData {
+  65   uint64_t _counter;
+  66 
+  67   ZStatCounterData() :
+  68     _counter(0) {}
+  69 };
+  70 
+  71 //
+  72 // Stat sampler history
+  73 //
+  74 template &lt;size_t size&gt;
+  75 class ZStatSamplerHistoryInterval {
+  76 private:
+  77   size_t           _next;
+  78   ZStatSamplerData _samples[size];
+  79   ZStatSamplerData _accumulated;
+  80   ZStatSamplerData _total;
+  81 
+  82 public:
+  83   ZStatSamplerHistoryInterval() :
+  84       _next(0),
+  85       _samples(),
+  86       _accumulated(),
+  87       _total() {}
+  88 
+  89   bool add(const ZStatSamplerData&amp; new_sample) {
+  90     // Insert sample
+  91     const ZStatSamplerData old_sample = _samples[_next];
+  92     _samples[_next] = new_sample;
+  93 
+  94     // Adjust accumulated
+  95     _accumulated._nsamples += new_sample._nsamples;
+  96     _accumulated._sum += new_sample._sum;
+  97     _accumulated._max = MAX2(_accumulated._max, new_sample._max);
+  98 
+  99     // Adjust total
+ 100     _total._nsamples -= old_sample._nsamples;
+ 101     _total._sum -= old_sample._sum;
+ 102     _total._nsamples += new_sample._nsamples;
+ 103     _total._sum += new_sample._sum;
+ 104     if (_total._max &lt; new_sample._max) {
+ 105       // Found new max
+ 106       _total._max = new_sample._max;
+ 107     } else if (_total._max == old_sample._max) {
+ 108       // Removed old max, reset and find new max
+ 109       _total._max = 0;
+ 110       for (size_t i = 0; i &lt; size; i++) {
+ 111         if (_total._max &lt; _samples[i]._max) {
+ 112           _total._max = _samples[i]._max;
+ 113         }
+ 114       }
+ 115     }
+ 116 
+ 117     // Adjust next
+ 118     if (++_next == size) {
+ 119       _next = 0;
+ 120 
+ 121       // Clear accumulated
+ 122       const ZStatSamplerData zero;
+ 123       _accumulated = zero;
+ 124 
+ 125       // Became full
+ 126       return true;
+ 127     }
+ 128 
+ 129     // Not yet full
+ 130     return false;
+ 131   }
+ 132 
+ 133   const ZStatSamplerData&amp; total() const {
+ 134     return _total;
+ 135   }
+ 136 
+ 137   const ZStatSamplerData&amp; accumulated() const {
+ 138     return _accumulated;
+ 139   }
+ 140 };
+ 141 
+ 142 class ZStatSamplerHistory : public CHeapObj&lt;mtGC&gt; {
+ 143 private:
+ 144   ZStatSamplerHistoryInterval&lt;10&gt; _10seconds;
+ 145   ZStatSamplerHistoryInterval&lt;60&gt; _10minutes;
+ 146   ZStatSamplerHistoryInterval&lt;60&gt; _10hours;
+ 147   ZStatSamplerData                _total;
+ 148 
+ 149   uint64_t avg(uint64_t sum, uint64_t nsamples) const {
+ 150     return (nsamples &gt; 0) ? sum / nsamples : 0;
+ 151   }
+ 152 
+ 153 public:
+ 154   ZStatSamplerHistory() :
+ 155       _10seconds(),
+ 156       _10minutes(),
+ 157       _10hours(),
+ 158       _total() {}
+ 159 
+ 160   void add(const ZStatSamplerData&amp; new_sample) {
+ 161     if (_10seconds.add(new_sample)) {
+ 162       if (_10minutes.add(_10seconds.total())) {
+ 163         if (_10hours.add(_10minutes.total())) {
+ 164           _total.add(_10hours.total());
+ 165         }
+ 166       }
+ 167     }
+ 168   }
+ 169 
+ 170   uint64_t avg_10_seconds() const {
+ 171     const uint64_t sum      = _10seconds.total()._sum;
+ 172     const uint64_t nsamples = _10seconds.total()._nsamples;
+ 173     return avg(sum, nsamples);
+ 174   }
+ 175 
+ 176   uint64_t avg_10_minutes() const {
+ 177     const uint64_t sum      = _10seconds.accumulated()._sum +
+ 178                               _10minutes.total()._sum;
+ 179     const uint64_t nsamples = _10seconds.accumulated()._nsamples +
+ 180                               _10minutes.total()._nsamples;
+ 181     return avg(sum, nsamples);
+ 182   }
+ 183 
+ 184   uint64_t avg_10_hours() const {
+ 185     const uint64_t sum      = _10seconds.accumulated()._sum +
+ 186                               _10minutes.accumulated()._sum +
+ 187                               _10hours.total()._sum;
+ 188     const uint64_t nsamples = _10seconds.accumulated()._nsamples +
+ 189                               _10minutes.accumulated()._nsamples +
+ 190                               _10hours.total()._nsamples;
+ 191     return avg(sum, nsamples);
+ 192   }
+ 193 
+ 194   uint64_t avg_total() const {
+ 195     const uint64_t sum      = _10seconds.accumulated()._sum +
+ 196                               _10minutes.accumulated()._sum +
+ 197                               _10hours.accumulated()._sum +
+ 198                               _total._sum;
+ 199     const uint64_t nsamples = _10seconds.accumulated()._nsamples +
+ 200                               _10minutes.accumulated()._nsamples +
+ 201                               _10hours.accumulated()._nsamples +
+ 202                               _total._nsamples;
+ 203     return avg(sum, nsamples);
+ 204   }
+ 205 
+ 206   uint64_t max_10_seconds() const {
+ 207     return _10seconds.total()._max;
+ 208   }
+ 209 
+ 210   uint64_t max_10_minutes() const {
+ 211     return MAX2(_10seconds.accumulated()._max,
+ 212                 _10minutes.total()._max);
+ 213   }
+ 214 
+ 215   uint64_t max_10_hours() const {
+ 216     return MAX3(_10seconds.accumulated()._max,
+ 217                 _10minutes.accumulated()._max,
+ 218                 _10hours.total()._max);
+ 219   }
+ 220 
+ 221   uint64_t max_total() const {
+ 222     return MAX4(_10seconds.accumulated()._max,
+ 223                 _10minutes.accumulated()._max,
+ 224                 _10hours.accumulated()._max,
+ 225                 _total._max);
+ 226   }
+ 227 };
+ 228 
+ 229 //
+ 230 // Stat unit printers
+ 231 //
+ 232 void ZStatUnitTime(LogTargetHandle log, const ZStatSampler&amp; sampler, const ZStatSamplerHistory&amp; history) {
+ 233   log.print(&quot; %10s: %-40s  &quot;
+ 234             &quot;%9.3f / %-9.3f &quot;
+ 235             &quot;%9.3f / %-9.3f &quot;
+ 236             &quot;%9.3f / %-9.3f &quot;
+ 237             &quot;%9.3f / %-9.3f   ms&quot;,
+ 238             sampler.group(),
+ 239             sampler.name(),
+ 240             TimeHelper::counter_to_millis(history.avg_10_seconds()),
+ 241             TimeHelper::counter_to_millis(history.max_10_seconds()),
+ 242             TimeHelper::counter_to_millis(history.avg_10_minutes()),
+ 243             TimeHelper::counter_to_millis(history.max_10_minutes()),
+ 244             TimeHelper::counter_to_millis(history.avg_10_hours()),
+ 245             TimeHelper::counter_to_millis(history.max_10_hours()),
+ 246             TimeHelper::counter_to_millis(history.avg_total()),
+ 247             TimeHelper::counter_to_millis(history.max_total()));
+ 248 }
+ 249 
+ 250 void ZStatUnitBytes(LogTargetHandle log, const ZStatSampler&amp; sampler, const ZStatSamplerHistory&amp; history) {
+ 251   log.print(&quot; %10s: %-40s  &quot;
+ 252             UINT64_FORMAT_W(9) &quot; / &quot; UINT64_FORMAT_W(-9) &quot; &quot;
+ 253             UINT64_FORMAT_W(9) &quot; / &quot; UINT64_FORMAT_W(-9) &quot; &quot;
+ 254             UINT64_FORMAT_W(9) &quot; / &quot; UINT64_FORMAT_W(-9) &quot; &quot;
+ 255             UINT64_FORMAT_W(9) &quot; / &quot; UINT64_FORMAT_W(-9) &quot;   MB&quot;,
+ 256             sampler.group(),
+ 257             sampler.name(),
+ 258             history.avg_10_seconds() / M,
+ 259             history.max_10_seconds() / M,
+ 260             history.avg_10_minutes() / M,
+ 261             history.max_10_minutes() / M,
+ 262             history.avg_10_hours() / M,
+ 263             history.max_10_hours() / M,
+ 264             history.avg_total() / M,
+ 265             history.max_total() / M);
+ 266 }
+ 267 
+ 268 void ZStatUnitThreads(LogTargetHandle log, const ZStatSampler&amp; sampler, const ZStatSamplerHistory&amp; history) {
+ 269   log.print(&quot; %10s: %-40s  &quot;
+ 270             UINT64_FORMAT_W(9) &quot; / &quot; UINT64_FORMAT_W(-9) &quot; &quot;
+ 271             UINT64_FORMAT_W(9) &quot; / &quot; UINT64_FORMAT_W(-9) &quot; &quot;
+ 272             UINT64_FORMAT_W(9) &quot; / &quot; UINT64_FORMAT_W(-9) &quot; &quot;
+ 273             UINT64_FORMAT_W(9) &quot; / &quot; UINT64_FORMAT_W(-9) &quot;   threads&quot;,
+ 274             sampler.group(),
+ 275             sampler.name(),
+ 276             history.avg_10_seconds(),
+ 277             history.max_10_seconds(),
+ 278             history.avg_10_minutes(),
+ 279             history.max_10_minutes(),
+ 280             history.avg_10_hours(),
+ 281             history.max_10_hours(),
+ 282             history.avg_total(),
+ 283             history.max_total());
+ 284 }
+ 285 
+ 286 void ZStatUnitBytesPerSecond(LogTargetHandle log, const ZStatSampler&amp; sampler, const ZStatSamplerHistory&amp; history) {
+ 287   log.print(&quot; %10s: %-40s  &quot;
+ 288             UINT64_FORMAT_W(9) &quot; / &quot; UINT64_FORMAT_W(-9) &quot; &quot;
+ 289             UINT64_FORMAT_W(9) &quot; / &quot; UINT64_FORMAT_W(-9) &quot; &quot;
+ 290             UINT64_FORMAT_W(9) &quot; / &quot; UINT64_FORMAT_W(-9) &quot; &quot;
+ 291             UINT64_FORMAT_W(9) &quot; / &quot; UINT64_FORMAT_W(-9) &quot;   MB/s&quot;,
+ 292             sampler.group(),
+ 293             sampler.name(),
+ 294             history.avg_10_seconds() / M,
+ 295             history.max_10_seconds() / M,
+ 296             history.avg_10_minutes() / M,
+ 297             history.max_10_minutes() / M,
+ 298             history.avg_10_hours() / M,
+ 299             history.max_10_hours() / M,
+ 300             history.avg_total() / M,
+ 301             history.max_total() / M);
+ 302 }
+ 303 
+ 304 void ZStatUnitOpsPerSecond(LogTargetHandle log, const ZStatSampler&amp; sampler, const ZStatSamplerHistory&amp; history) {
+ 305   log.print(&quot; %10s: %-40s  &quot;
+ 306             UINT64_FORMAT_W(9) &quot; / &quot; UINT64_FORMAT_W(-9) &quot; &quot;
+ 307             UINT64_FORMAT_W(9) &quot; / &quot; UINT64_FORMAT_W(-9) &quot; &quot;
+ 308             UINT64_FORMAT_W(9) &quot; / &quot; UINT64_FORMAT_W(-9) &quot; &quot;
+ 309             UINT64_FORMAT_W(9) &quot; / &quot; UINT64_FORMAT_W(-9) &quot;   ops/s&quot;,
+ 310             sampler.group(),
+ 311             sampler.name(),
+ 312             history.avg_10_seconds(),
+ 313             history.max_10_seconds(),
+ 314             history.avg_10_minutes(),
+ 315             history.max_10_minutes(),
+ 316             history.avg_10_hours(),
+ 317             history.max_10_hours(),
+ 318             history.avg_total(),
+ 319             history.max_total());
+ 320 }
+ 321 
+ 322 //
+ 323 // Stat value
+ 324 //
+ 325 uintptr_t ZStatValue::_base = 0;
+ 326 uint32_t  ZStatValue::_cpu_offset = 0;
+ 327 
+ 328 ZStatValue::ZStatValue(const char* group,
+ 329                           const char* name,
+ 330                           uint32_t id,
+ 331                           uint32_t size) :
+ 332     _group(group),
+ 333     _name(name),
+ 334     _id(id),
+ 335     _offset(_cpu_offset) {
+ 336   assert(_base == 0, &quot;Already initialized&quot;);
+ 337   _cpu_offset += size;
+ 338 }
+ 339 
+ 340 template &lt;typename T&gt;
+ 341 T* ZStatValue::get_cpu_local(uint32_t cpu) const {
+ 342   assert(_base != 0, &quot;Not initialized&quot;);
+ 343   const uintptr_t cpu_base = _base + (_cpu_offset * cpu);
+ 344   const uintptr_t value_addr = cpu_base + _offset;
+ 345   return (T*)value_addr;
+ 346 }
+ 347 
+ 348 void ZStatValue::initialize() {
+ 349   // Finalize and align CPU offset
+ 350   _cpu_offset = align_up(_cpu_offset, ZCacheLineSize);
+ 351 
+ 352   // Allocation aligned memory
+ 353   const size_t size = _cpu_offset * ZCPU::count();
+ 354   _base = ZUtils::alloc_aligned(ZCacheLineSize, size);
+ 355   memset((void*)_base, 0, size);
+ 356 }
+ 357 
+ 358 const char* ZStatValue::group() const {
+ 359   return _group;
+ 360 }
+ 361 
+ 362 const char* ZStatValue::name() const {
+ 363   return _name;
+ 364 }
+ 365 
+ 366 uint32_t ZStatValue::id() const {
+ 367   return _id;
+ 368 }
+ 369 
+ 370 //
+ 371 // Stat iterable value
+ 372 //
+ 373 template &lt;typename T&gt; uint32_t ZStatIterableValue&lt;T&gt;::_count = 0;
+ 374 template &lt;typename T&gt; T*       ZStatIterableValue&lt;T&gt;::_first = NULL;
+ 375 
+ 376 template &lt;typename T&gt;
+ 377 ZStatIterableValue&lt;T&gt;::ZStatIterableValue(const char* group,
+ 378                                           const char* name,
+ 379                                           uint32_t size) :
+ 380     ZStatValue(group, name, _count++, size),
+ 381     _next(insert()) {}
+ 382 
+ 383 template &lt;typename T&gt;
+ 384 T* ZStatIterableValue&lt;T&gt;::insert() const {
+ 385   T** current = &amp;_first;
+ 386 
+ 387   while (*current != NULL) {
+ 388     // First sort by group, then by name
+ 389     const int group_cmp = strcmp((*current)-&gt;group(), group());
+ 390     const int name_cmp = strcmp((*current)-&gt;name(), name());
+ 391     if ((group_cmp &gt; 0) || (group_cmp == 0 &amp;&amp; name_cmp &gt; 0)) {
+ 392       break;
+ 393     }
+ 394 
+ 395     current = &amp;(*current)-&gt;_next;
+ 396   }
+ 397 
+ 398   T* const next = *current;
+ 399   *current = (T*)this;
+ 400   return next;
+ 401 }
+ 402 
+ 403 //
+ 404 // Stat sampler
+ 405 //
+ 406 ZStatSampler::ZStatSampler(const char* group, const char* name, ZStatUnitPrinter printer) :
+ 407     ZStatIterableValue&lt;ZStatSampler&gt;(group, name, sizeof(ZStatSamplerData)),
+ 408     _printer(printer) {}
+ 409 
+ 410 ZStatSamplerData* ZStatSampler::get() const {
+ 411   return get_cpu_local&lt;ZStatSamplerData&gt;(ZCPU::id());
+ 412 }
+ 413 
+ 414 ZStatSamplerData ZStatSampler::collect_and_reset() const {
+ 415   ZStatSamplerData all;
+ 416 
+ 417   const uint32_t ncpus = ZCPU::count();
+ 418   for (uint32_t i = 0; i &lt; ncpus; i++) {
+ 419     ZStatSamplerData* const cpu_data = get_cpu_local&lt;ZStatSamplerData&gt;(i);
+ 420     if (cpu_data-&gt;_nsamples &gt; 0) {
+ 421       const uint64_t nsamples = Atomic::xchg((uint64_t)0, &amp;cpu_data-&gt;_nsamples);
+ 422       const uint64_t sum = Atomic::xchg((uint64_t)0, &amp;cpu_data-&gt;_sum);
+ 423       const uint64_t max = Atomic::xchg((uint64_t)0, &amp;cpu_data-&gt;_max);
+ 424       all._nsamples += nsamples;
+ 425       all._sum += sum;
+ 426       if (all._max &lt; max) {
+ 427         all._max = max;
+ 428       }
+ 429     }
+ 430   }
+ 431 
+ 432   return all;
+ 433 }
+ 434 
+ 435 ZStatUnitPrinter ZStatSampler::printer() const {
+ 436   return _printer;
+ 437 }
+ 438 
+ 439 //
+ 440 // Stat counter
+ 441 //
+ 442 ZStatCounter::ZStatCounter(const char* group, const char* name, ZStatUnitPrinter printer) :
+ 443     ZStatIterableValue&lt;ZStatCounter&gt;(group, name, sizeof(ZStatCounterData)),
+ 444     _sampler(group, name, printer) {}
+ 445 
+ 446 ZStatCounterData* ZStatCounter::get() const {
+ 447   return get_cpu_local&lt;ZStatCounterData&gt;(ZCPU::id());
+ 448 }
+ 449 
+ 450 void ZStatCounter::sample_and_reset() const {
+ 451   uint64_t counter = 0;
+ 452 
+ 453   const uint32_t ncpus = ZCPU::count();
+ 454   for (uint32_t i = 0; i &lt; ncpus; i++) {
+ 455     ZStatCounterData* const cpu_data = get_cpu_local&lt;ZStatCounterData&gt;(i);
+ 456     counter += Atomic::xchg((uint64_t)0, &amp;cpu_data-&gt;_counter);
+ 457   }
+ 458 
+ 459   ZStatSample(_sampler, counter);
+ 460 }
+ 461 
+ 462 //
+ 463 // Stat unsampled counter
+ 464 //
+ 465 ZStatUnsampledCounter::ZStatUnsampledCounter(const char* name) :
+ 466     ZStatIterableValue&lt;ZStatUnsampledCounter&gt;(&quot;Unsampled&quot;, name, sizeof(ZStatCounterData)) {}
+ 467 
+ 468 ZStatCounterData* ZStatUnsampledCounter::get() const {
+ 469   return get_cpu_local&lt;ZStatCounterData&gt;(ZCPU::id());
+ 470 }
+ 471 
+ 472 ZStatCounterData ZStatUnsampledCounter::collect_and_reset() const {
+ 473   ZStatCounterData all;
+ 474 
+ 475   const uint32_t ncpus = ZCPU::count();
+ 476   for (uint32_t i = 0; i &lt; ncpus; i++) {
+ 477     ZStatCounterData* const cpu_data = get_cpu_local&lt;ZStatCounterData&gt;(i);
+ 478     all._counter += Atomic::xchg((uint64_t)0, &amp;cpu_data-&gt;_counter);
+ 479   }
+ 480 
+ 481   return all;
+ 482 }
+ 483 
+ 484 //
+ 485 // Stat MMU (Minimum Mutator Utilization)
+ 486 //
+ 487 ZStatMMUPause::ZStatMMUPause() :
+ 488     _start(0.0),
+ 489     _end(0.0) {}
+ 490 
+ 491 ZStatMMUPause::ZStatMMUPause(const Ticks&amp; start, const Ticks&amp; end) :
+ 492     _start(TimeHelper::counter_to_millis(start.value())),
+ 493     _end(TimeHelper::counter_to_millis(end.value())) {}
+ 494 
+ 495 double ZStatMMUPause::end() const {
+ 496   return _end;
+ 497 }
+ 498 
+ 499 double ZStatMMUPause::overlap(double start, double end) const {
+ 500   const double start_max = MAX2(start, _start);
+ 501   const double end_min = MIN2(end, _end);
+ 502 
+ 503   if (end_min &gt; start_max) {
+ 504     // Overlap found
+ 505     return end_min - start_max;
+ 506   }
+ 507 
+ 508   // No overlap
+ 509   return 0.0;
+ 510 }
+ 511 
+ 512 size_t ZStatMMU::_next = 0;
+ 513 size_t ZStatMMU::_npauses = 0;
+ 514 ZStatMMUPause ZStatMMU::_pauses[200];
+ 515 double ZStatMMU::_mmu_2ms = 100.0;
+ 516 double ZStatMMU::_mmu_5ms = 100.0;
+ 517 double ZStatMMU::_mmu_10ms = 100.0;
+ 518 double ZStatMMU::_mmu_20ms = 100.0;
+ 519 double ZStatMMU::_mmu_50ms = 100.0;
+ 520 double ZStatMMU::_mmu_100ms = 100.0;
+ 521 
+ 522 const ZStatMMUPause&amp; ZStatMMU::pause(size_t index) {
+ 523   return _pauses[(_next - index - 1) % ARRAY_SIZE(_pauses)];
+ 524 }
+ 525 
+ 526 double ZStatMMU::calculate_mmu(double time_slice) {
+ 527   const double end = pause(0).end();
+ 528   const double start = end - time_slice;
+ 529   double time_paused = 0.0;
+ 530 
+ 531   // Find all overlapping pauses
+ 532   for (size_t i = 0; i &lt; _npauses; i++) {
+ 533     const double overlap = pause(i).overlap(start, end);
+ 534     if (overlap == 0.0) {
+ 535       // No overlap
+ 536       break;
+ 537     }
+ 538 
+ 539     time_paused += overlap;
+ 540   }
+ 541 
+ 542   // Calculate MMU
+ 543   const double time_mutator = time_slice - time_paused;
+ 544   return percent_of(time_mutator, time_slice);
+ 545 }
+ 546 
+ 547 void ZStatMMU::register_pause(const Ticks&amp; start, const Ticks&amp; end) {
+ 548   // Add pause
+ 549   const size_t index = _next++ % ARRAY_SIZE(_pauses);
+ 550   _pauses[index] = ZStatMMUPause(start, end);
+ 551   _npauses = MIN2(_npauses + 1, ARRAY_SIZE(_pauses));
+ 552 
+ 553   // Recalculate MMUs
+ 554   _mmu_2ms    = MIN2(_mmu_2ms,   calculate_mmu(2));
+ 555   _mmu_5ms    = MIN2(_mmu_5ms,   calculate_mmu(5));
+ 556   _mmu_10ms   = MIN2(_mmu_10ms,  calculate_mmu(10));
+ 557   _mmu_20ms   = MIN2(_mmu_20ms,  calculate_mmu(20));
+ 558   _mmu_50ms   = MIN2(_mmu_50ms,  calculate_mmu(50));
+ 559   _mmu_100ms  = MIN2(_mmu_100ms, calculate_mmu(100));
+ 560 }
+ 561 
+ 562 void ZStatMMU::print() {
+ 563   log_info(gc, mmu)(&quot;MMU: 2ms/%.1f%%, 5ms/%.1f%%, 10ms/%.1f%%, 20ms/%.1f%%, 50ms/%.1f%%, 100ms/%.1f%%&quot;,
+ 564                     _mmu_2ms, _mmu_5ms, _mmu_10ms, _mmu_20ms, _mmu_50ms, _mmu_100ms);
+ 565 }
+ 566 
+ 567 //
+ 568 // Stat phases
+ 569 //
+ 570 ConcurrentGCTimer ZStatPhase::_timer;
+ 571 
+ 572 ZStatPhase::ZStatPhase(const char* group, const char* name) :
+ 573     _sampler(group, name, ZStatUnitTime) {}
+ 574 
+ 575 void ZStatPhase::log_start(LogTargetHandle log, bool thread) const {
+ 576   if (!log.is_enabled()) {
+ 577     return;
+ 578   }
+ 579 
+ 580   if (thread) {
+ 581     ResourceMark rm;
+ 582     log.print(&quot;%s (%s)&quot;, name(), Thread::current()-&gt;name());
+ 583   } else {
+ 584     log.print(&quot;%s&quot;, name());
+ 585   }
+ 586 }
+ 587 
+ 588 void ZStatPhase::log_end(LogTargetHandle log, const Tickspan&amp; duration, bool thread) const {
+ 589   if (!log.is_enabled()) {
+ 590     return;
+ 591   }
+ 592 
+ 593   if (thread) {
+ 594     ResourceMark rm;
+ 595     log.print(&quot;%s (%s) %.3fms&quot;, name(), Thread::current()-&gt;name(), TimeHelper::counter_to_millis(duration.value()));
+ 596   } else {
+ 597     log.print(&quot;%s %.3fms&quot;, name(), TimeHelper::counter_to_millis(duration.value()));
+ 598   }
+ 599 }
+ 600 
+ 601 ConcurrentGCTimer* ZStatPhase::timer() {
+ 602   return &amp;_timer;
+ 603 }
+ 604 
+ 605 const char* ZStatPhase::name() const {
+ 606   return _sampler.name();
+ 607 }
+ 608 
+ 609 ZStatPhaseCycle::ZStatPhaseCycle(const char* name) :
+ 610     ZStatPhase(&quot;Collector&quot;, name) {}
+ 611 
+ 612 void ZStatPhaseCycle::register_start(const Ticks&amp; start) const {
+ 613   timer()-&gt;register_gc_start(start);
+ 614 
+ 615   ZTracer::tracer()-&gt;report_gc_start(ZCollectedHeap::heap()-&gt;gc_cause(), start);
+ 616 
+ 617   ZCollectedHeap::heap()-&gt;print_heap_before_gc();
+ 618   ZCollectedHeap::heap()-&gt;trace_heap_before_gc(ZTracer::tracer());
+ 619 
+ 620   log_info(gc, start)(&quot;Garbage Collection (%s)&quot;,
+ 621                        GCCause::to_string(ZCollectedHeap::heap()-&gt;gc_cause()));
+ 622 }
+ 623 
+ 624 #define ZUSED_FMT                       SIZE_FORMAT &quot;M(%.0lf%%)&quot;
+ 625 #define ZUSED_ARGS(size, max_capacity)  ((size) / M), (percent_of(size, max_capacity))
+ 626 
+ 627 void ZStatPhaseCycle::register_end(const Ticks&amp; start, const Ticks&amp; end) const {
+ 628   timer()-&gt;register_gc_end(end);
+ 629 
+ 630   ZCollectedHeap::heap()-&gt;print_heap_after_gc();
+ 631   ZCollectedHeap::heap()-&gt;trace_heap_after_gc(ZTracer::tracer());
+ 632 
+ 633   ZTracer::tracer()-&gt;report_gc_end(end, timer()-&gt;time_partitions());
+ 634 
+ 635   const Tickspan duration = end - start;
+ 636   ZStatSample(_sampler, duration.value());
+ 637 
+ 638   ZStatLoad::print();
+ 639   ZStatMMU::print();
+ 640   ZStatMark::print();
+ 641   ZStatRelocation::print();
+ 642   ZStatNMethods::print();
+ 643   ZStatMetaspace::print();
+ 644   ZStatReferences::print();
+ 645   ZStatHeap::print();
+ 646 
+ 647   log_info(gc)(&quot;Garbage Collection (%s) &quot; ZUSED_FMT &quot;-&gt;&quot; ZUSED_FMT,
+ 648                GCCause::to_string(ZCollectedHeap::heap()-&gt;gc_cause()),
+ 649                ZUSED_ARGS(ZStatHeap::used_at_mark_start(), ZStatHeap::max_capacity()),
+ 650                ZUSED_ARGS(ZStatHeap::used_at_relocate_end(), ZStatHeap::max_capacity()));
+ 651 }
+ 652 
+ 653 Tickspan ZStatPhasePause::_max;
+ 654 
+ 655 ZStatPhasePause::ZStatPhasePause(const char* name) :
+ 656     ZStatPhase(&quot;Phase&quot;, name) {}
+ 657 
+ 658 const Tickspan&amp; ZStatPhasePause::max() {
+ 659   return _max;
+ 660 }
+ 661 
+ 662 void ZStatPhasePause::register_start(const Ticks&amp; start) const {
+ 663   timer()-&gt;register_gc_pause_start(name(), start);
+ 664 
+ 665   LogTarget(Debug, gc, phases, start) log;
+ 666   log_start(log);
+ 667 }
+ 668 
+ 669 void ZStatPhasePause::register_end(const Ticks&amp; start, const Ticks&amp; end) const {
+ 670   timer()-&gt;register_gc_pause_end(end);
+ 671 
+ 672   const Tickspan duration = end - start;
+ 673   ZStatSample(_sampler, duration.value());
+ 674 
+ 675   // Track max pause time
+ 676   if (_max &lt; duration) {
+ 677     _max = duration;
+ 678   }
+ 679 
+ 680   // Track minimum mutator utilization
+ 681   ZStatMMU::register_pause(start, end);
+ 682 
+ 683   LogTarget(Info, gc, phases) log;
+ 684   log_end(log, duration);
+ 685 }
+ 686 
+ 687 ZStatPhaseConcurrent::ZStatPhaseConcurrent(const char* name) :
+ 688     ZStatPhase(&quot;Phase&quot;, name) {}
+ 689 
+ 690 void ZStatPhaseConcurrent::register_start(const Ticks&amp; start) const {
+ 691   timer()-&gt;register_gc_concurrent_start(name(), start);
+ 692 
+ 693   LogTarget(Debug, gc, phases, start) log;
+ 694   log_start(log);
+ 695 }
+ 696 
+ 697 void ZStatPhaseConcurrent::register_end(const Ticks&amp; start, const Ticks&amp; end) const {
+ 698   timer()-&gt;register_gc_concurrent_end(end);
+ 699 
+ 700   const Tickspan duration = end - start;
+ 701   ZStatSample(_sampler, duration.value());
+ 702 
+ 703   LogTarget(Info, gc, phases) log;
+ 704   log_end(log, duration);
+ 705 }
+ 706 
+ 707 ZStatSubPhase::ZStatSubPhase(const char* name) :
+ 708     ZStatPhase(&quot;Subphase&quot;, name) {}
+ 709 
+ 710 void ZStatSubPhase::register_start(const Ticks&amp; start) const {
+ 711   LogTarget(Debug, gc, phases, start) log;
+ 712   log_start(log, true /* thread */);
+ 713 }
+ 714 
+ 715 void ZStatSubPhase::register_end(const Ticks&amp; start, const Ticks&amp; end) const {
+ 716   ZTracer::tracer()-&gt;report_thread_phase(*this, start, end);
+ 717 
+ 718   const Tickspan duration = end - start;
+ 719   ZStatSample(_sampler, duration.value());
+ 720 
+ 721   LogTarget(Debug, gc, phases) log;
+ 722   log_end(log, duration, true /* thread */);
+ 723 }
+ 724 
+ 725 ZStatCriticalPhase::ZStatCriticalPhase(const char* name, bool verbose) :
+ 726     ZStatPhase(&quot;Critical&quot;, name),
+ 727     _counter(&quot;Critical&quot;, name, ZStatUnitOpsPerSecond),
+ 728     _verbose(verbose) {}
+ 729 
+ 730 void ZStatCriticalPhase::register_start(const Ticks&amp; start) const {
+ 731   LogTarget(Debug, gc, start) log;
+ 732   log_start(log, true /* thread */);
+ 733 }
+ 734 
+ 735 void ZStatCriticalPhase::register_end(const Ticks&amp; start, const Ticks&amp; end) const {
+ 736   ZTracer::tracer()-&gt;report_thread_phase(*this, start, end);
+ 737 
+ 738   const Tickspan duration = end - start;
+ 739   ZStatSample(_sampler, duration.value());
+ 740   ZStatInc(_counter);
+ 741 
+ 742   if (_verbose) {
+ 743     LogTarget(Info, gc) log;
+ 744     log_end(log, duration, true /* thread */);
+ 745   } else {
+ 746     LogTarget(Debug, gc) log;
+ 747     log_end(log, duration, true /* thread */);
+ 748   }
+ 749 }
+ 750 
+ 751 //
+ 752 // Stat sample/inc
+ 753 //
+ 754 void ZStatSample(const ZStatSampler&amp; sampler, uint64_t value, bool trace) {
+ 755   ZStatSamplerData* const cpu_data = sampler.get();
+ 756   Atomic::add(1u, &amp;cpu_data-&gt;_nsamples);
+ 757   Atomic::add(value, &amp;cpu_data-&gt;_sum);
+ 758 
+ 759   uint64_t max = cpu_data-&gt;_max;
+ 760   for (;;) {
+ 761     if (max &gt;= value) {
+ 762       // Not max
+ 763       break;
+ 764     }
+ 765 
+ 766     const uint64_t new_max = value;
+ 767     const uint64_t prev_max = Atomic::cmpxchg(new_max, &amp;cpu_data-&gt;_max, max);
+ 768     if (prev_max == max) {
+ 769       // Success
+ 770       break;
+ 771     }
+ 772 
+ 773     // Retry
+ 774     max = prev_max;
+ 775   }
+ 776 
+ 777   if (trace) {
+ 778     ZTracer::tracer()-&gt;report_stat_sampler(sampler, value);
+ 779   }
+ 780 }
+ 781 
+ 782 void ZStatInc(const ZStatCounter&amp; counter, uint64_t increment, bool trace) {
+ 783   ZStatCounterData* const cpu_data = counter.get();
+ 784   const uint64_t value = Atomic::add(increment, &amp;cpu_data-&gt;_counter);
+ 785 
+ 786   if (trace) {
+ 787     ZTracer::tracer()-&gt;report_stat_counter(counter, increment, value);
+ 788   }
+ 789 }
+ 790 
+ 791 void ZStatInc(const ZStatUnsampledCounter&amp; counter, uint64_t increment) {
+ 792   ZStatCounterData* const cpu_data = counter.get();
+ 793   Atomic::add(increment, &amp;cpu_data-&gt;_counter);
+ 794 }
+ 795 
+ 796 //
+ 797 // Stat allocation rate
+ 798 //
+ 799 const ZStatUnsampledCounter ZStatAllocRate::_counter(&quot;Allocation Rate&quot;);
+ 800 TruncatedSeq                ZStatAllocRate::_rate(ZStatAllocRate::sample_window_sec * ZStatAllocRate::sample_hz);
+ 801 TruncatedSeq                ZStatAllocRate::_rate_avg(ZStatAllocRate::sample_window_sec * ZStatAllocRate::sample_hz);
+ 802 
+ 803 const ZStatUnsampledCounter&amp; ZStatAllocRate::counter() {
+ 804   return _counter;
+ 805 }
+ 806 
+ 807 uint64_t ZStatAllocRate::sample_and_reset() {
+ 808   const ZStatCounterData bytes_per_sample = _counter.collect_and_reset();
+ 809   const uint64_t bytes_per_second = bytes_per_sample._counter * sample_hz;
+ 810 
+ 811   _rate.add(bytes_per_second);
+ 812   _rate_avg.add(_rate.avg());
+ 813 
+ 814   return bytes_per_second;
+ 815 }
+ 816 
+ 817 double ZStatAllocRate::avg() {
+ 818   return _rate.avg();
+ 819 }
+ 820 
+ 821 double ZStatAllocRate::avg_sd() {
+ 822   return _rate_avg.sd();
+ 823 }
+ 824 
+ 825 //
+ 826 // Stat thread
+ 827 //
+ 828 ZStat::ZStat() :
+ 829     _metronome(sample_hz) {
+ 830   set_name(&quot;ZStat&quot;);
+ 831   create_and_start();
+ 832 }
+ 833 
+ 834 void ZStat::sample_and_collect(ZStatSamplerHistory* history) const {
+ 835   // Sample counters
+ 836   for (const ZStatCounter* counter = ZStatCounter::first(); counter != NULL; counter = counter-&gt;next()) {
+ 837     counter-&gt;sample_and_reset();
+ 838   }
+ 839 
+ 840   // Collect samples
+ 841   for (const ZStatSampler* sampler = ZStatSampler::first(); sampler != NULL; sampler = sampler-&gt;next()) {
+ 842     ZStatSamplerHistory&amp; sampler_history = history[sampler-&gt;id()];
+ 843     sampler_history.add(sampler-&gt;collect_and_reset());
+ 844   }
+ 845 }
+ 846 
+ 847 bool ZStat::should_print(LogTargetHandle log) const {
+ 848   return log.is_enabled() &amp;&amp; (_metronome.nticks() % ZStatisticsInterval == 0);
+ 849 }
+ 850 
+ 851 void ZStat::print(LogTargetHandle log, const ZStatSamplerHistory* history) const {
+ 852   // Print
+ 853   log.print(&quot;=== Garbage Collection Statistics =======================================================================================================================&quot;);
+ 854   log.print(&quot;                                                             Last 10s              Last 10m              Last 10h                Total&quot;);
+ 855   log.print(&quot;                                                             Avg / Max             Avg / Max             Avg / Max             Avg / Max&quot;);
+ 856 
+ 857   for (const ZStatSampler* sampler = ZStatSampler::first(); sampler != NULL; sampler = sampler-&gt;next()) {
+ 858     const ZStatSamplerHistory&amp; sampler_history = history[sampler-&gt;id()];
+ 859     const ZStatUnitPrinter printer = sampler-&gt;printer();
+ 860     printer(log, *sampler, sampler_history);
+ 861   }
+ 862 
+ 863   log.print(&quot;=========================================================================================================================================================&quot;);
+ 864 }
+ 865 
+ 866 void ZStat::run_service() {
+ 867   ZStatSamplerHistory* const history = new ZStatSamplerHistory[ZStatSampler::count()];
+ 868   LogTarget(Info, gc, stats) log;
+ 869 
+ 870   // Main loop
+ 871   while (_metronome.wait_for_tick()) {
+ 872     sample_and_collect(history);
+ 873     if (should_print(log)) {
+ 874       print(log, history);
+ 875     }
+ 876   }
+ 877 
+ 878   delete [] history;
+ 879 }
+ 880 
+ 881 void ZStat::stop_service() {
+ 882   _metronome.stop();
+ 883 }
+ 884 
+ 885 //
+ 886 // Stat table
+ 887 //
+ 888 class ZStatTablePrinter {
+ 889 private:
+ 890   static const size_t _buffer_size = 256;
+ 891 
+ 892   const size_t _column0_width;
+ 893   const size_t _columnN_width;
+ 894   char         _buffer[_buffer_size];
+ 895 
+ 896 public:
+ 897   class ZColumn {
+ 898   private:
+ 899     char* const  _buffer;
+ 900     const size_t _position;
+ 901     const size_t _width;
+ 902     const size_t _width_next;
+ 903 
+ 904     ZColumn next() const {
+ 905       // Insert space between columns
+ 906       _buffer[_position + _width] = &#39; &#39;;
+ 907       return ZColumn(_buffer, _position + _width + 1, _width_next, _width_next);
+ 908     }
+ 909 
+ 910     size_t print(size_t position, const char* fmt, va_list va) {
+ 911       const int res = jio_vsnprintf(_buffer + position, _buffer_size - position, fmt, va);
+ 912       if (res &lt; 0) {
+ 913         return 0;
+ 914       }
+ 915 
+ 916       return (size_t)res;
+ 917     }
+ 918 
+ 919   public:
+ 920     ZColumn(char* buffer, size_t position, size_t width, size_t width_next) :
+ 921         _buffer(buffer),
+ 922         _position(position),
+ 923         _width(width),
+ 924         _width_next(width_next) {}
+ 925 
+ 926     ZColumn left(const char* fmt, ...) ATTRIBUTE_PRINTF(2, 3) {
+ 927       va_list va;
+ 928 
+ 929       va_start(va, fmt);
+ 930       const size_t written = print(_position, fmt, va);
+ 931       va_end(va);
+ 932 
+ 933       if (written &lt; _width) {
+ 934         // Fill empty space
+ 935         memset(_buffer + _position + written, &#39; &#39;, _width - written);
+ 936       }
+ 937 
+ 938       return next();
+ 939     }
+ 940 
+ 941     ZColumn right(const char* fmt, ...) ATTRIBUTE_PRINTF(2, 3) {
+ 942       va_list va;
+ 943 
+ 944       va_start(va, fmt);
+ 945       const size_t written = print(_position, fmt, va);
+ 946       va_end(va);
+ 947 
+ 948       if (written &gt; _width) {
+ 949         // Line too long
+ 950         return fill(&#39;?&#39;);
+ 951       }
+ 952 
+ 953       if (written &lt; _width) {
+ 954         // Short line, move all to right
+ 955         memmove(_buffer + _position + _width - written, _buffer + _position, written);
+ 956 
+ 957         // Fill empty space
+ 958         memset(_buffer + _position, &#39; &#39;, _width - written);
+ 959       }
+ 960 
+ 961       return next();
+ 962     }
+ 963 
+ 964     ZColumn center(const char* fmt, ...) ATTRIBUTE_PRINTF(2, 3) {
+ 965       va_list va;
+ 966 
+ 967       va_start(va, fmt);
+ 968       const size_t written = print(_position, fmt, va);
+ 969       va_end(va);
+ 970 
+ 971       if (written &gt; _width) {
+ 972         // Line too long
+ 973         return fill(&#39;?&#39;);
+ 974       }
+ 975 
+ 976       if (written &lt; _width) {
+ 977         // Short line, move all to center
+ 978         const size_t start_space = (_width - written) / 2;
+ 979         const size_t end_space = _width - written - start_space;
+ 980         memmove(_buffer + _position + start_space, _buffer + _position, written);
+ 981 
+ 982         // Fill empty spaces
+ 983         memset(_buffer + _position, &#39; &#39;, start_space);
+ 984         memset(_buffer + _position + start_space + written, &#39; &#39;, end_space);
+ 985       }
+ 986 
+ 987       return next();
+ 988     }
+ 989 
+ 990     ZColumn fill(char filler = &#39; &#39;) {
+ 991       memset(_buffer + _position, filler, _width);
+ 992       return next();
+ 993     }
+ 994 
+ 995     const char* end() {
+ 996       _buffer[_position] = &#39;\0&#39;;
+ 997       return _buffer;
+ 998     }
+ 999   };
+1000 
+1001 public:
+1002   ZStatTablePrinter(size_t column0_width, size_t columnN_width) :
+1003       _column0_width(column0_width),
+1004       _columnN_width(columnN_width) {}
+1005 
+1006   ZColumn operator()() {
+1007     return ZColumn(_buffer, 0, _column0_width, _columnN_width);
+1008   }
+1009 };
+1010 
+1011 //
+1012 // Stat cycle
+1013 //
+1014 uint64_t  ZStatCycle::_ncycles = 0;
+1015 Ticks     ZStatCycle::_start_of_last;
+1016 Ticks     ZStatCycle::_end_of_last;
+1017 NumberSeq ZStatCycle::_normalized_duration(0.3 /* alpha */);
+1018 
+1019 void ZStatCycle::at_start() {
+1020   _start_of_last = Ticks::now();
+1021 }
+1022 
+1023 void ZStatCycle::at_end(double boost_factor) {
+1024   _end_of_last = Ticks::now();
+1025   _ncycles++;
+1026 
+1027   // Calculate normalized cycle duration. The measured duration is
+1028   // normalized using the boost factor to avoid artificial deflation
+1029   // of the duration when boost mode is enabled.
+1030   const double duration = (_end_of_last - _start_of_last).seconds();
+1031   const double normalized_duration = duration * boost_factor;
+1032   _normalized_duration.add(normalized_duration);
+1033 }
+1034 
+1035 uint64_t ZStatCycle::ncycles() {
+1036   return _ncycles;
+1037 }
+1038 
+1039 const AbsSeq&amp; ZStatCycle::normalized_duration() {
+1040   return _normalized_duration;
+1041 }
+1042 
+1043 double ZStatCycle::time_since_last() {
+1044   if (_ncycles == 0) {
+1045     // Return time since VM start-up
+1046     return os::elapsedTime();
+1047   }
+1048 
+1049   const Ticks now = Ticks::now();
+1050   const Tickspan time_since_last = now - _end_of_last;
+1051   return time_since_last.seconds();
+1052 }
+1053 
+1054 //
+1055 // Stat load
+1056 //
+1057 void ZStatLoad::print() {
+1058   double loadavg[3] = {};
+1059   os::loadavg(loadavg, ARRAY_SIZE(loadavg));
+1060   log_info(gc, load)(&quot;Load: %.2f/%.2f/%.2f&quot;, loadavg[0], loadavg[1], loadavg[2]);
+1061 }
+1062 
+1063 //
+1064 // Stat mark
+1065 //
+1066 size_t ZStatMark::_nstripes;
+1067 size_t ZStatMark::_nproactiveflush;
+1068 size_t ZStatMark::_nterminateflush;
+1069 size_t ZStatMark::_ntrycomplete;
+1070 size_t ZStatMark::_ncontinue;
+1071 
+1072 void ZStatMark::set_at_mark_start(size_t nstripes) {
+1073   _nstripes = nstripes;
+1074 }
+1075 
+1076 void ZStatMark::set_at_mark_end(size_t nproactiveflush,
+1077                                 size_t nterminateflush,
+1078                                 size_t ntrycomplete,
+1079                                 size_t ncontinue) {
+1080   _nproactiveflush = nproactiveflush;
+1081   _nterminateflush = nterminateflush;
+1082   _ntrycomplete = ntrycomplete;
+1083   _ncontinue = ncontinue;
+1084 }
+1085 
+1086 void ZStatMark::print() {
+1087   log_info(gc, marking)(&quot;Mark: &quot;
+1088                         SIZE_FORMAT &quot; stripe(s), &quot;
+1089                         SIZE_FORMAT &quot; proactive flush(es), &quot;
+1090                         SIZE_FORMAT &quot; terminate flush(es), &quot;
+1091                         SIZE_FORMAT &quot; completion(s), &quot;
+1092                         SIZE_FORMAT &quot; continuation(s) &quot;,
+1093                         _nstripes,
+1094                         _nproactiveflush,
+1095                         _nterminateflush,
+1096                         _ntrycomplete,
+1097                         _ncontinue);
+1098 }
+1099 
+1100 //
+1101 // Stat relocation
+1102 //
+1103 size_t ZStatRelocation::_relocating;
+1104 bool ZStatRelocation::_success;
+1105 
+1106 void ZStatRelocation::set_at_select_relocation_set(size_t relocating) {
+1107   _relocating = relocating;
+1108 }
+1109 
+1110 void ZStatRelocation::set_at_relocate_end(bool success) {
+1111   _success = success;
+1112 }
+1113 
+1114 void ZStatRelocation::print() {
+1115   if (_success) {
+1116     log_info(gc, reloc)(&quot;Relocation: Successful, &quot; SIZE_FORMAT &quot;M relocated&quot;, _relocating / M);
+1117   } else {
+1118     log_info(gc, reloc)(&quot;Relocation: Incomplete&quot;);
+1119   }
+1120 }
+1121 
+1122 //
+1123 // Stat nmethods
+1124 //
+1125 void ZStatNMethods::print() {
+1126   log_info(gc, nmethod)(&quot;NMethods: &quot; SIZE_FORMAT &quot; registered, &quot; SIZE_FORMAT &quot; unregistered&quot;,
+1127                         ZNMethodTable::registered_nmethods(),
+1128                         ZNMethodTable::unregistered_nmethods());
+1129 }
+1130 
+1131 //
+1132 // Stat metaspace
+1133 //
+1134 void ZStatMetaspace::print() {
+1135   log_info(gc, metaspace)(&quot;Metaspace: &quot;
+1136                           SIZE_FORMAT &quot;M used, &quot; SIZE_FORMAT &quot;M capacity, &quot;
+1137                           SIZE_FORMAT &quot;M committed, &quot; SIZE_FORMAT &quot;M reserved&quot;,
+1138                           MetaspaceUtils::used_bytes() / M,
+1139                           MetaspaceUtils::capacity_bytes() / M,
+1140                           MetaspaceUtils::committed_bytes() / M,
+1141                           MetaspaceUtils::reserved_bytes() / M);
+1142 }
+1143 
+1144 //
+1145 // Stat references
+1146 //
+1147 ZStatReferences::ZCount ZStatReferences::_soft;
+1148 ZStatReferences::ZCount ZStatReferences::_weak;
+1149 ZStatReferences::ZCount ZStatReferences::_final;
+1150 ZStatReferences::ZCount ZStatReferences::_phantom;
+1151 
+1152 void ZStatReferences::set(ZCount* count, size_t encountered, size_t discovered, size_t enqueued) {
+1153   count-&gt;encountered = encountered;
+1154   count-&gt;discovered = discovered;
+1155   count-&gt;enqueued = enqueued;
+1156 }
+1157 
+1158 void ZStatReferences::set_soft(size_t encountered, size_t discovered, size_t enqueued) {
+1159   set(&amp;_soft, encountered, discovered, enqueued);
+1160 }
+1161 
+1162 void ZStatReferences::set_weak(size_t encountered, size_t discovered, size_t enqueued) {
+1163   set(&amp;_weak, encountered, discovered, enqueued);
+1164 }
+1165 
+1166 void ZStatReferences::set_final(size_t encountered, size_t discovered, size_t enqueued) {
+1167   set(&amp;_final, encountered, discovered, enqueued);
+1168 }
+1169 
+1170 void ZStatReferences::set_phantom(size_t encountered, size_t discovered, size_t enqueued) {
+1171   set(&amp;_phantom, encountered, discovered, enqueued);
+1172 }
+1173 
+1174 void ZStatReferences::print(const char* name, const ZStatReferences::ZCount&amp; ref) {
+1175   log_info(gc, ref)(&quot;%s: &quot;
+1176                     SIZE_FORMAT &quot; encountered, &quot;
+1177                     SIZE_FORMAT &quot; discovered, &quot;
+1178                     SIZE_FORMAT &quot; enqueued&quot;,
+1179                     name,
+1180                     ref.encountered,
+1181                     ref.discovered,
+1182                     ref.enqueued);
+1183 }
+1184 
+1185 void ZStatReferences::print() {
+1186   print(&quot;Soft&quot;, _soft);
+1187   print(&quot;Weak&quot;, _weak);
+1188   print(&quot;Final&quot;, _final);
+1189   print(&quot;Phantom&quot;, _phantom);
+1190 }
+1191 
+1192 //
+1193 // Stat heap
+1194 //
+1195 ZStatHeap::ZAtInitialize ZStatHeap::_at_initialize;
+1196 ZStatHeap::ZAtMarkStart ZStatHeap::_at_mark_start;
+1197 ZStatHeap::ZAtMarkEnd ZStatHeap::_at_mark_end;
+1198 ZStatHeap::ZAtRelocateStart ZStatHeap::_at_relocate_start;
+1199 ZStatHeap::ZAtRelocateEnd ZStatHeap::_at_relocate_end;
+1200 
+1201 #define ZSIZE_NA               &quot;%9s&quot;, &quot;-&quot;
+1202 #define ZSIZE_ARGS(size)       SIZE_FORMAT_W(8) &quot;M (%.0lf%%)&quot;, \
+1203                                ((size) / M), (percent_of(size, _at_initialize.max_capacity))
+1204 
+1205 size_t ZStatHeap::available(size_t used) {
+1206   return _at_initialize.max_capacity - used;
+1207 }
+1208 
+1209 size_t ZStatHeap::reserve(size_t used) {
+1210   return MIN2(_at_initialize.max_reserve, available(used));
+1211 }
+1212 
+1213 size_t ZStatHeap::free(size_t used) {
+1214   return available(used) - reserve(used);
+1215 }
+1216 
+1217 void ZStatHeap::set_at_initialize(size_t max_capacity,
+1218                                   size_t max_reserve) {
+1219   _at_initialize.max_capacity = max_capacity;
+1220   _at_initialize.max_reserve = max_reserve;
+1221 }
+1222 
+1223 void ZStatHeap::set_at_mark_start(size_t capacity,
+1224                                   size_t used) {
+1225   _at_mark_start.capacity = capacity;
+1226   _at_mark_start.reserve = reserve(used);
+1227   _at_mark_start.used = used;
+1228   _at_mark_start.free = free(used);
+1229 }
+1230 
+1231 void ZStatHeap::set_at_mark_end(size_t capacity,
+1232                                 size_t allocated,
+1233                                 size_t used) {
+1234   _at_mark_end.capacity = capacity;
+1235   _at_mark_end.reserve = reserve(used);
+1236   _at_mark_end.allocated = allocated;
+1237   _at_mark_end.used = used;
+1238   _at_mark_end.free = free(used);
+1239 }
+1240 
+1241 void ZStatHeap::set_at_select_relocation_set(size_t live,
+1242                                              size_t garbage,
+1243                                              size_t reclaimed) {
+1244   _at_mark_end.live = live;
+1245   _at_mark_end.garbage = garbage;
+1246 
+1247   _at_relocate_start.garbage = garbage - reclaimed;
+1248   _at_relocate_start.reclaimed = reclaimed;
+1249 }
+1250 
+1251 void ZStatHeap::set_at_relocate_start(size_t capacity,
+1252                                       size_t allocated,
+1253                                       size_t used) {
+1254   _at_relocate_start.capacity = capacity;
+1255   _at_relocate_start.reserve = reserve(used);
+1256   _at_relocate_start.allocated = allocated;
+1257   _at_relocate_start.used = used;
+1258   _at_relocate_start.free = free(used);
+1259 }
+1260 
+1261 void ZStatHeap::set_at_relocate_end(size_t capacity,
+1262                                     size_t allocated,
+1263                                     size_t reclaimed,
+1264                                     size_t used,
+1265                                     size_t used_high,
+1266                                     size_t used_low) {
+1267   _at_relocate_end.capacity = capacity;
+1268   _at_relocate_end.capacity_high = capacity;
+1269   _at_relocate_end.capacity_low = _at_mark_start.capacity;
+1270   _at_relocate_end.reserve = reserve(used);
+1271   _at_relocate_end.reserve_high = reserve(used_low);
+1272   _at_relocate_end.reserve_low = reserve(used_high);
+1273   _at_relocate_end.garbage = _at_mark_end.garbage - reclaimed;
+1274   _at_relocate_end.allocated = allocated;
+1275   _at_relocate_end.reclaimed = reclaimed;
+1276   _at_relocate_end.used = used;
+1277   _at_relocate_end.used_high = used_high;
+1278   _at_relocate_end.used_low = used_low;
+1279   _at_relocate_end.free = free(used);
+1280   _at_relocate_end.free_high = free(used_low);
+1281   _at_relocate_end.free_low = free(used_high);
+1282 }
+1283 
+1284 size_t ZStatHeap::max_capacity() {
+1285   return _at_initialize.max_capacity;
+1286 }
+1287 
+1288 size_t ZStatHeap::used_at_mark_start() {
+1289   return _at_mark_start.used;
+1290 }
+1291 
+1292 size_t ZStatHeap::used_at_relocate_end() {
+1293   return _at_relocate_end.used;
+1294 }
+1295 
+1296 void ZStatHeap::print() {
+1297   ZStatTablePrinter table(10, 18);
+1298   log_info(gc, heap)(&quot;%s&quot;, table()
+1299                      .fill()
+1300                      .center(&quot;Mark Start&quot;)
+1301                      .center(&quot;Mark End&quot;)
+1302                      .center(&quot;Relocate Start&quot;)
+1303                      .center(&quot;Relocate End&quot;)
+1304                      .center(&quot;High&quot;)
+1305                      .center(&quot;Low&quot;)
+1306                      .end());
+1307   log_info(gc, heap)(&quot;%s&quot;, table()
+1308                      .right(&quot;Capacity:&quot;)
+1309                      .left(ZSIZE_ARGS(_at_mark_start.capacity))
+1310                      .left(ZSIZE_ARGS(_at_mark_end.capacity))
+1311                      .left(ZSIZE_ARGS(_at_relocate_start.capacity))
+1312                      .left(ZSIZE_ARGS(_at_relocate_end.capacity))
+1313                      .left(ZSIZE_ARGS(_at_relocate_end.capacity_high))
+1314                      .left(ZSIZE_ARGS(_at_relocate_end.capacity_low))
+1315                      .end());
+1316   log_info(gc, heap)(&quot;%s&quot;, table()
+1317                      .right(&quot;Reserve:&quot;)
+1318                      .left(ZSIZE_ARGS(_at_mark_start.reserve))
+1319                      .left(ZSIZE_ARGS(_at_mark_end.reserve))
+1320                      .left(ZSIZE_ARGS(_at_relocate_start.reserve))
+1321                      .left(ZSIZE_ARGS(_at_relocate_end.reserve))
+1322                      .left(ZSIZE_ARGS(_at_relocate_end.reserve_high))
+1323                      .left(ZSIZE_ARGS(_at_relocate_end.reserve_low))
+1324                      .end());
+1325   log_info(gc, heap)(&quot;%s&quot;, table()
+1326                      .right(&quot;Free:&quot;)
+1327                      .left(ZSIZE_ARGS(_at_mark_start.free))
+1328                      .left(ZSIZE_ARGS(_at_mark_end.free))
+1329                      .left(ZSIZE_ARGS(_at_relocate_start.free))
+1330                      .left(ZSIZE_ARGS(_at_relocate_end.free))
+1331                      .left(ZSIZE_ARGS(_at_relocate_end.free_high))
+1332                      .left(ZSIZE_ARGS(_at_relocate_end.free_low))
+1333                      .end());
+1334   log_info(gc, heap)(&quot;%s&quot;, table()
+1335                      .right(&quot;Used:&quot;)
+1336                      .left(ZSIZE_ARGS(_at_mark_start.used))
+1337                      .left(ZSIZE_ARGS(_at_mark_end.used))
+1338                      .left(ZSIZE_ARGS(_at_relocate_start.used))
+1339                      .left(ZSIZE_ARGS(_at_relocate_end.used))
+1340                      .left(ZSIZE_ARGS(_at_relocate_end.used_high))
+1341                      .left(ZSIZE_ARGS(_at_relocate_end.used_low))
+1342                      .end());
+1343   log_info(gc, heap)(&quot;%s&quot;, table()
+1344                      .right(&quot;Live:&quot;)
+1345                      .left(ZSIZE_NA)
+1346                      .left(ZSIZE_ARGS(_at_mark_end.live))
+1347                      .left(ZSIZE_ARGS(_at_mark_end.live /* Same as at mark end */))
+1348                      .left(ZSIZE_ARGS(_at_mark_end.live /* Same as at mark end */))
+1349                      .left(ZSIZE_NA)
+1350                      .left(ZSIZE_NA)
+1351                      .end());
+1352   log_info(gc, heap)(&quot;%s&quot;, table()
+1353                      .right(&quot;Allocated:&quot;)
+1354                      .left(ZSIZE_NA)
+1355                      .left(ZSIZE_ARGS(_at_mark_end.allocated))
+1356                      .left(ZSIZE_ARGS(_at_relocate_start.allocated))
+1357                      .left(ZSIZE_ARGS(_at_relocate_end.allocated))
+1358                      .left(ZSIZE_NA)
+1359                      .left(ZSIZE_NA)
+1360                      .end());
+1361   log_info(gc, heap)(&quot;%s&quot;, table()
+1362                      .right(&quot;Garbage:&quot;)
+1363                      .left(ZSIZE_NA)
+1364                      .left(ZSIZE_ARGS(_at_mark_end.garbage))
+1365                      .left(ZSIZE_ARGS(_at_relocate_start.garbage))
+1366                      .left(ZSIZE_ARGS(_at_relocate_end.garbage))
+1367                      .left(ZSIZE_NA)
+1368                      .left(ZSIZE_NA)
+1369                      .end());
+1370   log_info(gc, heap)(&quot;%s&quot;, table()
+1371                      .right(&quot;Reclaimed:&quot;)
+1372                      .left(ZSIZE_NA)
+1373                      .left(ZSIZE_NA)
+1374                      .left(ZSIZE_ARGS(_at_relocate_start.reclaimed))
+1375                      .left(ZSIZE_ARGS(_at_relocate_end.reclaimed))
+1376                      .left(ZSIZE_NA)
+1377                      .left(ZSIZE_NA)
+1378                      .end());
+1379 }
+    </pre>
+  </body>
+</html>
