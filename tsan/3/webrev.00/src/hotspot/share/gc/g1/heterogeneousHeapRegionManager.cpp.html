@@ -1,0 +1,535 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>New src/hotspot/share/gc/g1/heterogeneousHeapRegionManager.cpp</title>
+    <link rel="stylesheet" href="../../../../../style.css" />
+  </head>
+  <body>
+    <pre>
+  1 /*
+  2  * Copyright (c) 2018, 2019, Oracle and/or its affiliates. All rights reserved.
+  3  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  4  *
+  5  * This code is free software; you can redistribute it and/or modify it
+  6  * under the terms of the GNU General Public License version 2 only, as
+  7  * published by the Free Software Foundation.
+  8  *
+  9  * This code is distributed in the hope that it will be useful, but WITHOUT
+ 10  * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ 11  * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ 12  * version 2 for more details (a copy is included in the LICENSE file that
+ 13  * accompanied this code).
+ 14  *
+ 15  * You should have received a copy of the GNU General Public License version
+ 16  * 2 along with this work; if not, write to the Free Software Foundation,
+ 17  * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ 18  *
+ 19  * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ 20  * or visit www.oracle.com if you need additional information or have any
+ 21  * questions.
+ 22  *
+ 23  */
+ 24 
+ 25 #include &quot;precompiled.hpp&quot;
+ 26 #include &quot;gc/g1/g1CollectedHeap.inline.hpp&quot;
+ 27 #include &quot;gc/g1/g1ConcurrentRefine.hpp&quot;
+ 28 #include &quot;gc/g1/heapRegion.hpp&quot;
+ 29 #include &quot;gc/g1/heapRegionManager.inline.hpp&quot;
+ 30 #include &quot;gc/g1/heapRegionSet.inline.hpp&quot;
+ 31 #include &quot;gc/g1/heterogeneousHeapRegionManager.hpp&quot;
+ 32 #include &quot;memory/allocation.hpp&quot;
+ 33 
+ 34 
+ 35 HeterogeneousHeapRegionManager* HeterogeneousHeapRegionManager::manager() {
+ 36   G1CollectedHeap* g1h = G1CollectedHeap::heap();
+ 37   assert(g1h != NULL, &quot;Uninitialized access to HeterogeneousHeapRegionManager::manager()&quot;);
+ 38 
+ 39   HeapRegionManager* hrm = g1h-&gt;hrm();
+ 40   assert(hrm != NULL, &quot;Uninitialized access to HeterogeneousHeapRegionManager::manager()&quot;);
+ 41   return (HeterogeneousHeapRegionManager*)hrm;
+ 42 }
+ 43 
+ 44 void HeterogeneousHeapRegionManager::initialize(G1RegionToSpaceMapper* heap_storage,
+ 45                                                 G1RegionToSpaceMapper* prev_bitmap,
+ 46                                                 G1RegionToSpaceMapper* next_bitmap,
+ 47                                                 G1RegionToSpaceMapper* bot,
+ 48                                                 G1RegionToSpaceMapper* cardtable,
+ 49                                                 G1RegionToSpaceMapper* card_counts) {
+ 50   HeapRegionManager::initialize(heap_storage, prev_bitmap, next_bitmap, bot, cardtable, card_counts);
+ 51 
+ 52   // We commit bitmap for all regions during initialization and mark the bitmap space as special.
+ 53   // This allows regions to be un-committed while concurrent-marking threads are accessing the bitmap concurrently.
+ 54   _prev_bitmap_mapper-&gt;commit_and_set_special();
+ 55   _next_bitmap_mapper-&gt;commit_and_set_special();
+ 56 }
+ 57 
+ 58 // expand_by() is called to grow the heap. We grow into nvdimm now.
+ 59 // Dram regions are committed later as needed during mutator region allocation or
+ 60 // when young list target length is determined after gc cycle.
+ 61 uint HeterogeneousHeapRegionManager::expand_by(uint num_regions, WorkGang* pretouch_workers) {
+ 62   uint num_regions_possible = total_regions_committed() &gt;= max_expandable_length() ? 0 : max_expandable_length() - total_regions_committed();
+ 63   uint num_expanded = expand_nvdimm(MIN2(num_regions, num_regions_possible), pretouch_workers);
+ 64   return num_expanded;
+ 65 }
+ 66 
+ 67 // Expands heap starting from &#39;start&#39; index. The question is should we expand from one memory (e.g. nvdimm) to another (e.g. dram).
+ 68 // Looking at the code, expand_at() is called for humongous allocation where &#39;start&#39; is in nv-dimm.
+ 69 // So we only allocate regions in the same kind of memory as &#39;start&#39;.
+ 70 uint HeterogeneousHeapRegionManager::expand_at(uint start, uint num_regions, WorkGang* pretouch_workers) {
+ 71   if (num_regions == 0) {
+ 72     return 0;
+ 73   }
+ 74   uint target_num_regions = MIN2(num_regions, max_expandable_length() - total_regions_committed());
+ 75   uint end = is_in_nvdimm(start) ? end_index_of_nvdimm() : end_index_of_dram();
+ 76 
+ 77   uint num_expanded = expand_in_range(start, end, target_num_regions, pretouch_workers);
+ 78   assert(total_regions_committed() &lt;= max_expandable_length(), &quot;must be&quot;);
+ 79   return num_expanded;
+ 80 }
+ 81 
+ 82 // This function ensures that there are &#39;expected_num_regions&#39; committed regions in dram.
+ 83 // If new regions are committed, it un-commits that many regions from nv-dimm.
+ 84 // If there are already more regions committed in dram, extra regions are un-committed.
+ 85 void HeterogeneousHeapRegionManager::adjust_dram_regions(uint expected_num_regions, WorkGang* pretouch_workers) {
+ 86 
+ 87   // Release back the extra regions allocated in evacuation failure scenario.
+ 88   if(_no_borrowed_regions &gt; 0) {
+ 89     _no_borrowed_regions -= shrink_dram(_no_borrowed_regions);
+ 90     _no_borrowed_regions -= shrink_nvdimm(_no_borrowed_regions);
+ 91   }
+ 92 
+ 93   if(expected_num_regions &gt; free_list_dram_length()) {
+ 94     // If we are going to expand DRAM, we expand a little more so that we can absorb small variations in Young gen sizing.
+ 95     uint targeted_dram_regions = expected_num_regions * (1 + (double)G1YoungExpansionBufferPercent / 100);
+ 96     uint to_be_made_available = targeted_dram_regions - free_list_dram_length();
+ 97 
+ 98 #ifdef ASSERT
+ 99     uint total_committed_before = total_regions_committed();
+100 #endif
+101     uint can_be_made_available = shrink_nvdimm(to_be_made_available);
+102     uint ret = expand_dram(can_be_made_available, pretouch_workers);
+103 #ifdef ASSERT
+104     assert(ret == can_be_made_available, &quot;should be equal&quot;);
+105     assert(total_committed_before == total_regions_committed(), &quot;invariant not met&quot;);
+106 #endif
+107   } else {
+108     uint to_be_released = free_list_dram_length() - expected_num_regions;
+109     // if number of extra DRAM regions is small, do not shrink.
+110     if (to_be_released &lt; expected_num_regions * G1YoungExpansionBufferPercent / 100) {
+111       return;
+112     }
+113 
+114 #ifdef ASSERT
+115     uint total_committed_before = total_regions_committed();
+116 #endif
+117     uint ret = shrink_dram(to_be_released);
+118     assert(ret == to_be_released, &quot;Should be able to shrink by given amount&quot;);
+119     ret = expand_nvdimm(to_be_released, pretouch_workers);
+120 #ifdef ASSERT
+121     assert(ret == to_be_released, &quot;Should be able to expand by given amount&quot;);
+122     assert(total_committed_before == total_regions_committed(), &quot;invariant not met&quot;);
+123 #endif
+124   }
+125 }
+126 
+127 uint HeterogeneousHeapRegionManager::total_regions_committed() const {
+128   return num_committed_dram() + num_committed_nvdimm();
+129 }
+130 
+131 uint HeterogeneousHeapRegionManager::num_committed_dram() const {
+132   // This class does not keep count of committed regions in dram and nv-dimm.
+133   // G1RegionToHeteroSpaceMapper keeps this information.
+134   return static_cast&lt;G1RegionToHeteroSpaceMapper*&gt;(_heap_mapper)-&gt;num_committed_dram();
+135 }
+136 
+137 uint HeterogeneousHeapRegionManager::num_committed_nvdimm() const {
+138   // See comment for num_committed_dram()
+139   return static_cast&lt;G1RegionToHeteroSpaceMapper*&gt;(_heap_mapper)-&gt;num_committed_nvdimm();
+140 }
+141 
+142 // Return maximum number of regions that heap can expand to.
+143 uint HeterogeneousHeapRegionManager::max_expandable_length() const {
+144   return _max_regions;
+145 }
+146 
+147 uint HeterogeneousHeapRegionManager::find_unavailable_in_range(uint start_idx, uint end_idx, uint* res_idx) const {
+148   guarantee(res_idx != NULL, &quot;checking&quot;);
+149   guarantee(start_idx &lt;= (max_length() + 1), &quot;checking&quot;);
+150 
+151   uint num_regions = 0;
+152 
+153   uint cur = start_idx;
+154   while (cur &lt;= end_idx &amp;&amp; is_available(cur)) {
+155     cur++;
+156   }
+157   if (cur == end_idx + 1) {
+158     return num_regions;
+159   }
+160   *res_idx = cur;
+161   while (cur &lt;= end_idx &amp;&amp; !is_available(cur)) {
+162     cur++;
+163   }
+164   num_regions = cur - *res_idx;
+165 
+166 #ifdef ASSERT
+167   for (uint i = *res_idx; i &lt; (*res_idx + num_regions); i++) {
+168     assert(!is_available(i), &quot;just checking&quot;);
+169   }
+170   assert(cur == end_idx + 1 || num_regions == 0 || is_available(cur),
+171     &quot;The region at the current position %u must be available or at the end&quot;, cur);
+172 #endif
+173   return num_regions;
+174 }
+175 
+176 uint HeterogeneousHeapRegionManager::expand_dram(uint num_regions, WorkGang* pretouch_workers) {
+177   return expand_in_range(start_index_of_dram(), end_index_of_dram(), num_regions, pretouch_workers);
+178 }
+179 
+180 uint HeterogeneousHeapRegionManager::expand_nvdimm(uint num_regions, WorkGang* pretouch_workers) {
+181   return expand_in_range(start_index_of_nvdimm(), end_index_of_nvdimm(), num_regions, pretouch_workers);
+182 }
+183 
+184 // Follows same logic as expand_at() form HeapRegionManager.
+185 uint HeterogeneousHeapRegionManager::expand_in_range(uint start, uint end, uint num_regions, WorkGang* pretouch_gang) {
+186 
+187   uint so_far = 0;
+188   uint chunk_start = 0;
+189   uint num_last_found = 0;
+190   while (so_far &lt; num_regions &amp;&amp;
+191          (num_last_found = find_unavailable_in_range(start, end, &amp;chunk_start)) &gt; 0) {
+192     uint to_commit = MIN2(num_regions - so_far, num_last_found);
+193     make_regions_available(chunk_start, to_commit, pretouch_gang);
+194     so_far += to_commit;
+195     start = chunk_start + to_commit + 1;
+196   }
+197 
+198   return so_far;
+199 }
+200 
+201 // Shrink in the range of indexes which are reserved for dram.
+202 uint HeterogeneousHeapRegionManager::shrink_dram(uint num_regions, bool update_free_list) {
+203   return shrink_in_range(start_index_of_dram(), end_index_of_dram(), num_regions, update_free_list);
+204 }
+205 
+206 // Shrink in the range of indexes which are reserved for nv-dimm.
+207 uint HeterogeneousHeapRegionManager::shrink_nvdimm(uint num_regions, bool update_free_list) {
+208   return shrink_in_range(start_index_of_nvdimm(), end_index_of_nvdimm(), num_regions, update_free_list);
+209 }
+210 
+211 // Find empty regions in given range, un-commit them and return the count.
+212 uint HeterogeneousHeapRegionManager::shrink_in_range(uint start, uint end, uint num_regions, bool update_free_list) {
+213 
+214   if (num_regions == 0) {
+215     return 0;
+216   }
+217   uint so_far = 0;
+218   uint idx_last_found = 0;
+219   uint num_last_found;
+220   while (so_far &lt; num_regions &amp;&amp;
+221          (num_last_found = find_empty_in_range_reverse(start, end, &amp;idx_last_found)) &gt; 0) {
+222     uint to_uncommit = MIN2(num_regions - so_far, num_last_found);
+223     if(update_free_list) {
+224       _free_list.remove_starting_at(at(idx_last_found + num_last_found - to_uncommit), to_uncommit);
+225     }
+226     uncommit_regions(idx_last_found + num_last_found - to_uncommit, to_uncommit);
+227     so_far += to_uncommit;
+228     end = idx_last_found;
+229   }
+230   return so_far;
+231 }
+232 
+233 uint HeterogeneousHeapRegionManager::find_empty_in_range_reverse(uint start_idx, uint end_idx, uint* res_idx) {
+234   guarantee(res_idx != NULL, &quot;checking&quot;);
+235   guarantee(start_idx &lt; max_length(), &quot;checking&quot;);
+236   guarantee(end_idx &lt; max_length(), &quot;checking&quot;);
+237   if(start_idx &gt; end_idx) {
+238     return 0;
+239   }
+240 
+241   uint num_regions_found = 0;
+242 
+243   jlong cur = end_idx;
+244   while (cur &gt;= start_idx &amp;&amp; !(is_available(cur) &amp;&amp; at(cur)-&gt;is_empty())) {
+245     cur--;
+246   }
+247   if (cur == start_idx - 1) {
+248     return num_regions_found;
+249   }
+250   jlong old_cur = cur;
+251   // cur indexes the first empty region
+252   while (cur &gt;= start_idx &amp;&amp; is_available(cur) &amp;&amp; at(cur)-&gt;is_empty()) {
+253     cur--;
+254   }
+255   *res_idx = cur + 1;
+256   num_regions_found = old_cur - cur;
+257 
+258 #ifdef ASSERT
+259   for (uint i = *res_idx; i &lt; (*res_idx + num_regions_found); i++) {
+260     assert(at(i)-&gt;is_empty(), &quot;just checking&quot;);
+261   }
+262 #endif
+263   return num_regions_found;
+264 }
+265 
+266 HeapRegion* HeterogeneousHeapRegionManager::allocate_free_region(HeapRegionType type, uint node_index) {
+267 
+268   // We want to prevent mutators from proceeding when we have borrowed regions from the last collection. This
+269   // will force a full collection to remedy the situation.
+270   // Free region requests from GC threads can proceed.
+271   if(type.is_eden() || type.is_humongous()) {
+272     if(has_borrowed_regions()) {
+273       return NULL;
+274     }
+275   }
+276 
+277   // old and humongous regions are allocated from nv-dimm; eden and survivor regions are allocated from dram
+278   // assumption: dram regions take higher indexes
+279   bool from_nvdimm = (type.is_old() || type.is_humongous()) ? true : false;
+280   bool from_head = from_nvdimm;
+281   HeapRegion* hr = _free_list.remove_region(from_head);
+282 
+283   if (hr != NULL &amp;&amp; ( (from_nvdimm &amp;&amp; !is_in_nvdimm(hr-&gt;hrm_index())) || (!from_nvdimm &amp;&amp; !is_in_dram(hr-&gt;hrm_index())) ) ) {
+284     _free_list.add_ordered(hr);
+285     hr = NULL;
+286   }
+287 
+288 #ifdef ASSERT
+289   uint total_committed_before = total_regions_committed();
+290 #endif
+291 
+292   if (hr == NULL) {
+293     if (!from_nvdimm) {
+294       uint ret = shrink_nvdimm(1);
+295       if (ret == 1) {
+296         ret = expand_dram(1, NULL);
+297         assert(ret == 1, &quot;We should be able to commit one region&quot;);
+298         hr = _free_list.remove_region(from_head);
+299       }
+300     }
+301     else { /*is_old*/
+302       uint ret = shrink_dram(1);
+303       if (ret == 1) {
+304         ret = expand_nvdimm(1, NULL);
+305         assert(ret == 1, &quot;We should be able to commit one region&quot;);
+306         hr = _free_list.remove_region(from_head);
+307       }
+308     }
+309   }
+310 #ifdef ASSERT
+311   assert(total_committed_before == total_regions_committed(), &quot;invariant not met&quot;);
+312 #endif
+313 
+314   // When an old region is requested (which happens during collection pause) and we can&#39;t find any empty region
+315   // in the set of available regions (which is an evacuation failure scenario), we borrow (or pre-allocate) an unavailable region
+316   // from nv-dimm. This region is used to evacuate surviving objects from eden, survivor or old.
+317   if(hr == NULL &amp;&amp; type.is_old()) {
+318     hr = borrow_old_region_for_gc();
+319   }
+320 
+321   if (hr != NULL) {
+322     assert(hr-&gt;next() == NULL, &quot;Single region should not have next&quot;);
+323     assert(is_available(hr-&gt;hrm_index()), &quot;Must be committed&quot;);
+324   }
+325   return hr;
+326 }
+327 
+328 uint HeterogeneousHeapRegionManager::find_contiguous_only_empty(size_t num) {
+329   if (has_borrowed_regions()) {
+330       return G1_NO_HRM_INDEX;
+331   }
+332   return find_contiguous(start_index_of_nvdimm(), end_index_of_nvdimm(), num, true);
+333 }
+334 
+335 uint HeterogeneousHeapRegionManager::find_contiguous_empty_or_unavailable(size_t num) {
+336   if (has_borrowed_regions()) {
+337     return G1_NO_HRM_INDEX;
+338   }
+339   return find_contiguous(start_index_of_nvdimm(), end_index_of_nvdimm(), num, false);
+340 }
+341 
+342 uint HeterogeneousHeapRegionManager::find_contiguous(size_t start, size_t end, size_t num, bool empty_only) {
+343   uint found = 0;
+344   size_t length_found = 0;
+345   uint cur = (uint)start;
+346   uint length_unavailable = 0;
+347 
+348   while (length_found &lt; num &amp;&amp; cur &lt;= end) {
+349     HeapRegion* hr = _regions.get_by_index(cur);
+350     if ((!empty_only &amp;&amp; !is_available(cur)) || (is_available(cur) &amp;&amp; hr != NULL &amp;&amp; hr-&gt;is_empty())) {
+351       // This region is a potential candidate for allocation into.
+352       if (!is_available(cur)) {
+353         if(shrink_dram(1) == 1) {
+354           uint ret = expand_in_range(cur, cur, 1, NULL);
+355           assert(ret == 1, &quot;We should be able to expand at this index&quot;);
+356         } else {
+357           length_unavailable++;
+358         }
+359       }
+360       length_found++;
+361     }
+362     else {
+363       // This region is not a candidate. The next region is the next possible one.
+364       found = cur + 1;
+365       length_found = 0;
+366     }
+367     cur++;
+368   }
+369 
+370   if (length_found == num) {
+371     for (uint i = found; i &lt; (found + num); i++) {
+372       HeapRegion* hr = _regions.get_by_index(i);
+373       // sanity check
+374       guarantee((!empty_only &amp;&amp; !is_available(i)) || (is_available(i) &amp;&amp; hr != NULL &amp;&amp; hr-&gt;is_empty()),
+375                 &quot;Found region sequence starting at &quot; UINT32_FORMAT &quot;, length &quot; SIZE_FORMAT
+376                 &quot; that is not empty at &quot; UINT32_FORMAT &quot;. Hr is &quot; PTR_FORMAT, found, num, i, p2i(hr));
+377     }
+378     if (!empty_only &amp;&amp; length_unavailable &gt; (max_expandable_length() - total_regions_committed())) {
+379       // if &#39;length_unavailable&#39; number of regions will be made available, we will exceed max regions.
+380       return G1_NO_HRM_INDEX;
+381     }
+382     return found;
+383   }
+384   else {
+385     return G1_NO_HRM_INDEX;
+386   }
+387 }
+388 
+389 uint HeterogeneousHeapRegionManager::find_highest_free(bool* expanded) {
+390   // Loop downwards from the highest dram region index, looking for an
+391   // entry which is either free or not yet committed.  If not yet
+392   // committed, expand_at that index.
+393   uint curr = end_index_of_dram();
+394   while (true) {
+395     HeapRegion *hr = _regions.get_by_index(curr);
+396     if (hr == NULL &amp;&amp; !(total_regions_committed() &lt; _max_regions)) {
+397       uint res = shrink_nvdimm(1);
+398       if (res == 1) {
+399         res = expand_in_range(curr, curr, 1, NULL);
+400         assert(res == 1, &quot;We should be able to expand since shrink was successful&quot;);
+401         *expanded = true;
+402         return curr;
+403       }
+404     }
+405     else {
+406       if (hr-&gt;is_free()) {
+407         *expanded = false;
+408         return curr;
+409       }
+410     }
+411     if (curr == start_index_of_dram()) {
+412       return G1_NO_HRM_INDEX;
+413     }
+414     curr--;
+415   }
+416 }
+417 
+418 // We need to override this since region 0 which serves are dummy region in base class may not be available here.
+419 // This is a corner condition when either number of regions is small. When adaptive sizing is used, initial heap size
+420 // could be just one region.  This region is commited in dram to be used for young generation, leaving region 0 (which is in nvdimm)
+421 // unavailable.
+422 HeapRegion* HeterogeneousHeapRegionManager::get_dummy_region() {
+423   uint curr = 0;
+424 
+425   while (curr &lt; _regions.length()) {
+426     if (is_available(curr)) {
+427       return new_heap_region(curr);
+428     }
+429     curr++;
+430   }
+431   assert(false, &quot;We should always find a region available for dummy region&quot;);
+432   return NULL;
+433 }
+434 
+435 // First shrink in dram, then in nv-dimm.
+436 uint HeterogeneousHeapRegionManager::shrink_by(uint num_regions) {
+437   // This call is made at end of full collection. Before making this call the region sets are tore down (tear_down_region_sets()).
+438   // So shrink() calls below do not need to remove uncomitted regions from free list.
+439   uint ret = shrink_dram(num_regions, false /* update_free_list */);
+440   ret += shrink_nvdimm(num_regions - ret, false /* update_free_list */);
+441   return ret;
+442 }
+443 
+444 void HeterogeneousHeapRegionManager::verify() {
+445   HeapRegionManager::verify();
+446 }
+447 
+448 uint HeterogeneousHeapRegionManager::free_list_dram_length() const {
+449   return _free_list.num_of_regions_in_range(start_index_of_dram(), end_index_of_dram());
+450 }
+451 
+452 uint HeterogeneousHeapRegionManager::free_list_nvdimm_length() const {
+453   return _free_list.num_of_regions_in_range(start_index_of_nvdimm(), end_index_of_nvdimm());
+454 }
+455 
+456 bool HeterogeneousHeapRegionManager::is_in_nvdimm(uint index) const {
+457   return index &gt;= start_index_of_nvdimm() &amp;&amp; index &lt;= end_index_of_nvdimm();
+458 }
+459 
+460 bool HeterogeneousHeapRegionManager::is_in_dram(uint index) const {
+461   return index &gt;= start_index_of_dram() &amp;&amp; index &lt;= end_index_of_dram();
+462 }
+463 
+464 // We have to make sure full collection copies all surviving objects to NV-DIMM.
+465 // We might not have enough regions in nvdimm_set, so we need to make more regions on NV-DIMM available for full collection.
+466 // Note: by doing this we are breaking the in-variant that total number of committed regions is equal to current heap size.
+467 // After full collection ends, we will re-establish this in-variant by freeing DRAM regions.
+468 void HeterogeneousHeapRegionManager::prepare_for_full_collection_start() {
+469   _total_commited_before_full_gc = total_regions_committed() - _no_borrowed_regions;
+470   _no_borrowed_regions = 0;
+471   expand_nvdimm(num_committed_dram(), NULL);
+472   remove_all_free_regions();
+473 }
+474 
+475 // We need to bring back the total committed regions to before full collection start.
+476 // Unless we are close to OOM, all regular (not pinned) regions in DRAM should be free.
+477 // We shrink all free regions in DRAM and if needed from NV-DIMM (when there are pinned DRAM regions)
+478 // If we can&#39;t bring back committed regions count to _total_commited_before_full_gc, we keep the extra count in _no_borrowed_regions.
+479 // When this GC finishes, new regions won&#39;t be allocated since has_borrowed_regions() is true. VM will be forced to re-try GC
+480 // with clear soft references followed by OOM error in worst case.
+481 void HeterogeneousHeapRegionManager::prepare_for_full_collection_end() {
+482   uint shrink_size = total_regions_committed() - _total_commited_before_full_gc;
+483   uint so_far = 0;
+484   uint idx_last_found = 0;
+485   uint num_last_found;
+486   uint end = (uint)_regions.length() - 1;
+487   while (so_far &lt; shrink_size &amp;&amp;
+488          (num_last_found = find_empty_in_range_reverse(0, end, &amp;idx_last_found)) &gt; 0) {
+489     uint to_uncommit = MIN2(shrink_size - so_far, num_last_found);
+490     uncommit_regions(idx_last_found + num_last_found - to_uncommit, to_uncommit);
+491     so_far += to_uncommit;
+492     end = idx_last_found;
+493   }
+494   // See comment above the function.
+495   _no_borrowed_regions = shrink_size - so_far;
+496 }
+497 
+498 uint HeterogeneousHeapRegionManager::start_index_of_dram() const { return _max_regions;}
+499 
+500 uint HeterogeneousHeapRegionManager::end_index_of_dram() const { return 2*_max_regions - 1; }
+501 
+502 uint HeterogeneousHeapRegionManager::start_index_of_nvdimm() const { return 0; }
+503 
+504 uint HeterogeneousHeapRegionManager::end_index_of_nvdimm() const { return _max_regions - 1; }
+505 
+506 // This function is called when there are no free nv-dimm regions.
+507 // It borrows a region from the set of unavailable regions in nv-dimm for GC purpose.
+508 HeapRegion* HeterogeneousHeapRegionManager::borrow_old_region_for_gc() {
+509   assert(free_list_nvdimm_length() == 0, &quot;this function should be called only when there are no nv-dimm regions in free list&quot;);
+510 
+511   uint ret = expand_nvdimm(1, NULL);
+512   if(ret != 1) {
+513     return NULL;
+514   }
+515   HeapRegion* hr = _free_list.remove_region(true /*from_head*/);
+516   assert(is_in_nvdimm(hr-&gt;hrm_index()), &quot;allocated region should be in nv-dimm&quot;);
+517   _no_borrowed_regions++;
+518   return hr;
+519 }
+520 
+521 bool HeterogeneousHeapRegionManager::has_borrowed_regions() const {
+522   return _no_borrowed_regions &gt; 0;
+523 }
+    </pre>
+  </body>
+</html>

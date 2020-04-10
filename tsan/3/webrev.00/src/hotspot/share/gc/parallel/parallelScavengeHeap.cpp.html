@@ -1,0 +1,796 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>New src/hotspot/share/gc/parallel/parallelScavengeHeap.cpp</title>
+    <link rel="stylesheet" href="../../../../../style.css" />
+  </head>
+  <body>
+    <pre>
+  1 /*
+  2  * Copyright (c) 2001, 2020, Oracle and/or its affiliates. All rights reserved.
+  3  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  4  *
+  5  * This code is free software; you can redistribute it and/or modify it
+  6  * under the terms of the GNU General Public License version 2 only, as
+  7  * published by the Free Software Foundation.
+  8  *
+  9  * This code is distributed in the hope that it will be useful, but WITHOUT
+ 10  * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ 11  * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ 12  * version 2 for more details (a copy is included in the LICENSE file that
+ 13  * accompanied this code).
+ 14  *
+ 15  * You should have received a copy of the GNU General Public License version
+ 16  * 2 along with this work; if not, write to the Free Software Foundation,
+ 17  * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ 18  *
+ 19  * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ 20  * or visit www.oracle.com if you need additional information or have any
+ 21  * questions.
+ 22  *
+ 23  */
+ 24 
+ 25 #include &quot;precompiled.hpp&quot;
+ 26 #include &quot;code/codeCache.hpp&quot;
+ 27 #include &quot;gc/parallel/adjoiningGenerations.hpp&quot;
+ 28 #include &quot;gc/parallel/adjoiningGenerationsForHeteroHeap.hpp&quot;
+ 29 #include &quot;gc/parallel/adjoiningVirtualSpaces.hpp&quot;
+ 30 #include &quot;gc/parallel/parallelArguments.hpp&quot;
+ 31 #include &quot;gc/parallel/objectStartArray.inline.hpp&quot;
+ 32 #include &quot;gc/parallel/parallelScavengeHeap.inline.hpp&quot;
+ 33 #include &quot;gc/parallel/psAdaptiveSizePolicy.hpp&quot;
+ 34 #include &quot;gc/parallel/psMemoryPool.hpp&quot;
+ 35 #include &quot;gc/parallel/psParallelCompact.inline.hpp&quot;
+ 36 #include &quot;gc/parallel/psPromotionManager.hpp&quot;
+ 37 #include &quot;gc/parallel/psScavenge.hpp&quot;
+ 38 #include &quot;gc/parallel/psVMOperations.hpp&quot;
+ 39 #include &quot;gc/shared/gcHeapSummary.hpp&quot;
+ 40 #include &quot;gc/shared/gcLocker.hpp&quot;
+ 41 #include &quot;gc/shared/gcWhen.hpp&quot;
+ 42 #include &quot;gc/shared/genArguments.hpp&quot;
+ 43 #include &quot;gc/shared/locationPrinter.inline.hpp&quot;
+ 44 #include &quot;gc/shared/scavengableNMethods.hpp&quot;
+ 45 #include &quot;logging/log.hpp&quot;
+ 46 #include &quot;memory/iterator.hpp&quot;
+ 47 #include &quot;memory/metaspaceCounters.hpp&quot;
+ 48 #include &quot;memory/universe.hpp&quot;
+ 49 #include &quot;oops/oop.inline.hpp&quot;
+ 50 #include &quot;runtime/handles.inline.hpp&quot;
+ 51 #include &quot;runtime/java.hpp&quot;
+ 52 #include &quot;runtime/vmThread.hpp&quot;
+ 53 #include &quot;services/memoryManager.hpp&quot;
+ 54 #include &quot;services/memTracker.hpp&quot;
+ 55 #include &quot;utilities/macros.hpp&quot;
+ 56 #include &quot;utilities/vmError.hpp&quot;
+ 57 
+ 58 PSYoungGen*  ParallelScavengeHeap::_young_gen = NULL;
+ 59 PSOldGen*    ParallelScavengeHeap::_old_gen = NULL;
+ 60 PSAdaptiveSizePolicy* ParallelScavengeHeap::_size_policy = NULL;
+ 61 PSGCAdaptivePolicyCounters* ParallelScavengeHeap::_gc_policy_counters = NULL;
+ 62 
+ 63 jint ParallelScavengeHeap::initialize() {
+ 64   const size_t reserved_heap_size = ParallelArguments::heap_reserved_size_bytes();
+ 65 
+ 66   ReservedHeapSpace heap_rs = Universe::reserve_heap(reserved_heap_size, HeapAlignment);
+ 67 
+ 68   os::trace_page_sizes(&quot;Heap&quot;,
+ 69                        MinHeapSize,
+ 70                        reserved_heap_size,
+ 71                        GenAlignment,
+ 72                        heap_rs.base(),
+ 73                        heap_rs.size());
+ 74 
+ 75   initialize_reserved_region(heap_rs);
+ 76 
+ 77   PSCardTable* card_table = new PSCardTable(heap_rs.region());
+ 78   card_table-&gt;initialize();
+ 79   CardTableBarrierSet* const barrier_set = new CardTableBarrierSet(card_table);
+ 80   barrier_set-&gt;initialize();
+ 81   BarrierSet::set_barrier_set(barrier_set);
+ 82 
+ 83   // Make up the generations
+ 84   // Calculate the maximum size that a generation can grow.  This
+ 85   // includes growth into the other generation.  Note that the
+ 86   // parameter _max_gen_size is kept as the maximum
+ 87   // size of the generation as the boundaries currently stand.
+ 88   // _max_gen_size is still used as that value.
+ 89   double max_gc_pause_sec = ((double) MaxGCPauseMillis)/1000.0;
+ 90   double max_gc_minor_pause_sec = ((double) MaxGCMinorPauseMillis)/1000.0;
+ 91 
+ 92   _gens = AdjoiningGenerations::create_adjoining_generations(heap_rs);
+ 93 
+ 94   _old_gen = _gens-&gt;old_gen();
+ 95   _young_gen = _gens-&gt;young_gen();
+ 96 
+ 97   const size_t eden_capacity = _young_gen-&gt;eden_space()-&gt;capacity_in_bytes();
+ 98   const size_t old_capacity = _old_gen-&gt;capacity_in_bytes();
+ 99   const size_t initial_promo_size = MIN2(eden_capacity, old_capacity);
+100   _size_policy =
+101     new PSAdaptiveSizePolicy(eden_capacity,
+102                              initial_promo_size,
+103                              young_gen()-&gt;to_space()-&gt;capacity_in_bytes(),
+104                              GenAlignment,
+105                              max_gc_pause_sec,
+106                              max_gc_minor_pause_sec,
+107                              GCTimeRatio
+108                              );
+109 
+110   assert(ParallelArguments::is_heterogeneous_heap() || !UseAdaptiveGCBoundary ||
+111     (old_gen()-&gt;virtual_space()-&gt;high_boundary() ==
+112      young_gen()-&gt;virtual_space()-&gt;low_boundary()),
+113     &quot;Boundaries must meet&quot;);
+114   // initialize the policy counters - 2 collectors, 2 generations
+115   _gc_policy_counters =
+116     new PSGCAdaptivePolicyCounters(&quot;ParScav:MSC&quot;, 2, 2, _size_policy);
+117 
+118   if (!PSParallelCompact::initialize()) {
+119     return JNI_ENOMEM;
+120   }
+121 
+122   // Set up WorkGang
+123   _workers.initialize_workers();
+124 
+125   return JNI_OK;
+126 }
+127 
+128 void ParallelScavengeHeap::initialize_serviceability() {
+129 
+130   _eden_pool = new EdenMutableSpacePool(_young_gen,
+131                                         _young_gen-&gt;eden_space(),
+132                                         &quot;PS Eden Space&quot;,
+133                                         false /* support_usage_threshold */);
+134 
+135   _survivor_pool = new SurvivorMutableSpacePool(_young_gen,
+136                                                 &quot;PS Survivor Space&quot;,
+137                                                 false /* support_usage_threshold */);
+138 
+139   _old_pool = new PSGenerationPool(_old_gen,
+140                                    &quot;PS Old Gen&quot;,
+141                                    true /* support_usage_threshold */);
+142 
+143   _young_manager = new GCMemoryManager(&quot;PS Scavenge&quot;, &quot;end of minor GC&quot;);
+144   _old_manager = new GCMemoryManager(&quot;PS MarkSweep&quot;, &quot;end of major GC&quot;);
+145 
+146   _old_manager-&gt;add_pool(_eden_pool);
+147   _old_manager-&gt;add_pool(_survivor_pool);
+148   _old_manager-&gt;add_pool(_old_pool);
+149 
+150   _young_manager-&gt;add_pool(_eden_pool);
+151   _young_manager-&gt;add_pool(_survivor_pool);
+152 
+153 }
+154 
+155 class PSIsScavengable : public BoolObjectClosure {
+156   bool do_object_b(oop obj) {
+157     return ParallelScavengeHeap::heap()-&gt;is_in_young(obj);
+158   }
+159 };
+160 
+161 static PSIsScavengable _is_scavengable;
+162 
+163 void ParallelScavengeHeap::post_initialize() {
+164   CollectedHeap::post_initialize();
+165   // Need to init the tenuring threshold
+166   PSScavenge::initialize();
+167   PSParallelCompact::post_initialize();
+168   PSPromotionManager::initialize();
+169 
+170   ScavengableNMethods::initialize(&amp;_is_scavengable);
+171 }
+172 
+173 void ParallelScavengeHeap::update_counters() {
+174   young_gen()-&gt;update_counters();
+175   old_gen()-&gt;update_counters();
+176   MetaspaceCounters::update_performance_counters();
+177   CompressedClassSpaceCounters::update_performance_counters();
+178 }
+179 
+180 size_t ParallelScavengeHeap::capacity() const {
+181   size_t value = young_gen()-&gt;capacity_in_bytes() + old_gen()-&gt;capacity_in_bytes();
+182   return value;
+183 }
+184 
+185 size_t ParallelScavengeHeap::used() const {
+186   size_t value = young_gen()-&gt;used_in_bytes() + old_gen()-&gt;used_in_bytes();
+187   return value;
+188 }
+189 
+190 bool ParallelScavengeHeap::is_maximal_no_gc() const {
+191   return old_gen()-&gt;is_maximal_no_gc() &amp;&amp; young_gen()-&gt;is_maximal_no_gc();
+192 }
+193 
+194 
+195 size_t ParallelScavengeHeap::max_capacity() const {
+196   size_t estimated = reserved_region().byte_size();
+197   if (UseAdaptiveSizePolicy) {
+198     estimated -= _size_policy-&gt;max_survivor_size(young_gen()-&gt;max_size());
+199   } else {
+200     estimated -= young_gen()-&gt;to_space()-&gt;capacity_in_bytes();
+201   }
+202   return MAX2(estimated, capacity());
+203 }
+204 
+205 bool ParallelScavengeHeap::is_in(const void* p) const {
+206   return young_gen()-&gt;is_in(p) || old_gen()-&gt;is_in(p);
+207 }
+208 
+209 bool ParallelScavengeHeap::is_in_reserved(const void* p) const {
+210   return young_gen()-&gt;is_in_reserved(p) || old_gen()-&gt;is_in_reserved(p);
+211 }
+212 
+213 // There are two levels of allocation policy here.
+214 //
+215 // When an allocation request fails, the requesting thread must invoke a VM
+216 // operation, transfer control to the VM thread, and await the results of a
+217 // garbage collection. That is quite expensive, and we should avoid doing it
+218 // multiple times if possible.
+219 //
+220 // To accomplish this, we have a basic allocation policy, and also a
+221 // failed allocation policy.
+222 //
+223 // The basic allocation policy controls how you allocate memory without
+224 // attempting garbage collection. It is okay to grab locks and
+225 // expand the heap, if that can be done without coming to a safepoint.
+226 // It is likely that the basic allocation policy will not be very
+227 // aggressive.
+228 //
+229 // The failed allocation policy is invoked from the VM thread after
+230 // the basic allocation policy is unable to satisfy a mem_allocate
+231 // request. This policy needs to cover the entire range of collection,
+232 // heap expansion, and out-of-memory conditions. It should make every
+233 // attempt to allocate the requested memory.
+234 
+235 // Basic allocation policy. Should never be called at a safepoint, or
+236 // from the VM thread.
+237 //
+238 // This method must handle cases where many mem_allocate requests fail
+239 // simultaneously. When that happens, only one VM operation will succeed,
+240 // and the rest will not be executed. For that reason, this method loops
+241 // during failed allocation attempts. If the java heap becomes exhausted,
+242 // we rely on the size_policy object to force a bail out.
+243 HeapWord* ParallelScavengeHeap::mem_allocate(
+244                                      size_t size,
+245                                      bool* gc_overhead_limit_was_exceeded) {
+246   assert(!SafepointSynchronize::is_at_safepoint(), &quot;should not be at safepoint&quot;);
+247   assert(Thread::current() != (Thread*)VMThread::vm_thread(), &quot;should not be in vm thread&quot;);
+248   assert(!Heap_lock-&gt;owned_by_self(), &quot;this thread should not own the Heap_lock&quot;);
+249 
+250   // In general gc_overhead_limit_was_exceeded should be false so
+251   // set it so here and reset it to true only if the gc time
+252   // limit is being exceeded as checked below.
+253   *gc_overhead_limit_was_exceeded = false;
+254 
+255   HeapWord* result = young_gen()-&gt;allocate(size);
+256 
+257   uint loop_count = 0;
+258   uint gc_count = 0;
+259   uint gclocker_stalled_count = 0;
+260 
+261   while (result == NULL) {
+262     // We don&#39;t want to have multiple collections for a single filled generation.
+263     // To prevent this, each thread tracks the total_collections() value, and if
+264     // the count has changed, does not do a new collection.
+265     //
+266     // The collection count must be read only while holding the heap lock. VM
+267     // operations also hold the heap lock during collections. There is a lock
+268     // contention case where thread A blocks waiting on the Heap_lock, while
+269     // thread B is holding it doing a collection. When thread A gets the lock,
+270     // the collection count has already changed. To prevent duplicate collections,
+271     // The policy MUST attempt allocations during the same period it reads the
+272     // total_collections() value!
+273     {
+274       MutexLocker ml(Heap_lock);
+275       gc_count = total_collections();
+276 
+277       result = young_gen()-&gt;allocate(size);
+278       if (result != NULL) {
+279         return result;
+280       }
+281 
+282       // If certain conditions hold, try allocating from the old gen.
+283       result = mem_allocate_old_gen(size);
+284       if (result != NULL) {
+285         return result;
+286       }
+287 
+288       if (gclocker_stalled_count &gt; GCLockerRetryAllocationCount) {
+289         return NULL;
+290       }
+291 
+292       // Failed to allocate without a gc.
+293       if (GCLocker::is_active_and_needs_gc()) {
+294         // If this thread is not in a jni critical section, we stall
+295         // the requestor until the critical section has cleared and
+296         // GC allowed. When the critical section clears, a GC is
+297         // initiated by the last thread exiting the critical section; so
+298         // we retry the allocation sequence from the beginning of the loop,
+299         // rather than causing more, now probably unnecessary, GC attempts.
+300         JavaThread* jthr = JavaThread::current();
+301         if (!jthr-&gt;in_critical()) {
+302           MutexUnlocker mul(Heap_lock);
+303           GCLocker::stall_until_clear();
+304           gclocker_stalled_count += 1;
+305           continue;
+306         } else {
+307           if (CheckJNICalls) {
+308             fatal(&quot;Possible deadlock due to allocating while&quot;
+309                   &quot; in jni critical section&quot;);
+310           }
+311           return NULL;
+312         }
+313       }
+314     }
+315 
+316     if (result == NULL) {
+317       // Generate a VM operation
+318       VM_ParallelGCFailedAllocation op(size, gc_count);
+319       VMThread::execute(&amp;op);
+320 
+321       // Did the VM operation execute? If so, return the result directly.
+322       // This prevents us from looping until time out on requests that can
+323       // not be satisfied.
+324       if (op.prologue_succeeded()) {
+325         assert(is_in_or_null(op.result()), &quot;result not in heap&quot;);
+326 
+327         // If GC was locked out during VM operation then retry allocation
+328         // and/or stall as necessary.
+329         if (op.gc_locked()) {
+330           assert(op.result() == NULL, &quot;must be NULL if gc_locked() is true&quot;);
+331           continue;  // retry and/or stall as necessary
+332         }
+333 
+334         // Exit the loop if the gc time limit has been exceeded.
+335         // The allocation must have failed above (&quot;result&quot; guarding
+336         // this path is NULL) and the most recent collection has exceeded the
+337         // gc overhead limit (although enough may have been collected to
+338         // satisfy the allocation).  Exit the loop so that an out-of-memory
+339         // will be thrown (return a NULL ignoring the contents of
+340         // op.result()),
+341         // but clear gc_overhead_limit_exceeded so that the next collection
+342         // starts with a clean slate (i.e., forgets about previous overhead
+343         // excesses).  Fill op.result() with a filler object so that the
+344         // heap remains parsable.
+345         const bool limit_exceeded = size_policy()-&gt;gc_overhead_limit_exceeded();
+346         const bool softrefs_clear = soft_ref_policy()-&gt;all_soft_refs_clear();
+347 
+348         if (limit_exceeded &amp;&amp; softrefs_clear) {
+349           *gc_overhead_limit_was_exceeded = true;
+350           size_policy()-&gt;set_gc_overhead_limit_exceeded(false);
+351           log_trace(gc)(&quot;ParallelScavengeHeap::mem_allocate: return NULL because gc_overhead_limit_exceeded is set&quot;);
+352           if (op.result() != NULL) {
+353             CollectedHeap::fill_with_object(op.result(), size);
+354           }
+355           return NULL;
+356         }
+357 
+358         return op.result();
+359       }
+360     }
+361 
+362     // The policy object will prevent us from looping forever. If the
+363     // time spent in gc crosses a threshold, we will bail out.
+364     loop_count++;
+365     if ((result == NULL) &amp;&amp; (QueuedAllocationWarningCount &gt; 0) &amp;&amp;
+366         (loop_count % QueuedAllocationWarningCount == 0)) {
+367       log_warning(gc)(&quot;ParallelScavengeHeap::mem_allocate retries %d times&quot;, loop_count);
+368       log_warning(gc)(&quot;\tsize=&quot; SIZE_FORMAT, size);
+369     }
+370   }
+371 
+372   return result;
+373 }
+374 
+375 // A &quot;death march&quot; is a series of ultra-slow allocations in which a full gc is
+376 // done before each allocation, and after the full gc the allocation still
+377 // cannot be satisfied from the young gen.  This routine detects that condition;
+378 // it should be called after a full gc has been done and the allocation
+379 // attempted from the young gen. The parameter &#39;addr&#39; should be the result of
+380 // that young gen allocation attempt.
+381 void
+382 ParallelScavengeHeap::death_march_check(HeapWord* const addr, size_t size) {
+383   if (addr != NULL) {
+384     _death_march_count = 0;  // death march has ended
+385   } else if (_death_march_count == 0) {
+386     if (should_alloc_in_eden(size)) {
+387       _death_march_count = 1;    // death march has started
+388     }
+389   }
+390 }
+391 
+392 HeapWord* ParallelScavengeHeap::mem_allocate_old_gen(size_t size) {
+393   if (!should_alloc_in_eden(size) || GCLocker::is_active_and_needs_gc()) {
+394     // Size is too big for eden, or gc is locked out.
+395     return old_gen()-&gt;allocate(size);
+396   }
+397 
+398   // If a &quot;death march&quot; is in progress, allocate from the old gen a limited
+399   // number of times before doing a GC.
+400   if (_death_march_count &gt; 0) {
+401     if (_death_march_count &lt; 64) {
+402       ++_death_march_count;
+403       return old_gen()-&gt;allocate(size);
+404     } else {
+405       _death_march_count = 0;
+406     }
+407   }
+408   return NULL;
+409 }
+410 
+411 void ParallelScavengeHeap::do_full_collection(bool clear_all_soft_refs) {
+412   // The do_full_collection() parameter clear_all_soft_refs
+413   // is interpreted here as maximum_compaction which will
+414   // cause SoftRefs to be cleared.
+415   bool maximum_compaction = clear_all_soft_refs;
+416   PSParallelCompact::invoke(maximum_compaction);
+417 }
+418 
+419 // Failed allocation policy. Must be called from the VM thread, and
+420 // only at a safepoint! Note that this method has policy for allocation
+421 // flow, and NOT collection policy. So we do not check for gc collection
+422 // time over limit here, that is the responsibility of the heap specific
+423 // collection methods. This method decides where to attempt allocations,
+424 // and when to attempt collections, but no collection specific policy.
+425 HeapWord* ParallelScavengeHeap::failed_mem_allocate(size_t size) {
+426   assert(SafepointSynchronize::is_at_safepoint(), &quot;should be at safepoint&quot;);
+427   assert(Thread::current() == (Thread*)VMThread::vm_thread(), &quot;should be in vm thread&quot;);
+428   assert(!is_gc_active(), &quot;not reentrant&quot;);
+429   assert(!Heap_lock-&gt;owned_by_self(), &quot;this thread should not own the Heap_lock&quot;);
+430 
+431   // We assume that allocation in eden will fail unless we collect.
+432 
+433   // First level allocation failure, scavenge and allocate in young gen.
+434   GCCauseSetter gccs(this, GCCause::_allocation_failure);
+435   const bool invoked_full_gc = PSScavenge::invoke();
+436   HeapWord* result = young_gen()-&gt;allocate(size);
+437 
+438   // Second level allocation failure.
+439   //   Mark sweep and allocate in young generation.
+440   if (result == NULL &amp;&amp; !invoked_full_gc) {
+441     do_full_collection(false);
+442     result = young_gen()-&gt;allocate(size);
+443   }
+444 
+445   death_march_check(result, size);
+446 
+447   // Third level allocation failure.
+448   //   After mark sweep and young generation allocation failure,
+449   //   allocate in old generation.
+450   if (result == NULL) {
+451     result = old_gen()-&gt;allocate(size);
+452   }
+453 
+454   // Fourth level allocation failure. We&#39;re running out of memory.
+455   //   More complete mark sweep and allocate in young generation.
+456   if (result == NULL) {
+457     do_full_collection(true);
+458     result = young_gen()-&gt;allocate(size);
+459   }
+460 
+461   // Fifth level allocation failure.
+462   //   After more complete mark sweep, allocate in old generation.
+463   if (result == NULL) {
+464     result = old_gen()-&gt;allocate(size);
+465   }
+466 
+467   return result;
+468 }
+469 
+470 void ParallelScavengeHeap::ensure_parsability(bool retire_tlabs) {
+471   CollectedHeap::ensure_parsability(retire_tlabs);
+472   young_gen()-&gt;eden_space()-&gt;ensure_parsability();
+473 }
+474 
+475 size_t ParallelScavengeHeap::tlab_capacity(Thread* thr) const {
+476   return young_gen()-&gt;eden_space()-&gt;tlab_capacity(thr);
+477 }
+478 
+479 size_t ParallelScavengeHeap::tlab_used(Thread* thr) const {
+480   return young_gen()-&gt;eden_space()-&gt;tlab_used(thr);
+481 }
+482 
+483 size_t ParallelScavengeHeap::unsafe_max_tlab_alloc(Thread* thr) const {
+484   return young_gen()-&gt;eden_space()-&gt;unsafe_max_tlab_alloc(thr);
+485 }
+486 
+487 HeapWord* ParallelScavengeHeap::allocate_new_tlab(size_t min_size, size_t requested_size, size_t* actual_size) {
+488   HeapWord* result = young_gen()-&gt;allocate(requested_size);
+489   if (result != NULL) {
+490     *actual_size = requested_size;
+491   }
+492 
+493   return result;
+494 }
+495 
+496 void ParallelScavengeHeap::resize_all_tlabs() {
+497   CollectedHeap::resize_all_tlabs();
+498 }
+499 
+500 // This method is used by System.gc() and JVMTI.
+501 void ParallelScavengeHeap::collect(GCCause::Cause cause) {
+502   assert(!Heap_lock-&gt;owned_by_self(),
+503     &quot;this thread should not own the Heap_lock&quot;);
+504 
+505   uint gc_count      = 0;
+506   uint full_gc_count = 0;
+507   {
+508     MutexLocker ml(Heap_lock);
+509     // This value is guarded by the Heap_lock
+510     gc_count      = total_collections();
+511     full_gc_count = total_full_collections();
+512   }
+513 
+514   if (GCLocker::should_discard(cause, gc_count)) {
+515     return;
+516   }
+517 
+518   VM_ParallelGCSystemGC op(gc_count, full_gc_count, cause);
+519   VMThread::execute(&amp;op);
+520 }
+521 
+522 void ParallelScavengeHeap::object_iterate(ObjectClosure* cl) {
+523   young_gen()-&gt;object_iterate(cl);
+524   old_gen()-&gt;object_iterate(cl);
+525 }
+526 
+527 
+528 HeapWord* ParallelScavengeHeap::block_start(const void* addr) const {
+529   if (young_gen()-&gt;is_in_reserved(addr)) {
+530     assert(young_gen()-&gt;is_in(addr),
+531            &quot;addr should be in allocated part of young gen&quot;);
+532     // called from os::print_location by find or VMError
+533     if (Debugging || VMError::fatal_error_in_progress())  return NULL;
+534     Unimplemented();
+535   } else if (old_gen()-&gt;is_in_reserved(addr)) {
+536     assert(old_gen()-&gt;is_in(addr),
+537            &quot;addr should be in allocated part of old gen&quot;);
+538     return old_gen()-&gt;start_array()-&gt;object_start((HeapWord*)addr);
+539   }
+540   return 0;
+541 }
+542 
+543 bool ParallelScavengeHeap::block_is_obj(const HeapWord* addr) const {
+544   return block_start(addr) == addr;
+545 }
+546 
+547 jlong ParallelScavengeHeap::millis_since_last_gc() {
+548   return PSParallelCompact::millis_since_last_gc();
+549 }
+550 
+551 void ParallelScavengeHeap::prepare_for_verify() {
+552   ensure_parsability(false);  // no need to retire TLABs for verification
+553 }
+554 
+555 PSHeapSummary ParallelScavengeHeap::create_ps_heap_summary() {
+556   PSOldGen* old = old_gen();
+557   HeapWord* old_committed_end = (HeapWord*)old-&gt;virtual_space()-&gt;committed_high_addr();
+558   VirtualSpaceSummary old_summary(old-&gt;reserved().start(), old_committed_end, old-&gt;reserved().end());
+559   SpaceSummary old_space(old-&gt;reserved().start(), old_committed_end, old-&gt;used_in_bytes());
+560 
+561   PSYoungGen* young = young_gen();
+562   VirtualSpaceSummary young_summary(young-&gt;reserved().start(),
+563     (HeapWord*)young-&gt;virtual_space()-&gt;committed_high_addr(), young-&gt;reserved().end());
+564 
+565   MutableSpace* eden = young_gen()-&gt;eden_space();
+566   SpaceSummary eden_space(eden-&gt;bottom(), eden-&gt;end(), eden-&gt;used_in_bytes());
+567 
+568   MutableSpace* from = young_gen()-&gt;from_space();
+569   SpaceSummary from_space(from-&gt;bottom(), from-&gt;end(), from-&gt;used_in_bytes());
+570 
+571   MutableSpace* to = young_gen()-&gt;to_space();
+572   SpaceSummary to_space(to-&gt;bottom(), to-&gt;end(), to-&gt;used_in_bytes());
+573 
+574   VirtualSpaceSummary heap_summary = create_heap_space_summary();
+575   return PSHeapSummary(heap_summary, used(), old_summary, old_space, young_summary, eden_space, from_space, to_space);
+576 }
+577 
+578 bool ParallelScavengeHeap::print_location(outputStream* st, void* addr) const {
+579   return BlockLocationPrinter&lt;ParallelScavengeHeap&gt;::print_location(st, addr);
+580 }
+581 
+582 void ParallelScavengeHeap::print_on(outputStream* st) const {
+583   young_gen()-&gt;print_on(st);
+584   old_gen()-&gt;print_on(st);
+585   MetaspaceUtils::print_on(st);
+586 }
+587 
+588 void ParallelScavengeHeap::print_on_error(outputStream* st) const {
+589   this-&gt;CollectedHeap::print_on_error(st);
+590 
+591   st-&gt;cr();
+592   PSParallelCompact::print_on_error(st);
+593 }
+594 
+595 void ParallelScavengeHeap::gc_threads_do(ThreadClosure* tc) const {
+596   ParallelScavengeHeap::heap()-&gt;workers().threads_do(tc);
+597 }
+598 
+599 void ParallelScavengeHeap::print_gc_threads_on(outputStream* st) const {
+600   ParallelScavengeHeap::heap()-&gt;workers().print_worker_threads_on(st);
+601 }
+602 
+603 void ParallelScavengeHeap::print_tracing_info() const {
+604   AdaptiveSizePolicyOutput::print();
+605   log_debug(gc, heap, exit)(&quot;Accumulated young generation GC time %3.7f secs&quot;, PSScavenge::accumulated_time()-&gt;seconds());
+606   log_debug(gc, heap, exit)(&quot;Accumulated old generation GC time %3.7f secs&quot;, PSParallelCompact::accumulated_time()-&gt;seconds());
+607 }
+608 
+609 PreGenGCValues ParallelScavengeHeap::get_pre_gc_values() const {
+610   const PSYoungGen* const young = young_gen();
+611   const MutableSpace* const eden = young-&gt;eden_space();
+612   const MutableSpace* const from = young-&gt;from_space();
+613   const PSOldGen* const old = old_gen();
+614 
+615   return PreGenGCValues(young-&gt;used_in_bytes(),
+616                         young-&gt;capacity_in_bytes(),
+617                         eden-&gt;used_in_bytes(),
+618                         eden-&gt;capacity_in_bytes(),
+619                         from-&gt;used_in_bytes(),
+620                         from-&gt;capacity_in_bytes(),
+621                         old-&gt;used_in_bytes(),
+622                         old-&gt;capacity_in_bytes());
+623 }
+624 
+625 void ParallelScavengeHeap::print_heap_change(const PreGenGCValues&amp; pre_gc_values) const {
+626   const PSYoungGen* const young = young_gen();
+627   const MutableSpace* const eden = young-&gt;eden_space();
+628   const MutableSpace* const from = young-&gt;from_space();
+629   const PSOldGen* const old = old_gen();
+630 
+631   log_info(gc, heap)(HEAP_CHANGE_FORMAT&quot; &quot;
+632                      HEAP_CHANGE_FORMAT&quot; &quot;
+633                      HEAP_CHANGE_FORMAT,
+634                      HEAP_CHANGE_FORMAT_ARGS(young-&gt;name(),
+635                                              pre_gc_values.young_gen_used(),
+636                                              pre_gc_values.young_gen_capacity(),
+637                                              young-&gt;used_in_bytes(),
+638                                              young-&gt;capacity_in_bytes()),
+639                      HEAP_CHANGE_FORMAT_ARGS(&quot;Eden&quot;,
+640                                              pre_gc_values.eden_used(),
+641                                              pre_gc_values.eden_capacity(),
+642                                              eden-&gt;used_in_bytes(),
+643                                              eden-&gt;capacity_in_bytes()),
+644                      HEAP_CHANGE_FORMAT_ARGS(&quot;From&quot;,
+645                                              pre_gc_values.from_used(),
+646                                              pre_gc_values.from_capacity(),
+647                                              from-&gt;used_in_bytes(),
+648                                              from-&gt;capacity_in_bytes()));
+649   log_info(gc, heap)(HEAP_CHANGE_FORMAT,
+650                      HEAP_CHANGE_FORMAT_ARGS(old-&gt;name(),
+651                                              pre_gc_values.old_gen_used(),
+652                                              pre_gc_values.old_gen_capacity(),
+653                                              old-&gt;used_in_bytes(),
+654                                              old-&gt;capacity_in_bytes()));
+655   MetaspaceUtils::print_metaspace_change(pre_gc_values.metaspace_sizes());
+656 }
+657 
+658 void ParallelScavengeHeap::verify(VerifyOption option /* ignored */) {
+659   // Why do we need the total_collections()-filter below?
+660   if (total_collections() &gt; 0) {
+661     log_debug(gc, verify)(&quot;Tenured&quot;);
+662     old_gen()-&gt;verify();
+663 
+664     log_debug(gc, verify)(&quot;Eden&quot;);
+665     young_gen()-&gt;verify();
+666   }
+667 }
+668 
+669 void ParallelScavengeHeap::trace_heap(GCWhen::Type when, const GCTracer* gc_tracer) {
+670   const PSHeapSummary&amp; heap_summary = create_ps_heap_summary();
+671   gc_tracer-&gt;report_gc_heap_summary(when, heap_summary);
+672 
+673   const MetaspaceSummary&amp; metaspace_summary = create_metaspace_summary();
+674   gc_tracer-&gt;report_metaspace_summary(when, metaspace_summary);
+675 }
+676 
+677 ParallelScavengeHeap* ParallelScavengeHeap::heap() {
+678   CollectedHeap* heap = Universe::heap();
+679   assert(heap != NULL, &quot;Uninitialized access to ParallelScavengeHeap::heap()&quot;);
+680   assert(heap-&gt;kind() == CollectedHeap::Parallel, &quot;Invalid name&quot;);
+681   return (ParallelScavengeHeap*)heap;
+682 }
+683 
+684 CardTableBarrierSet* ParallelScavengeHeap::barrier_set() {
+685   return barrier_set_cast&lt;CardTableBarrierSet&gt;(BarrierSet::barrier_set());
+686 }
+687 
+688 PSCardTable* ParallelScavengeHeap::card_table() {
+689   return static_cast&lt;PSCardTable*&gt;(barrier_set()-&gt;card_table());
+690 }
+691 
+692 // Before delegating the resize to the young generation,
+693 // the reserved space for the young and old generations
+694 // may be changed to accommodate the desired resize.
+695 void ParallelScavengeHeap::resize_young_gen(size_t eden_size,
+696     size_t survivor_size) {
+697   if (UseAdaptiveGCBoundary) {
+698     if (size_policy()-&gt;bytes_absorbed_from_eden() != 0) {
+699       size_policy()-&gt;reset_bytes_absorbed_from_eden();
+700       return;  // The generation changed size already.
+701     }
+702     gens()-&gt;adjust_boundary_for_young_gen_needs(eden_size, survivor_size);
+703   }
+704 
+705   // Delegate the resize to the generation.
+706   _young_gen-&gt;resize(eden_size, survivor_size);
+707 }
+708 
+709 // Before delegating the resize to the old generation,
+710 // the reserved space for the young and old generations
+711 // may be changed to accommodate the desired resize.
+712 void ParallelScavengeHeap::resize_old_gen(size_t desired_free_space) {
+713   if (UseAdaptiveGCBoundary) {
+714     if (size_policy()-&gt;bytes_absorbed_from_eden() != 0) {
+715       size_policy()-&gt;reset_bytes_absorbed_from_eden();
+716       return;  // The generation changed size already.
+717     }
+718     gens()-&gt;adjust_boundary_for_old_gen_needs(desired_free_space);
+719   }
+720 
+721   // Delegate the resize to the generation.
+722   _old_gen-&gt;resize(desired_free_space);
+723 }
+724 
+725 ParallelScavengeHeap::ParStrongRootsScope::ParStrongRootsScope() {
+726   // nothing particular
+727 }
+728 
+729 ParallelScavengeHeap::ParStrongRootsScope::~ParStrongRootsScope() {
+730   // nothing particular
+731 }
+732 
+733 #ifndef PRODUCT
+734 void ParallelScavengeHeap::record_gen_tops_before_GC() {
+735   if (ZapUnusedHeapArea) {
+736     young_gen()-&gt;record_spaces_top();
+737     old_gen()-&gt;record_spaces_top();
+738   }
+739 }
+740 
+741 void ParallelScavengeHeap::gen_mangle_unused_area() {
+742   if (ZapUnusedHeapArea) {
+743     young_gen()-&gt;eden_space()-&gt;mangle_unused_area();
+744     young_gen()-&gt;to_space()-&gt;mangle_unused_area();
+745     young_gen()-&gt;from_space()-&gt;mangle_unused_area();
+746     old_gen()-&gt;object_space()-&gt;mangle_unused_area();
+747   }
+748 }
+749 #endif
+750 
+751 void ParallelScavengeHeap::register_nmethod(nmethod* nm) {
+752   ScavengableNMethods::register_nmethod(nm);
+753 }
+754 
+755 void ParallelScavengeHeap::unregister_nmethod(nmethod* nm) {
+756   ScavengableNMethods::unregister_nmethod(nm);
+757 }
+758 
+759 void ParallelScavengeHeap::verify_nmethod(nmethod* nm) {
+760   ScavengableNMethods::verify_nmethod(nm);
+761 }
+762 
+763 void ParallelScavengeHeap::flush_nmethod(nmethod* nm) {
+764   // nothing particular
+765 }
+766 
+767 void ParallelScavengeHeap::prune_scavengable_nmethods() {
+768   ScavengableNMethods::prune_nmethods();
+769 }
+770 
+771 GrowableArray&lt;GCMemoryManager*&gt; ParallelScavengeHeap::memory_managers() {
+772   GrowableArray&lt;GCMemoryManager*&gt; memory_managers(2);
+773   memory_managers.append(_young_manager);
+774   memory_managers.append(_old_manager);
+775   return memory_managers;
+776 }
+777 
+778 GrowableArray&lt;MemoryPool*&gt; ParallelScavengeHeap::memory_pools() {
+779   GrowableArray&lt;MemoryPool*&gt; memory_pools(3);
+780   memory_pools.append(_eden_pool);
+781   memory_pools.append(_survivor_pool);
+782   memory_pools.append(_old_pool);
+783   return memory_pools;
+784 }
+    </pre>
+  </body>
+</html>
