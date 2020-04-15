@@ -1,0 +1,891 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Frames src/hotspot/share/gc/z/zPageAllocator.cpp</title>
+    <link rel="stylesheet" href="../../../../../style.css" />
+    <script type="text/javascript" src="../../../../../navigation.js"></script>
+  </head>
+<body onkeypress="keypress(event);">
+<a name="0"></a>
+<hr />
+<pre>  1 /*
+<a name="1" id="anc1"></a><span class="line-modified">  2  * Copyright (c) 2015, 2019, Oracle and/or its affiliates. All rights reserved.</span>
+  3  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  4  *
+  5  * This code is free software; you can redistribute it and/or modify it
+  6  * under the terms of the GNU General Public License version 2 only, as
+  7  * published by the Free Software Foundation.
+  8  *
+  9  * This code is distributed in the hope that it will be useful, but WITHOUT
+ 10  * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ 11  * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ 12  * version 2 for more details (a copy is included in the LICENSE file that
+ 13  * accompanied this code).
+ 14  *
+ 15  * You should have received a copy of the GNU General Public License version
+ 16  * 2 along with this work; if not, write to the Free Software Foundation,
+ 17  * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ 18  *
+ 19  * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ 20  * or visit www.oracle.com if you need additional information or have any
+ 21  * questions.
+ 22  */
+ 23 
+ 24 #include &quot;precompiled.hpp&quot;
+ 25 #include &quot;gc/shared/suspendibleThreadSet.hpp&quot;
+ 26 #include &quot;gc/z/zAddress.inline.hpp&quot;
+ 27 #include &quot;gc/z/zCollectedHeap.hpp&quot;
+ 28 #include &quot;gc/z/zFuture.inline.hpp&quot;
+ 29 #include &quot;gc/z/zGlobals.hpp&quot;
+ 30 #include &quot;gc/z/zLock.inline.hpp&quot;
+ 31 #include &quot;gc/z/zPage.inline.hpp&quot;
+ 32 #include &quot;gc/z/zPageAllocator.hpp&quot;
+ 33 #include &quot;gc/z/zPageCache.inline.hpp&quot;
+ 34 #include &quot;gc/z/zSafeDelete.inline.hpp&quot;
+ 35 #include &quot;gc/z/zStat.hpp&quot;
+ 36 #include &quot;gc/z/zTask.hpp&quot;
+ 37 #include &quot;gc/z/zTracer.inline.hpp&quot;
+ 38 #include &quot;gc/z/zWorkers.hpp&quot;
+<a name="2" id="anc2"></a>
+ 39 #include &quot;runtime/globals.hpp&quot;
+ 40 #include &quot;runtime/init.hpp&quot;
+ 41 #include &quot;runtime/java.hpp&quot;
+ 42 #include &quot;utilities/debug.hpp&quot;
+ 43 
+ 44 static const ZStatCounter       ZCounterAllocationRate(&quot;Memory&quot;, &quot;Allocation Rate&quot;, ZStatUnitBytesPerSecond);
+ 45 static const ZStatCounter       ZCounterPageCacheFlush(&quot;Memory&quot;, &quot;Page Cache Flush&quot;, ZStatUnitBytesPerSecond);
+ 46 static const ZStatCounter       ZCounterUncommit(&quot;Memory&quot;, &quot;Uncommit&quot;, ZStatUnitBytesPerSecond);
+ 47 static const ZStatCriticalPhase ZCriticalPhaseAllocationStall(&quot;Allocation Stall&quot;);
+ 48 
+ 49 class ZPageAllocRequest : public StackObj {
+ 50   friend class ZList&lt;ZPageAllocRequest&gt;;
+ 51 
+ 52 private:
+ 53   const uint8_t                _type;
+ 54   const size_t                 _size;
+ 55   const ZAllocationFlags       _flags;
+ 56   const unsigned int           _total_collections;
+ 57   ZListNode&lt;ZPageAllocRequest&gt; _node;
+ 58   ZFuture&lt;ZPage*&gt;              _result;
+ 59 
+ 60 public:
+ 61   ZPageAllocRequest(uint8_t type, size_t size, ZAllocationFlags flags, unsigned int total_collections) :
+ 62       _type(type),
+ 63       _size(size),
+ 64       _flags(flags),
+ 65       _total_collections(total_collections),
+ 66       _node(),
+ 67       _result() {}
+ 68 
+ 69   uint8_t type() const {
+ 70     return _type;
+ 71   }
+ 72 
+ 73   size_t size() const {
+ 74     return _size;
+ 75   }
+ 76 
+ 77   ZAllocationFlags flags() const {
+ 78     return _flags;
+ 79   }
+ 80 
+ 81   unsigned int total_collections() const {
+ 82     return _total_collections;
+ 83   }
+ 84 
+ 85   ZPage* peek() {
+ 86     return _result.peek();
+ 87   }
+ 88 
+ 89   ZPage* wait() {
+ 90     return _result.get();
+ 91   }
+ 92 
+ 93   void satisfy(ZPage* page) {
+ 94     _result.set(page);
+ 95   }
+ 96 };
+ 97 
+ 98 ZPage* const ZPageAllocator::gc_marker = (ZPage*)-1;
+ 99 
+100 ZPageAllocator::ZPageAllocator(ZWorkers* workers,
+101                                size_t min_capacity,
+102                                size_t initial_capacity,
+103                                size_t max_capacity,
+104                                size_t max_reserve) :
+105     _lock(),
+106     _virtual(max_capacity),
+107     _physical(),
+108     _cache(),
+109     _min_capacity(min_capacity),
+110     _max_capacity(max_capacity),
+111     _max_reserve(max_reserve),
+112     _current_max_capacity(max_capacity),
+113     _capacity(0),
+114     _used_high(0),
+115     _used_low(0),
+116     _used(0),
+117     _allocated(0),
+118     _reclaimed(0),
+119     _queue(),
+120     _satisfied(),
+121     _safe_delete(),
+122     _uncommit(false),
+123     _initialized(false) {
+124 
+125   if (!_virtual.is_initialized() || !_physical.is_initialized()) {
+126     return;
+127   }
+128 
+129   log_info(gc, init)(&quot;Min Capacity: &quot; SIZE_FORMAT &quot;M&quot;, min_capacity / M);
+130   log_info(gc, init)(&quot;Initial Capacity: &quot; SIZE_FORMAT &quot;M&quot;, initial_capacity / M);
+131   log_info(gc, init)(&quot;Max Capacity: &quot; SIZE_FORMAT &quot;M&quot;, max_capacity / M);
+132   log_info(gc, init)(&quot;Max Reserve: &quot; SIZE_FORMAT &quot;M&quot;, max_reserve / M);
+133   log_info(gc, init)(&quot;Pre-touch: %s&quot;, AlwaysPreTouch ? &quot;Enabled&quot; : &quot;Disabled&quot;);
+134 
+135   // Warn if system limits could stop us from reaching max capacity
+136   _physical.warn_commit_limits(max_capacity);
+137 
+138   // Commit initial capacity
+139   _capacity = _physical.commit(initial_capacity);
+140   if (_capacity != initial_capacity) {
+141     log_error(gc)(&quot;Failed to allocate initial Java heap (&quot; SIZE_FORMAT &quot;M)&quot;, initial_capacity / M);
+142     return;
+143   }
+144 
+145   // If uncommit is not explicitly disabled, max capacity is greater than
+146   // min capacity, and uncommit is supported by the platform, then we will
+147   // try to uncommit unused memory.
+148   _uncommit = ZUncommit &amp;&amp; (max_capacity &gt; min_capacity) &amp;&amp; _physical.supports_uncommit();
+149   if (_uncommit) {
+150     log_info(gc, init)(&quot;Uncommit: Enabled, Delay: &quot; UINTX_FORMAT &quot;s&quot;, ZUncommitDelay);
+151   } else {
+152     log_info(gc, init)(&quot;Uncommit: Disabled&quot;);
+153   }
+154 
+155   // Pre-map initial capacity
+156   prime_cache(workers, initial_capacity);
+157 
+158   // Successfully initialized
+159   _initialized = true;
+160 }
+161 
+162 class ZPreTouchTask : public ZTask {
+163 private:
+164   const ZPhysicalMemoryManager* const _physical;
+165   volatile uintptr_t                  _start;
+166   const uintptr_t                     _end;
+167 
+168 public:
+169   ZPreTouchTask(const ZPhysicalMemoryManager* physical, uintptr_t start, uintptr_t end) :
+170       ZTask(&quot;ZPreTouchTask&quot;),
+171       _physical(physical),
+172       _start(start),
+173       _end(end) {}
+174 
+175   virtual void work() {
+176     for (;;) {
+177       // Get granule offset
+178       const size_t size = ZGranuleSize;
+179       const uintptr_t offset = Atomic::fetch_and_add(&amp;_start, size);
+180       if (offset &gt;= _end) {
+181         // Done
+182         break;
+183       }
+184 
+185       // Pre-touch granule
+186       _physical-&gt;pretouch(offset, size);
+187     }
+188   }
+189 };
+190 
+191 void ZPageAllocator::prime_cache(ZWorkers* workers, size_t size) {
+192   // Allocate physical memory
+193   const ZPhysicalMemory pmem = _physical.alloc(size);
+194   guarantee(!pmem.is_null(), &quot;Invalid size&quot;);
+195 
+196   // Allocate virtual memory
+197   const ZVirtualMemory vmem = _virtual.alloc(size, true /* alloc_from_front */);
+198   guarantee(!vmem.is_null(), &quot;Invalid size&quot;);
+199 
+200   // Allocate page
+201   ZPage* const page = new ZPage(vmem, pmem);
+202 
+203   // Map page
+204   map_page(page);
+205   page-&gt;set_pre_mapped();
+206 
+207   if (AlwaysPreTouch) {
+208     // Pre-touch page
+209     ZPreTouchTask task(&amp;_physical, page-&gt;start(), page-&gt;end());
+210     workers-&gt;run_parallel(&amp;task);
+211   }
+212 
+213   // Add page to cache
+214   page-&gt;set_last_used();
+215   _cache.free_page(page);
+216 }
+217 
+218 bool ZPageAllocator::is_initialized() const {
+219   return _initialized;
+220 }
+221 
+222 size_t ZPageAllocator::min_capacity() const {
+223   return _min_capacity;
+224 }
+225 
+226 size_t ZPageAllocator::max_capacity() const {
+227   return _max_capacity;
+228 }
+229 
+230 size_t ZPageAllocator::soft_max_capacity() const {
+231   // Note that SoftMaxHeapSize is a manageable flag
+232   return MIN2(SoftMaxHeapSize, _current_max_capacity);
+233 }
+234 
+235 size_t ZPageAllocator::capacity() const {
+236   return _capacity;
+237 }
+238 
+239 size_t ZPageAllocator::max_reserve() const {
+240   return _max_reserve;
+241 }
+242 
+243 size_t ZPageAllocator::used_high() const {
+244   return _used_high;
+245 }
+246 
+247 size_t ZPageAllocator::used_low() const {
+248   return _used_low;
+249 }
+250 
+251 size_t ZPageAllocator::used() const {
+252   return _used;
+253 }
+254 
+255 size_t ZPageAllocator::unused() const {
+256   const ssize_t unused = (ssize_t)_capacity - (ssize_t)_used - (ssize_t)_max_reserve;
+257   return unused &gt; 0 ? (size_t)unused : 0;
+258 }
+259 
+260 size_t ZPageAllocator::allocated() const {
+261   return _allocated;
+262 }
+263 
+264 size_t ZPageAllocator::reclaimed() const {
+265   return _reclaimed &gt; 0 ? (size_t)_reclaimed : 0;
+266 }
+267 
+268 void ZPageAllocator::reset_statistics() {
+269   assert(SafepointSynchronize::is_at_safepoint(), &quot;Should be at safepoint&quot;);
+270   _allocated = 0;
+271   _reclaimed = 0;
+272   _used_high = _used_low = _used;
+273 }
+274 
+275 void ZPageAllocator::increase_used(size_t size, bool relocation) {
+276   if (relocation) {
+277     // Allocating a page for the purpose of relocation has a
+278     // negative contribution to the number of reclaimed bytes.
+279     _reclaimed -= size;
+280   }
+281   _allocated += size;
+282   _used += size;
+283   if (_used &gt; _used_high) {
+284     _used_high = _used;
+285   }
+286 }
+287 
+288 void ZPageAllocator::decrease_used(size_t size, bool reclaimed) {
+289   if (reclaimed) {
+290     // Only pages explicitly released with the reclaimed flag set
+291     // counts as reclaimed bytes. This flag is typically true when
+292     // a worker releases a page after relocation, and is typically
+293     // false when we release a page to undo an allocation.
+294     _reclaimed += size;
+295   }
+296   _used -= size;
+297   if (_used &lt; _used_low) {
+298     _used_low = _used;
+299   }
+300 }
+301 
+302 ZPage* ZPageAllocator::create_page(uint8_t type, size_t size) {
+303   // Allocate virtual memory
+304   const ZVirtualMemory vmem = _virtual.alloc(size);
+305   if (vmem.is_null()) {
+306     // Out of address space
+307     return NULL;
+308   }
+309 
+310   // Allocate physical memory
+311   const ZPhysicalMemory pmem = _physical.alloc(size);
+312   assert(!pmem.is_null(), &quot;Invalid size&quot;);
+313 
+314   // Allocate page
+315   return new ZPage(type, vmem, pmem);
+316 }
+317 
+318 void ZPageAllocator::destroy_page(ZPage* page) {
+319   const ZVirtualMemory&amp; vmem = page-&gt;virtual_memory();
+320   const ZPhysicalMemory&amp; pmem = page-&gt;physical_memory();
+321 
+322   // Unmap memory
+323   _physical.unmap(pmem, vmem.start());
+324 
+325   // Free physical memory
+326   _physical.free(pmem);
+327 
+328   // Free virtual memory
+329   _virtual.free(vmem);
+330 
+331   // Delete page safely
+332   _safe_delete(page);
+333 }
+334 
+335 void ZPageAllocator::map_page(const ZPage* page) const {
+336   // Map physical memory
+337   _physical.map(page-&gt;physical_memory(), page-&gt;start());
+338 }
+339 
+340 size_t ZPageAllocator::max_available(bool no_reserve) const {
+341   size_t available = _current_max_capacity - _used;
+342 
+343   if (no_reserve) {
+344     // The reserve should not be considered available
+345     available -= MIN2(available, _max_reserve);
+346   }
+347 
+348   return available;
+349 }
+350 
+351 bool ZPageAllocator::ensure_available(size_t size, bool no_reserve) {
+352   if (max_available(no_reserve) &lt; size) {
+353     // Not enough free memory
+354     return false;
+355   }
+356 
+357   // We add the max_reserve to the requested size to avoid losing
+358   // the reserve because of failure to increase capacity before
+359   // reaching max capacity.
+360   size += _max_reserve;
+361 
+362   // Don&#39;t try to increase capacity if enough unused capacity
+363   // is available or if current max capacity has been reached.
+364   const size_t available = _capacity - _used;
+365   if (available &lt; size &amp;&amp; _capacity &lt; _current_max_capacity) {
+366     // Try to increase capacity
+367     const size_t commit = MIN2(size - available, _current_max_capacity - _capacity);
+368     const size_t committed = _physical.commit(commit);
+369     _capacity += committed;
+370 
+371     log_trace(gc, heap)(&quot;Make Available: Size: &quot; SIZE_FORMAT &quot;M, NoReserve: %s, &quot;
+372                         &quot;Available: &quot; SIZE_FORMAT &quot;M, Commit: &quot; SIZE_FORMAT &quot;M, &quot;
+373                         &quot;Committed: &quot; SIZE_FORMAT &quot;M, Capacity: &quot; SIZE_FORMAT &quot;M&quot;,
+374                         size / M, no_reserve ? &quot;True&quot; : &quot;False&quot;, available / M,
+375                         commit / M, committed / M, _capacity / M);
+376 
+377     if (committed != commit) {
+378       // Failed, or partly failed, to increase capacity. Adjust current
+379       // max capacity to avoid further attempts to increase capacity.
+380       log_error(gc)(&quot;Forced to lower max Java heap size from &quot;
+381                     SIZE_FORMAT &quot;M(%.0f%%) to &quot; SIZE_FORMAT &quot;M(%.0f%%)&quot;,
+382                     _current_max_capacity / M, percent_of(_current_max_capacity, _max_capacity),
+383                     _capacity / M, percent_of(_capacity, _max_capacity));
+384 
+385       _current_max_capacity = _capacity;
+386     }
+387   }
+388 
+389   if (!no_reserve) {
+390     size -= _max_reserve;
+391   }
+392 
+393   const size_t new_available = _capacity - _used;
+394   return new_available &gt;= size;
+395 }
+396 
+397 void ZPageAllocator::ensure_uncached_available(size_t size) {
+398   assert(_capacity - _used &gt;= size, &quot;Invalid size&quot;);
+399   const size_t uncached_available = _capacity - _used - _cache.available();
+400   if (size &gt; uncached_available) {
+401     flush_cache_for_allocation(size - uncached_available);
+402   }
+403 }
+404 
+405 ZPage* ZPageAllocator::alloc_page_common_inner(uint8_t type, size_t size, bool no_reserve) {
+406   if (!ensure_available(size, no_reserve)) {
+407     // Not enough free memory
+408     return NULL;
+409   }
+410 
+411   // Try allocate page from the cache
+412   ZPage* const page = _cache.alloc_page(type, size);
+413   if (page != NULL) {
+414     return page;
+415   }
+416 
+417   // Try flush pages from the cache
+418   ensure_uncached_available(size);
+419 
+420   // Create new page
+421   return create_page(type, size);
+422 }
+423 
+424 ZPage* ZPageAllocator::alloc_page_common(uint8_t type, size_t size, ZAllocationFlags flags) {
+<a name="3" id="anc3"></a>
+
+425   ZPage* const page = alloc_page_common_inner(type, size, flags.no_reserve());
+426   if (page == NULL) {
+427     // Out of memory
+428     return NULL;
+429   }
+430 
+431   // Update used statistics
+432   increase_used(size, flags.relocation());
+433 
+434   // Send trace event
+<a name="4" id="anc4"></a><span class="line-modified">435   ZTracer::tracer()-&gt;report_page_alloc(size, _used, max_available(flags.no_reserve()), _cache.available(), flags);</span>
+
+436 
+437   return page;
+438 }
+439 
+440 void ZPageAllocator::check_out_of_memory_during_initialization() {
+441   if (!is_init_completed()) {
+442     vm_exit_during_initialization(&quot;java.lang.OutOfMemoryError&quot;, &quot;Java heap too small&quot;);
+443   }
+444 }
+445 
+446 ZPage* ZPageAllocator::alloc_page_blocking(uint8_t type, size_t size, ZAllocationFlags flags) {
+447   // Prepare to block
+448   ZPageAllocRequest request(type, size, flags, ZCollectedHeap::heap()-&gt;total_collections());
+449 
+450   _lock.lock();
+451 
+452   // Try non-blocking allocation
+453   ZPage* page = alloc_page_common(type, size, flags);
+454   if (page == NULL) {
+455     // Allocation failed, enqueue request
+456     _queue.insert_last(&amp;request);
+457   }
+458 
+459   _lock.unlock();
+460 
+461   if (page == NULL) {
+462     // Allocation failed
+463     ZStatTimer timer(ZCriticalPhaseAllocationStall);
+<a name="5" id="anc5"></a>
+464 
+465     // We can only block if VM is fully initialized
+466     check_out_of_memory_during_initialization();
+467 
+468     do {
+469       // Start asynchronous GC
+470       ZCollectedHeap::heap()-&gt;collect(GCCause::_z_allocation_stall);
+471 
+472       // Wait for allocation to complete or fail
+473       page = request.wait();
+474     } while (page == gc_marker);
+475 
+476     {
+477       //
+478       // We grab the lock here for two different reasons:
+479       //
+480       // 1) Guard deletion of underlying semaphore. This is a workaround for
+481       // a bug in sem_post() in glibc &lt; 2.21, where it&#39;s not safe to destroy
+482       // the semaphore immediately after returning from sem_wait(). The
+483       // reason is that sem_post() can touch the semaphore after a waiting
+484       // thread have returned from sem_wait(). To avoid this race we are
+485       // forcing the waiting thread to acquire/release the lock held by the
+486       // posting thread. https://sourceware.org/bugzilla/show_bug.cgi?id=12674
+487       //
+488       // 2) Guard the list of satisfied pages.
+489       //
+490       ZLocker&lt;ZLock&gt; locker(&amp;_lock);
+491       _satisfied.remove(&amp;request);
+492     }
+<a name="6" id="anc6"></a>
+
+493   }
+494 
+495   return page;
+496 }
+497 
+498 ZPage* ZPageAllocator::alloc_page_nonblocking(uint8_t type, size_t size, ZAllocationFlags flags) {
+499   ZLocker&lt;ZLock&gt; locker(&amp;_lock);
+500   return alloc_page_common(type, size, flags);
+501 }
+502 
+503 ZPage* ZPageAllocator::alloc_page(uint8_t type, size_t size, ZAllocationFlags flags) {
+504   ZPage* const page = flags.non_blocking()
+505                       ? alloc_page_nonblocking(type, size, flags)
+506                       : alloc_page_blocking(type, size, flags);
+507   if (page == NULL) {
+508     // Out of memory
+509     return NULL;
+510   }
+511 
+512   // Map page if needed
+513   if (!page-&gt;is_mapped()) {
+514     map_page(page);
+515   }
+516 
+517   // Reset page. This updates the page&#39;s sequence number and must
+518   // be done after page allocation, which potentially blocked in
+519   // a safepoint where the global sequence number was updated.
+520   page-&gt;reset();
+521 
+522   // Update allocation statistics. Exclude worker threads to avoid
+523   // artificial inflation of the allocation rate due to relocation.
+524   if (!flags.worker_thread()) {
+525     // Note that there are two allocation rate counters, which have
+526     // different purposes and are sampled at different frequencies.
+527     const size_t bytes = page-&gt;size();
+528     ZStatInc(ZCounterAllocationRate, bytes);
+529     ZStatInc(ZStatAllocRate::counter(), bytes);
+530   }
+531 
+532   return page;
+533 }
+534 
+535 void ZPageAllocator::satisfy_alloc_queue() {
+536   for (;;) {
+537     ZPageAllocRequest* const request = _queue.first();
+538     if (request == NULL) {
+539       // Allocation queue is empty
+540       return;
+541     }
+542 
+543     ZPage* const page = alloc_page_common(request-&gt;type(), request-&gt;size(), request-&gt;flags());
+544     if (page == NULL) {
+545       // Allocation could not be satisfied, give up
+546       return;
+547     }
+548 
+549     // Allocation succeeded, dequeue and satisfy request. Note that
+550     // the dequeue operation must happen first, since the request
+551     // will immediately be deallocated once it has been satisfied.
+552     _queue.remove(request);
+553     _satisfied.insert_first(request);
+554     request-&gt;satisfy(page);
+555   }
+556 }
+557 
+558 void ZPageAllocator::free_page(ZPage* page, bool reclaimed) {
+559   ZLocker&lt;ZLock&gt; locker(&amp;_lock);
+560 
+561   // Update used statistics
+562   decrease_used(page-&gt;size(), reclaimed);
+563 
+564   // Set time when last used
+565   page-&gt;set_last_used();
+566 
+567   // Cache page
+568   _cache.free_page(page);
+569 
+570   // Try satisfy blocked allocations
+571   satisfy_alloc_queue();
+572 }
+573 
+<a name="7" id="anc7"></a><span class="line-modified">574 size_t ZPageAllocator::flush_cache(ZPageCacheFlushClosure* cl) {</span>
+
+
+575   ZList&lt;ZPage&gt; list;
+576 
+577   // Flush pages
+578   _cache.flush(cl, &amp;list);
+579 
+580   const size_t overflushed = cl-&gt;overflushed();
+581   if (overflushed &gt; 0) {
+582     // Overflushed, keep part of last page
+583     ZPage* const page = list.last()-&gt;split(overflushed);
+584     _cache.free_page(page);
+585   }
+586 
+587   // Destroy pages
+588   size_t flushed = 0;
+589   for (ZPage* page = list.remove_first(); page != NULL; page = list.remove_first()) {
+590     flushed += page-&gt;size();
+591     destroy_page(page);
+592   }
+593 
+<a name="8" id="anc8"></a>
+
+
+594   return flushed;
+595 }
+596 
+597 class ZPageCacheFlushForAllocationClosure : public ZPageCacheFlushClosure {
+598 public:
+599   ZPageCacheFlushForAllocationClosure(size_t requested) :
+600       ZPageCacheFlushClosure(requested) {}
+601 
+602   virtual bool do_page(const ZPage* page) {
+603     if (_flushed &lt; _requested) {
+604       // Flush page
+605       _flushed += page-&gt;size();
+606       return true;
+607     }
+608 
+609     // Don&#39;t flush page
+610     return false;
+611   }
+612 };
+613 
+614 void ZPageAllocator::flush_cache_for_allocation(size_t requested) {
+615   assert(requested &lt;= _cache.available(), &quot;Invalid request&quot;);
+616 
+617   // Flush pages
+618   ZPageCacheFlushForAllocationClosure cl(requested);
+<a name="9" id="anc9"></a><span class="line-modified">619   const size_t flushed = flush_cache(&amp;cl);</span>
+620 
+621   assert(requested == flushed, &quot;Failed to flush&quot;);
+622 
+623   const size_t cached_after = _cache.available();
+624   const size_t cached_before = cached_after + flushed;
+625 
+626   log_info(gc, heap)(&quot;Page Cache: &quot; SIZE_FORMAT &quot;M(%.0f%%)-&gt;&quot; SIZE_FORMAT &quot;M(%.0f%%), &quot;
+627                      &quot;Flushed: &quot; SIZE_FORMAT &quot;M&quot;,
+628                      cached_before / M, percent_of(cached_before, max_capacity()),
+629                      cached_after / M, percent_of(cached_after, max_capacity()),
+630                      flushed / M);
+631 
+632   // Update statistics
+633   ZStatInc(ZCounterPageCacheFlush, flushed);
+634 }
+635 
+636 class ZPageCacheFlushForUncommitClosure : public ZPageCacheFlushClosure {
+637 private:
+638   const uint64_t _now;
+639   const uint64_t _delay;
+640   uint64_t       _timeout;
+641 
+642 public:
+643   ZPageCacheFlushForUncommitClosure(size_t requested, uint64_t delay) :
+644       ZPageCacheFlushClosure(requested),
+645       _now(os::elapsedTime()),
+646       _delay(delay),
+647       _timeout(_delay) {}
+648 
+649   virtual bool do_page(const ZPage* page) {
+650     const uint64_t expires = page-&gt;last_used() + _delay;
+651     const uint64_t timeout = expires - MIN2(expires, _now);
+652 
+653     if (_flushed &lt; _requested &amp;&amp; timeout == 0) {
+654       // Flush page
+655       _flushed += page-&gt;size();
+656       return true;
+657     }
+658 
+659     // Record shortest non-expired timeout
+660     _timeout = MIN2(_timeout, timeout);
+661 
+662     // Don&#39;t flush page
+663     return false;
+664   }
+665 
+666   uint64_t timeout() const {
+667     return _timeout;
+668   }
+669 };
+670 
+671 uint64_t ZPageAllocator::uncommit(uint64_t delay) {
+672   // Set the default timeout, when no pages are found in the
+673   // cache or when uncommit is disabled, equal to the delay.
+674   uint64_t timeout = delay;
+675 
+676   if (!_uncommit) {
+677     // Disabled
+678     return timeout;
+679   }
+680 
+<a name="10" id="anc10"></a>
+681   size_t capacity_before;
+682   size_t capacity_after;
+683   size_t uncommitted;
+684 
+685   {
+686     SuspendibleThreadSetJoiner joiner;
+687     ZLocker&lt;ZLock&gt; locker(&amp;_lock);
+688 
+689     // Don&#39;t flush more than we will uncommit. Never uncommit
+690     // the reserve, and never uncommit below min capacity.
+691     const size_t needed = MIN2(_used + _max_reserve, _current_max_capacity);
+692     const size_t guarded = MAX2(needed, _min_capacity);
+693     const size_t uncommittable = _capacity - guarded;
+694     const size_t uncached_available = _capacity - _used - _cache.available();
+695     size_t uncommit = MIN2(uncommittable, uncached_available);
+696     const size_t flush = uncommittable - uncommit;
+697 
+698     if (flush &gt; 0) {
+699       // Flush pages to uncommit
+700       ZPageCacheFlushForUncommitClosure cl(flush, delay);
+<a name="11" id="anc11"></a><span class="line-modified">701       uncommit += flush_cache(&amp;cl);</span>
+702       timeout = cl.timeout();
+703     }
+704 
+705     // Uncommit
+706     uncommitted = _physical.uncommit(uncommit);
+707     _capacity -= uncommitted;
+708 
+709     capacity_after = _capacity;
+710     capacity_before = capacity_after + uncommitted;
+711   }
+712 
+713   if (uncommitted &gt; 0) {
+714     log_info(gc, heap)(&quot;Capacity: &quot; SIZE_FORMAT &quot;M(%.0f%%)-&gt;&quot; SIZE_FORMAT &quot;M(%.0f%%), &quot;
+715                        &quot;Uncommitted: &quot; SIZE_FORMAT &quot;M&quot;,
+716                        capacity_before / M, percent_of(capacity_before, max_capacity()),
+717                        capacity_after / M, percent_of(capacity_after, max_capacity()),
+718                        uncommitted / M);
+719 
+<a name="12" id="anc12"></a>
+
+
+720     // Update statistics
+721     ZStatInc(ZCounterUncommit, uncommitted);
+722   }
+723 
+724   return timeout;
+725 }
+726 
+727 void ZPageAllocator::enable_deferred_delete() const {
+728   _safe_delete.enable_deferred_delete();
+729 }
+730 
+731 void ZPageAllocator::disable_deferred_delete() const {
+732   _safe_delete.disable_deferred_delete();
+733 }
+734 
+735 void ZPageAllocator::debug_map_page(const ZPage* page) const {
+736   assert(SafepointSynchronize::is_at_safepoint(), &quot;Should be at safepoint&quot;);
+737   _physical.debug_map(page-&gt;physical_memory(), page-&gt;start());
+738 }
+739 
+740 void ZPageAllocator::debug_unmap_page(const ZPage* page) const {
+741   assert(SafepointSynchronize::is_at_safepoint(), &quot;Should be at safepoint&quot;);
+742   _physical.debug_unmap(page-&gt;physical_memory(), page-&gt;start());
+743 }
+744 
+745 void ZPageAllocator::pages_do(ZPageClosure* cl) const {
+746   ZListIterator&lt;ZPageAllocRequest&gt; iter(&amp;_satisfied);
+747   for (ZPageAllocRequest* request; iter.next(&amp;request);) {
+748     const ZPage* const page = request-&gt;peek();
+749     if (page != NULL) {
+750       cl-&gt;do_page(page);
+751     }
+752   }
+753 
+754   _cache.pages_do(cl);
+755 }
+756 
+757 bool ZPageAllocator::is_alloc_stalled() const {
+758   assert(SafepointSynchronize::is_at_safepoint(), &quot;Should be at safepoint&quot;);
+759   return !_queue.is_empty();
+760 }
+761 
+762 void ZPageAllocator::check_out_of_memory() {
+763   ZLocker&lt;ZLock&gt; locker(&amp;_lock);
+764 
+765   // Fail allocation requests that were enqueued before the
+766   // last GC cycle started, otherwise start a new GC cycle.
+767   for (ZPageAllocRequest* request = _queue.first(); request != NULL; request = _queue.first()) {
+768     if (request-&gt;total_collections() == ZCollectedHeap::heap()-&gt;total_collections()) {
+769       // Start a new GC cycle, keep allocation requests enqueued
+770       request-&gt;satisfy(gc_marker);
+771       return;
+772     }
+773 
+774     // Out of memory, fail allocation request
+775     _queue.remove(request);
+776     _satisfied.insert_first(request);
+777     request-&gt;satisfy(NULL);
+778   }
+779 }
+<a name="13" id="anc13"></a><b style="font-size: large; color: red">--- EOF ---</b>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+</pre>
+<input id="eof" value="13" type="hidden" />
+</body>
+</html>

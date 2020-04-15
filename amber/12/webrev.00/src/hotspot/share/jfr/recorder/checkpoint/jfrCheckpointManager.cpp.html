@@ -1,0 +1,535 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>New src/hotspot/share/jfr/recorder/checkpoint/jfrCheckpointManager.cpp</title>
+    <link rel="stylesheet" href="../../../../../../style.css" />
+  </head>
+  <body>
+    <pre>
+  1 /*
+  2  * Copyright (c) 2016, 2020, Oracle and/or its affiliates. All rights reserved.
+  3  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  4  *
+  5  * This code is free software; you can redistribute it and/or modify it
+  6  * under the terms of the GNU General Public License version 2 only, as
+  7  * published by the Free Software Foundation.
+  8  *
+  9  * This code is distributed in the hope that it will be useful, but WITHOUT
+ 10  * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ 11  * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ 12  * version 2 for more details (a copy is included in the LICENSE file that
+ 13  * accompanied this code).
+ 14  *
+ 15  * You should have received a copy of the GNU General Public License version
+ 16  * 2 along with this work; if not, write to the Free Software Foundation,
+ 17  * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ 18  *
+ 19  * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ 20  * or visit www.oracle.com if you need additional information or have any
+ 21  * questions.
+ 22  *
+ 23  */
+ 24 
+ 25 #include &quot;precompiled.hpp&quot;
+ 26 #include &quot;classfile/javaClasses.inline.hpp&quot;
+ 27 #include &quot;jfr/leakprofiler/checkpoint/objectSampleCheckpoint.hpp&quot;
+ 28 #include &quot;jfr/leakprofiler/leakProfiler.hpp&quot;
+ 29 #include &quot;jfr/recorder/checkpoint/jfrCheckpointManager.hpp&quot;
+ 30 #include &quot;jfr/recorder/checkpoint/jfrCheckpointWriter.hpp&quot;
+ 31 #include &quot;jfr/recorder/checkpoint/types/jfrTypeManager.hpp&quot;
+ 32 #include &quot;jfr/recorder/checkpoint/types/jfrTypeSet.hpp&quot;
+ 33 #include &quot;jfr/recorder/checkpoint/types/traceid/jfrTraceIdEpoch.hpp&quot;
+ 34 #include &quot;jfr/recorder/jfrRecorder.hpp&quot;
+ 35 #include &quot;jfr/recorder/repository/jfrChunkWriter.hpp&quot;
+ 36 #include &quot;jfr/recorder/service/jfrOptionSet.hpp&quot;
+ 37 #include &quot;jfr/recorder/storage/jfrMemorySpace.inline.hpp&quot;
+ 38 #include &quot;jfr/recorder/storage/jfrStorageUtils.inline.hpp&quot;
+ 39 #include &quot;jfr/utilities/jfrBigEndian.hpp&quot;
+ 40 #include &quot;jfr/utilities/jfrIterator.hpp&quot;
+ 41 #include &quot;jfr/utilities/jfrThreadIterator.hpp&quot;
+ 42 #include &quot;jfr/utilities/jfrTypes.hpp&quot;
+ 43 #include &quot;jfr/writers/jfrJavaEventWriter.hpp&quot;
+ 44 #include &quot;logging/log.hpp&quot;
+ 45 #include &quot;memory/iterator.hpp&quot;
+ 46 #include &quot;memory/resourceArea.hpp&quot;
+ 47 #include &quot;runtime/atomic.hpp&quot;
+ 48 #include &quot;runtime/handles.inline.hpp&quot;
+ 49 #include &quot;runtime/mutex.hpp&quot;
+ 50 #include &quot;runtime/os.inline.hpp&quot;
+ 51 #include &quot;runtime/safepoint.hpp&quot;
+ 52 
+ 53 typedef JfrCheckpointManager::Buffer* BufferPtr;
+ 54 
+ 55 static JfrCheckpointManager* _instance = NULL;
+ 56 
+ 57 static volatile bool constant_pending = false;
+ 58 
+ 59 static bool is_constant_pending() {
+ 60   if (Atomic::load_acquire(&amp;constant_pending)) {
+ 61     Atomic::release_store(&amp;constant_pending, false); // reset
+ 62     return true;
+ 63   }
+ 64   return false;
+ 65 }
+ 66 
+ 67 static void set_constant_pending() {
+ 68   if (!Atomic::load_acquire(&amp;constant_pending)) {
+ 69     Atomic::release_store(&amp;constant_pending, true);
+ 70   }
+ 71 }
+ 72 
+ 73 JfrCheckpointManager&amp; JfrCheckpointManager::instance() {
+ 74   return *_instance;
+ 75 }
+ 76 
+ 77 JfrCheckpointManager* JfrCheckpointManager::create(JfrChunkWriter&amp; cw) {
+ 78   assert(_instance == NULL, &quot;invariant&quot;);
+ 79   _instance = new JfrCheckpointManager(cw);
+ 80   return _instance;
+ 81 }
+ 82 
+ 83 void JfrCheckpointManager::destroy() {
+ 84   assert(_instance != NULL, &quot;invariant&quot;);
+ 85   delete _instance;
+ 86   _instance = NULL;
+ 87 }
+ 88 
+ 89 JfrCheckpointManager::JfrCheckpointManager(JfrChunkWriter&amp; cw) :
+ 90   _free_list_mspace(NULL),
+ 91   _epoch_transition_mspace(NULL),
+ 92   _lock(NULL),
+ 93   _service_thread(NULL),
+ 94   _chunkwriter(cw),
+ 95   _checkpoint_epoch_state(JfrTraceIdEpoch::epoch()) {}
+ 96 
+ 97 JfrCheckpointManager::~JfrCheckpointManager() {
+ 98   if (_free_list_mspace != NULL) {
+ 99     delete _free_list_mspace;
+100   }
+101   if (_epoch_transition_mspace != NULL) {
+102     delete _epoch_transition_mspace;
+103   }
+104   if (_lock != NULL) {
+105     delete _lock;
+106   }
+107   JfrTypeManager::destroy();
+108 }
+109 
+110 static const size_t unlimited_mspace_size = 0;
+111 static const size_t checkpoint_buffer_cache_count = 2;
+112 static const size_t checkpoint_buffer_size = 512 * K;
+113 
+114 static JfrCheckpointMspace* allocate_mspace(size_t size, size_t limit, size_t cache_count, JfrCheckpointManager* mgr) {
+115   return create_mspace&lt;JfrCheckpointMspace, JfrCheckpointManager&gt;(size, limit, cache_count, mgr);
+116 }
+117 
+118 bool JfrCheckpointManager::initialize() {
+119   assert(_free_list_mspace == NULL, &quot;invariant&quot;);
+120   _free_list_mspace = allocate_mspace(checkpoint_buffer_size, unlimited_mspace_size, checkpoint_buffer_cache_count, this);
+121   if (_free_list_mspace == NULL) {
+122     return false;
+123   }
+124   assert(_epoch_transition_mspace == NULL, &quot;invariant&quot;);
+125   _epoch_transition_mspace = allocate_mspace(checkpoint_buffer_size, unlimited_mspace_size, checkpoint_buffer_cache_count, this);
+126   if (_epoch_transition_mspace == NULL) {
+127     return false;
+128   }
+129   assert(_lock == NULL, &quot;invariant&quot;);
+130   _lock = new Mutex(Monitor::leaf - 1, &quot;Checkpoint mutex&quot;, Mutex::_allow_vm_block_flag, Monitor::_safepoint_check_never);
+131   if (_lock == NULL) {
+132     return false;
+133   }
+134   return JfrTypeManager::initialize();
+135 }
+136 
+137 void JfrCheckpointManager::register_service_thread(const Thread* thread) {
+138   _service_thread = thread;
+139 }
+140 
+141 void JfrCheckpointManager::register_full(BufferPtr t, Thread* thread) {
+142   // nothing here at the moment
+143   assert(t != NULL, &quot;invariant&quot;);
+144   assert(t-&gt;acquired_by(thread), &quot;invariant&quot;);
+145   assert(t-&gt;retired(), &quot;invariant&quot;);
+146 }
+147 
+148 void JfrCheckpointManager::lock() {
+149   assert(!_lock-&gt;owned_by_self(), &quot;invariant&quot;);
+150   _lock-&gt;lock_without_safepoint_check();
+151 }
+152 
+153 void JfrCheckpointManager::unlock() {
+154   _lock-&gt;unlock();
+155 }
+156 
+157 #ifdef ASSERT
+158 bool JfrCheckpointManager::is_locked() const {
+159   return _lock-&gt;owned_by_self();
+160 }
+161 
+162 static void assert_free_lease(const BufferPtr buffer) {
+163   assert(buffer != NULL, &quot;invariant&quot;);
+164   assert(buffer-&gt;acquired_by_self(), &quot;invariant&quot;);
+165   assert(buffer-&gt;lease(), &quot;invariant&quot;);
+166 }
+167 
+168 static void assert_release(const BufferPtr buffer) {
+169   assert(buffer != NULL, &quot;invariant&quot;);
+170   assert(buffer-&gt;lease(), &quot;invariant&quot;);
+171   assert(buffer-&gt;acquired_by_self(), &quot;invariant&quot;);
+172 }
+173 #endif // ASSERT
+174 
+175 static BufferPtr lease_free(size_t size, JfrCheckpointMspace* mspace, size_t retry_count, Thread* thread) {
+176   static const size_t max_elem_size = mspace-&gt;min_elem_size(); // min is max
+177   BufferPtr buffer;
+178   if (size &lt;= max_elem_size) {
+179     BufferPtr buffer = mspace_get_free_lease_with_retry(size, mspace, retry_count, thread);
+180     if (buffer != NULL) {
+181       DEBUG_ONLY(assert_free_lease(buffer);)
+182       return buffer;
+183     }
+184   }
+185   buffer = mspace_allocate_transient_lease_to_free(size, mspace, thread);
+186   DEBUG_ONLY(assert_free_lease(buffer);)
+187   return buffer;
+188 }
+189 
+190 bool JfrCheckpointManager::use_epoch_transition_mspace(const Thread* thread) const {
+191   return _service_thread != thread &amp;&amp; Atomic::load_acquire(&amp;_checkpoint_epoch_state) != JfrTraceIdEpoch::epoch();
+192 }
+193 
+194 static const size_t lease_retry = 10;
+195 
+196 BufferPtr JfrCheckpointManager::lease_buffer(Thread* thread, size_t size /* 0 */) {
+197   JfrCheckpointManager&amp; manager = instance();
+198   if (manager.use_epoch_transition_mspace(thread)) {
+199     return lease_free(size, manager._epoch_transition_mspace, lease_retry, thread);
+200   }
+201   return lease_free(size, manager._free_list_mspace, lease_retry, thread);
+202 }
+203 
+204 JfrCheckpointMspace* JfrCheckpointManager::lookup(BufferPtr old) const {
+205   assert(old != NULL, &quot;invariant&quot;);
+206   return _free_list_mspace-&gt;in_free_list(old) ? _free_list_mspace : _epoch_transition_mspace;
+207 }
+208 
+209 BufferPtr JfrCheckpointManager::lease_buffer(BufferPtr old, Thread* thread, size_t size /* 0 */) {
+210   assert(old != NULL, &quot;invariant&quot;);
+211   JfrCheckpointMspace* mspace = instance().lookup(old);
+212   assert(mspace != NULL, &quot;invariant&quot;);
+213   return lease_free(size, mspace, lease_retry, thread);
+214 }
+215 
+216 /*
+217  * If the buffer was a lease, release back.
+218  *
+219  * The buffer is effectively invalidated for the thread post-return,
+220  * and the caller should take means to ensure that it is not referenced.
+221  */
+222 static void release(BufferPtr const buffer, Thread* thread) {
+223   DEBUG_ONLY(assert_release(buffer);)
+224   buffer-&gt;clear_lease();
+225   buffer-&gt;release();
+226 }
+227 
+228 BufferPtr JfrCheckpointManager::flush(BufferPtr old, size_t used, size_t requested, Thread* thread) {
+229   assert(old != NULL, &quot;invariant&quot;);
+230   assert(old-&gt;lease(), &quot;invariant&quot;);
+231   if (0 == requested) {
+232     // indicates a lease is being returned
+233     release(old, thread);
+234     set_constant_pending();
+235     return NULL;
+236   }
+237   // migration of in-flight information
+238   BufferPtr const new_buffer = lease_buffer(old, thread, used + requested);
+239   if (new_buffer != NULL) {
+240     migrate_outstanding_writes(old, new_buffer, used, requested);
+241   }
+242   release(old, thread);
+243   return new_buffer; // might be NULL
+244 }
+245 
+246 // offsets into the JfrCheckpointEntry
+247 static const juint starttime_offset = sizeof(jlong);
+248 static const juint duration_offset = starttime_offset + sizeof(jlong);
+249 static const juint checkpoint_type_offset = duration_offset + sizeof(jlong);
+250 static const juint types_offset = checkpoint_type_offset + sizeof(juint);
+251 static const juint payload_offset = types_offset + sizeof(juint);
+252 
+253 template &lt;typename Return&gt;
+254 static Return read_data(const u1* data) {
+255   return JfrBigEndian::read&lt;Return&gt;(data);
+256 }
+257 
+258 static jlong total_size(const u1* data) {
+259   return read_data&lt;jlong&gt;(data);
+260 }
+261 
+262 static jlong starttime(const u1* data) {
+263   return read_data&lt;jlong&gt;(data + starttime_offset);
+264 }
+265 
+266 static jlong duration(const u1* data) {
+267   return read_data&lt;jlong&gt;(data + duration_offset);
+268 }
+269 
+270 static u1 checkpoint_type(const u1* data) {
+271   return read_data&lt;u1&gt;(data + checkpoint_type_offset);
+272 }
+273 
+274 static juint number_of_types(const u1* data) {
+275   return read_data&lt;juint&gt;(data + types_offset);
+276 }
+277 
+278 static void write_checkpoint_header(JfrChunkWriter&amp; cw, int64_t delta_to_last_checkpoint, const u1* data) {
+279   cw.reserve(sizeof(u4));
+280   cw.write&lt;u8&gt;(EVENT_CHECKPOINT);
+281   cw.write(starttime(data));
+282   cw.write(duration(data));
+283   cw.write(delta_to_last_checkpoint);
+284   cw.write(checkpoint_type(data));
+285   cw.write(number_of_types(data));
+286 }
+287 
+288 static void write_checkpoint_content(JfrChunkWriter&amp; cw, const u1* data, size_t size) {
+289   assert(data != NULL, &quot;invariant&quot;);
+290   cw.write_unbuffered(data + payload_offset, size - sizeof(JfrCheckpointEntry));
+291 }
+292 
+293 static size_t write_checkpoint_event(JfrChunkWriter&amp; cw, const u1* data) {
+294   assert(data != NULL, &quot;invariant&quot;);
+295   const int64_t event_begin = cw.current_offset();
+296   const int64_t last_checkpoint_event = cw.last_checkpoint_offset();
+297   const int64_t delta_to_last_checkpoint = last_checkpoint_event == 0 ? 0 : last_checkpoint_event - event_begin;
+298   const int64_t checkpoint_size = total_size(data);
+299   write_checkpoint_header(cw, delta_to_last_checkpoint, data);
+300   write_checkpoint_content(cw, data, checkpoint_size);
+301   const int64_t event_size = cw.current_offset() - event_begin;
+302   cw.write_padded_at_offset&lt;u4&gt;(event_size, event_begin);
+303   cw.set_last_checkpoint_offset(event_begin);
+304   return (size_t)checkpoint_size;
+305 }
+306 
+307 static size_t write_checkpoints(JfrChunkWriter&amp; cw, const u1* data, size_t size) {
+308   assert(cw.is_valid(), &quot;invariant&quot;);
+309   assert(data != NULL, &quot;invariant&quot;);
+310   assert(size &gt; 0, &quot;invariant&quot;);
+311   const u1* const limit = data + size;
+312   const u1* next = data;
+313   size_t processed = 0;
+314   while (next &lt; limit) {
+315     const size_t checkpoint_size = write_checkpoint_event(cw, next);
+316     processed += checkpoint_size;
+317     next += checkpoint_size;
+318   }
+319   assert(next == limit, &quot;invariant&quot;);
+320   return processed;
+321 }
+322 
+323 template &lt;typename T&gt;
+324 class CheckpointWriteOp {
+325  private:
+326   JfrChunkWriter&amp; _writer;
+327   size_t _processed;
+328  public:
+329   typedef T Type;
+330   CheckpointWriteOp(JfrChunkWriter&amp; writer) : _writer(writer), _processed(0) {}
+331   bool write(Type* t, const u1* data, size_t size) {
+332     _processed += write_checkpoints(_writer, data, size);
+333     return true;
+334   }
+335   size_t processed() const { return _processed; }
+336 };
+337 
+338 typedef CheckpointWriteOp&lt;JfrCheckpointMspace::Type&gt; WriteOperation;
+339 typedef ReleaseOp&lt;JfrCheckpointMspace&gt; CheckpointReleaseOperation;
+340 
+341 template &lt;template &lt;typename&gt; class WriterHost, template &lt;typename, typename, typename&gt; class CompositeOperation&gt;
+342 static size_t write_mspace(JfrCheckpointMspace* mspace, JfrChunkWriter&amp; chunkwriter) {
+343   assert(mspace != NULL, &quot;invariant&quot;);
+344   WriteOperation wo(chunkwriter);
+345   WriterHost&lt;WriteOperation&gt; wh(wo);
+346   CheckpointReleaseOperation cro(mspace, Thread::current(), false);
+347   CompositeOperation&lt;WriterHost&lt;WriteOperation&gt;, CheckpointReleaseOperation, CompositeOperationAnd&gt; co(&amp;wh, &amp;cro);
+348   assert(mspace-&gt;is_full_empty(), &quot;invariant&quot;);
+349   process_free_list(co, mspace);
+350   return wo.processed();
+351 }
+352 
+353 void JfrCheckpointManager::begin_epoch_shift() {
+354   assert(SafepointSynchronize::is_at_safepoint(), &quot;invariant&quot;);
+355   JfrTraceIdEpoch::begin_epoch_shift();
+356 }
+357 
+358 void JfrCheckpointManager::end_epoch_shift() {
+359   assert(SafepointSynchronize::is_at_safepoint(), &quot;invariant&quot;);
+360   debug_only(const u1 current_epoch = JfrTraceIdEpoch::current();)
+361   JfrTraceIdEpoch::end_epoch_shift();
+362   assert(current_epoch != JfrTraceIdEpoch::current(), &quot;invariant&quot;);
+363 }
+364 
+365 void JfrCheckpointManager::synchronize_checkpoint_manager_with_current_epoch() {
+366   assert(_checkpoint_epoch_state != JfrTraceIdEpoch::epoch(), &quot;invariant&quot;);
+367   OrderAccess::storestore();
+368   _checkpoint_epoch_state = JfrTraceIdEpoch::epoch();
+369 }
+370 
+371 size_t JfrCheckpointManager::write() {
+372   const size_t processed = write_mspace&lt;MutexedWriteOp, CompositeOperation&gt;(_free_list_mspace, _chunkwriter);
+373   synchronize_checkpoint_manager_with_current_epoch();
+374   return processed;
+375 }
+376 
+377 size_t JfrCheckpointManager::write_epoch_transition_mspace() {
+378   return write_mspace&lt;ExclusiveOp, CompositeOperation&gt;(_epoch_transition_mspace, _chunkwriter);
+379 }
+380 
+381 typedef DiscardOp&lt;DefaultDiscarder&lt;JfrBuffer&gt; &gt; DiscardOperation;
+382 size_t JfrCheckpointManager::clear() {
+383   clear_type_set();
+384   DiscardOperation discarder(mutexed); // mutexed discard mode
+385   process_free_list(discarder, _free_list_mspace);
+386   process_free_list(discarder, _epoch_transition_mspace);
+387   synchronize_checkpoint_manager_with_current_epoch();
+388   return discarder.elements();
+389 }
+390 
+391 // Optimization for write_static_type_set() and write_threads() is to write
+392 // directly into the epoch transition mspace because we will immediately
+393 // serialize and reset this mspace post-write.
+394 static JfrBuffer* get_epoch_transition_buffer(JfrCheckpointMspace* mspace, Thread* t) {
+395   assert(mspace != NULL, &quot;invariant&quot;);
+396   JfrBuffer* const buffer = mspace-&gt;free_head();
+397   assert(buffer != NULL, &quot;invariant&quot;);
+398   buffer-&gt;acquire(t);
+399   buffer-&gt;set_lease();
+400   DEBUG_ONLY(assert_free_lease(buffer);)
+401   return buffer;
+402 }
+403 
+404 size_t JfrCheckpointManager::write_static_type_set() {
+405   Thread* const t = Thread::current();
+406   ResourceMark rm(t);
+407   HandleMark hm(t);
+408   JfrCheckpointWriter writer(t, get_epoch_transition_buffer(_epoch_transition_mspace, t), STATICS);
+409   JfrTypeManager::write_static_types(writer);
+410   return writer.used_size();
+411 }
+412 
+413 size_t JfrCheckpointManager::write_threads() {
+414   Thread* const t = Thread::current();
+415   ResourceMark rm(t);
+416   HandleMark hm(t);
+417   JfrCheckpointWriter writer(t, get_epoch_transition_buffer(_epoch_transition_mspace, t), THREADS);
+418   JfrTypeManager::write_threads(writer);
+419   return writer.used_size();
+420 }
+421 
+422 size_t JfrCheckpointManager::write_static_type_set_and_threads() {
+423   write_static_type_set();
+424   write_threads();
+425   return write_epoch_transition_mspace();
+426 }
+427 
+428 void JfrCheckpointManager::on_rotation() {
+429   assert(SafepointSynchronize::is_at_safepoint(), &quot;invariant&quot;);
+430   JfrTypeManager::on_rotation();
+431   notify_threads();
+432 }
+433 
+434 void JfrCheckpointManager::clear_type_set() {
+435   assert(!SafepointSynchronize::is_at_safepoint(), &quot;invariant&quot;);
+436   assert(!JfrRecorder::is_recording(), &quot;invariant&quot;);
+437   // can safepoint here
+438   MutexLocker cld_lock(ClassLoaderDataGraph_lock);
+439   MutexLocker module_lock(Module_lock);
+440   JfrTypeSet::clear();
+441 }
+442 
+443 void JfrCheckpointManager::write_type_set() {
+444   assert(!SafepointSynchronize::is_at_safepoint(), &quot;invariant&quot;);
+445   if (LeakProfiler::is_running()) {
+446     Thread* const t = Thread::current();
+447     // can safepoint here
+448     MutexLocker cld_lock(t, ClassLoaderDataGraph_lock);
+449     MutexLocker module_lock(t, Module_lock);
+450     JfrCheckpointWriter leakp_writer(t);
+451     JfrCheckpointWriter writer(t);
+452     JfrTypeSet::serialize(&amp;writer, &amp;leakp_writer, false, false);
+453     ObjectSampleCheckpoint::on_type_set(leakp_writer);
+454   } else {
+455     // can safepoint here
+456     MutexLocker cld_lock(ClassLoaderDataGraph_lock);
+457     MutexLocker module_lock(Module_lock);
+458     JfrCheckpointWriter writer(Thread::current());
+459     JfrTypeSet::serialize(&amp;writer, NULL, false, false);
+460   }
+461   write();
+462 }
+463 
+464 void JfrCheckpointManager::write_type_set_for_unloaded_classes() {
+465   assert_locked_or_safepoint(ClassLoaderDataGraph_lock);
+466   JfrCheckpointWriter writer(Thread::current());
+467   const JfrCheckpointContext ctx = writer.context();
+468   JfrTypeSet::serialize(&amp;writer, NULL, true, false);
+469   if (LeakProfiler::is_running()) {
+470     ObjectSampleCheckpoint::on_type_set_unload(writer);
+471   }
+472   if (!JfrRecorder::is_recording()) {
+473     // discard by rewind
+474     writer.set_context(ctx);
+475   }
+476 }
+477 
+478 typedef MutexedWriteOp&lt;WriteOperation&gt; FlushOperation;
+479 
+480 size_t JfrCheckpointManager::flush_type_set() {
+481   size_t elements = 0;
+482   if (JfrTraceIdEpoch::has_changed_tag_state()) {
+483     JfrCheckpointWriter writer(Thread::current());
+484     // can safepoint here
+485     MutexLocker cld_lock(ClassLoaderDataGraph_lock);
+486     MutexLocker module_lock(Module_lock);
+487     elements = JfrTypeSet::serialize(&amp;writer, NULL, false, true);
+488   }
+489   if (is_constant_pending()) {
+490     WriteOperation wo(_chunkwriter);
+491     FlushOperation fo(wo);
+492     assert(_free_list_mspace-&gt;is_full_empty(), &quot;invariant&quot;);
+493     process_free_list(fo, _free_list_mspace);
+494   }
+495   return elements;
+496 }
+497 
+498 void JfrCheckpointManager::create_thread_blob(Thread* t) {
+499   JfrTypeManager::create_thread_blob(t);
+500 }
+501 
+502 void JfrCheckpointManager::write_thread_checkpoint(Thread* t) {
+503   JfrTypeManager::write_thread_checkpoint(t);
+504 }
+505 
+506 class JfrNotifyClosure : public ThreadClosure {
+507  public:
+508   void do_thread(Thread* t) {
+509     assert(t != NULL, &quot;invariant&quot;);
+510     assert(t-&gt;is_Java_thread(), &quot;invariant&quot;);
+511     assert_locked_or_safepoint(Threads_lock);
+512     JfrJavaEventWriter::notify((JavaThread*)t);
+513   }
+514 };
+515 
+516 void JfrCheckpointManager::notify_threads() {
+517   assert(SafepointSynchronize::is_at_safepoint(), &quot;invariant&quot;);
+518   JfrNotifyClosure tc;
+519   JfrJavaThreadIterator iter;
+520   while (iter.has_next()) {
+521     tc.do_thread(iter.next());
+522   }
+523 }
+    </pre>
+  </body>
+</html>
