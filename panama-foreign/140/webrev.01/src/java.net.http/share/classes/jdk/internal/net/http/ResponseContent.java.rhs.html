@@ -1,0 +1,720 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Frames src/java.net.http/share/classes/jdk/internal/net/http/ResponseContent.java</title>
+    <link rel="stylesheet" href="../../../../../../../../style.css" />
+    <script type="text/javascript" src="../../../../../../../../navigation.js"></script>
+  </head>
+<body onkeypress="keypress(event);">
+<a name="0"></a>
+<hr />
+<pre>  1 /*
+<a name="1" id="anc1"></a><span class="line-modified">  2  * Copyright (c) 2015, 2020, Oracle and/or its affiliates. All rights reserved.</span>
+  3  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  4  *
+  5  * This code is free software; you can redistribute it and/or modify it
+  6  * under the terms of the GNU General Public License version 2 only, as
+  7  * published by the Free Software Foundation.  Oracle designates this
+  8  * particular file as subject to the &quot;Classpath&quot; exception as provided
+  9  * by Oracle in the LICENSE file that accompanied this code.
+ 10  *
+ 11  * This code is distributed in the hope that it will be useful, but WITHOUT
+ 12  * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ 13  * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ 14  * version 2 for more details (a copy is included in the LICENSE file that
+ 15  * accompanied this code).
+ 16  *
+ 17  * You should have received a copy of the GNU General Public License version
+ 18  * 2 along with this work; if not, write to the Free Software Foundation,
+ 19  * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ 20  *
+ 21  * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ 22  * or visit www.oracle.com if you need additional information or have any
+ 23  * questions.
+ 24  */
+ 25 
+ 26 package jdk.internal.net.http;
+ 27 
+ 28 import java.io.IOException;
+ 29 import java.nio.ByteBuffer;
+ 30 import java.util.ArrayList;
+ 31 import java.util.Collections;
+ 32 import java.util.List;
+ 33 import java.util.function.Consumer;
+ 34 import java.net.http.HttpHeaders;
+ 35 import java.net.http.HttpResponse;
+ 36 import jdk.internal.net.http.common.Logger;
+ 37 import jdk.internal.net.http.common.Utils;
+ 38 import static java.lang.String.format;
+ 39 
+ 40 /**
+ 41  * Implements chunked/fixed transfer encodings of HTTP/1.1 responses.
+ 42  *
+ 43  * Call pushBody() to read the body (blocking). Data and errors are provided
+ 44  * to given Consumers. After final buffer delivered, empty optional delivered
+ 45  */
+ 46 class ResponseContent {
+ 47 
+ 48     final HttpResponse.BodySubscriber&lt;?&gt; pusher;
+ 49     final long contentLength;
+ 50     final HttpHeaders headers;
+ 51     // this needs to run before we complete the body
+ 52     // so that connection can be returned to pool
+ 53     private final Runnable onFinished;
+ 54     private final String dbgTag;
+ 55 
+ 56     ResponseContent(HttpConnection connection,
+ 57                     long contentLength,
+ 58                     HttpHeaders h,
+ 59                     HttpResponse.BodySubscriber&lt;?&gt; userSubscriber,
+ 60                     Runnable onFinished)
+ 61     {
+ 62         this.pusher = userSubscriber;
+ 63         this.contentLength = contentLength;
+ 64         this.headers = h;
+ 65         this.onFinished = onFinished;
+ 66         this.dbgTag = connection.dbgString() + &quot;/ResponseContent&quot;;
+ 67     }
+ 68 
+ 69     static final int LF = 10;
+ 70     static final int CR = 13;
+ 71 
+ 72     private boolean chunkedContent, chunkedContentInitialized;
+ 73 
+ 74     boolean contentChunked() throws IOException {
+ 75         if (chunkedContentInitialized) {
+ 76             return chunkedContent;
+ 77         }
+ 78         if (contentLength == -2) {
+ 79             // HTTP/1.0 content
+ 80             chunkedContentInitialized = true;
+ 81             chunkedContent = false;
+ 82             return chunkedContent;
+ 83         }
+ 84         if (contentLength == -1) {
+ 85             String tc = headers.firstValue(&quot;Transfer-Encoding&quot;)
+ 86                                .orElse(&quot;&quot;);
+ 87             if (!tc.isEmpty()) {
+ 88                 if (tc.equalsIgnoreCase(&quot;chunked&quot;)) {
+ 89                     chunkedContent = true;
+ 90                 } else {
+ 91                     throw new IOException(&quot;invalid content&quot;);
+ 92                 }
+ 93             } else {
+ 94                 chunkedContent = false;
+ 95             }
+ 96         }
+ 97         chunkedContentInitialized = true;
+ 98         return chunkedContent;
+ 99     }
+100 
+101     interface BodyParser extends Consumer&lt;ByteBuffer&gt; {
+102         void onSubscribe(AbstractSubscription sub);
+103         // A current-state message suitable for inclusion in an exception
+104         // detail message.
+105         String currentStateMessage();
+106     }
+107 
+108     // Returns a parser that will take care of parsing the received byte
+109     // buffers and forward them to the BodySubscriber.
+110     // When the parser is done, it will call onComplete.
+111     // If parsing was successful, the throwable parameter will be null.
+112     // Otherwise it will be the exception that occurred
+113     // Note: revisit: it might be better to use a CompletableFuture than
+114     //       a completion handler.
+115     BodyParser getBodyParser(Consumer&lt;Throwable&gt; onComplete)
+116         throws IOException {
+117         if (contentChunked()) {
+118             return new ChunkedBodyParser(onComplete);
+119         } else {
+120             return contentLength == -2
+121                 ? new UnknownLengthBodyParser(onComplete)
+122                 : new FixedLengthBodyParser(contentLength, onComplete);
+123         }
+124     }
+125 
+126 
+127     static enum ChunkState {READING_LENGTH, READING_DATA, DONE}
+<a name="2" id="anc2"></a><span class="line-added">128     static final int MAX_CHUNK_HEADER_SIZE = 2050;</span>
+129     class ChunkedBodyParser implements BodyParser {
+130         final ByteBuffer READMORE = Utils.EMPTY_BYTEBUFFER;
+131         final Consumer&lt;Throwable&gt; onComplete;
+132         final Logger debug = Utils.getDebugLogger(this::dbgString, Utils.DEBUG);
+133         final String dbgTag = ResponseContent.this.dbgTag + &quot;/ChunkedBodyParser&quot;;
+134 
+135         volatile Throwable closedExceptionally;
+136         volatile int partialChunklen = 0; // partially read chunk len
+137         volatile int chunklen = -1;  // number of bytes in chunk
+138         volatile int bytesremaining;  // number of bytes in chunk left to be read incl CRLF
+139         volatile boolean cr = false;  // tryReadChunkLength has found CR
+<a name="3" id="anc3"></a><span class="line-added">140         volatile int chunkext = 0;    // number of bytes already read in the chunk extension</span>
+<span class="line-added">141         volatile int digits = 0;      // number of chunkLength bytes already read</span>
+142         volatile int bytesToConsume;  // number of bytes that still need to be consumed before proceeding
+143         volatile ChunkState state = ChunkState.READING_LENGTH; // current state
+144         volatile AbstractSubscription sub;
+145         ChunkedBodyParser(Consumer&lt;Throwable&gt; onComplete) {
+146             this.onComplete = onComplete;
+147         }
+148 
+149         String dbgString() {
+150             return dbgTag;
+151         }
+152 
+<a name="4" id="anc4"></a><span class="line-added">153         // best effort - we&#39;re assuming UTF-8 text and breaks at character boundaries</span>
+<span class="line-added">154         // for this debug output. Not called.</span>
+<span class="line-added">155         private void debugBuffer(ByteBuffer b) {</span>
+<span class="line-added">156             if (!debug.on()) return;</span>
+<span class="line-added">157             ByteBuffer printable = b.asReadOnlyBuffer();</span>
+<span class="line-added">158             byte[] bytes = new byte[printable.limit() - printable.position()];</span>
+<span class="line-added">159             printable.get(bytes, 0, bytes.length);</span>
+<span class="line-added">160             String msg = &quot;============== accepted ==================\n&quot;;</span>
+<span class="line-added">161             try {</span>
+<span class="line-added">162                 var str = new String(bytes, &quot;UTF-8&quot;);</span>
+<span class="line-added">163                 msg += str;</span>
+<span class="line-added">164             } catch (Exception x) {</span>
+<span class="line-added">165                 msg += x;</span>
+<span class="line-added">166                 x.printStackTrace();</span>
+<span class="line-added">167             }</span>
+<span class="line-added">168             msg += &quot;\n==========================================\n&quot;;</span>
+<span class="line-added">169             debug.log(msg);</span>
+<span class="line-added">170 </span>
+<span class="line-added">171         }</span>
+<span class="line-added">172 </span>
+173         @Override
+174         public void onSubscribe(AbstractSubscription sub) {
+175             if (debug.on())
+176                 debug.log(&quot;onSubscribe: &quot;  + pusher.getClass().getName());
+177             pusher.onSubscribe(this.sub = sub);
+178         }
+179 
+180         @Override
+181         public String currentStateMessage() {
+182             return format(&quot;chunked transfer encoding, state: %s&quot;, state);
+183         }
+<a name="5" id="anc5"></a>
+184         @Override
+185         public void accept(ByteBuffer b) {
+186             if (closedExceptionally != null) {
+187                 if (debug.on())
+188                     debug.log(&quot;already closed: &quot; + closedExceptionally);
+189                 return;
+190             }
+<a name="6" id="anc6"></a><span class="line-added">191             // debugBuffer(b);</span>
+192             boolean completed = false;
+193             try {
+194                 List&lt;ByteBuffer&gt; out = new ArrayList&lt;&gt;();
+195                 do {
+196                     if (tryPushOneHunk(b, out))  {
+197                         // We&#39;re done! (true if the final chunk was parsed).
+198                         if (!out.isEmpty()) {
+199                             // push what we have and complete
+200                             // only reduce demand if we actually push something.
+201                             // we would not have come here if there was no
+202                             // demand.
+203                             boolean hasDemand = sub.demand().tryDecrement();
+204                             assert hasDemand;
+205                             pusher.onNext(Collections.unmodifiableList(out));
+206                             if (debug.on()) debug.log(&quot;Chunks sent&quot;);
+207                         }
+208                         if (debug.on()) debug.log(&quot;done!&quot;);
+209                         assert closedExceptionally == null;
+210                         assert state == ChunkState.DONE;
+211                         onFinished.run();
+212                         pusher.onComplete();
+213                         if (debug.on()) debug.log(&quot;subscriber completed&quot;);
+214                         completed = true;
+215                         onComplete.accept(closedExceptionally); // should be null
+216                         break;
+217                     }
+218                     // the buffer may contain several hunks, and therefore
+219                     // we must loop while it&#39;s not exhausted.
+220                 } while (b.hasRemaining());
+221 
+222                 if (!completed &amp;&amp; !out.isEmpty()) {
+223                     // push what we have.
+224                     // only reduce demand if we actually push something.
+225                     // we would not have come here if there was no
+226                     // demand.
+227                     boolean hasDemand = sub.demand().tryDecrement();
+228                     assert hasDemand;
+229                     pusher.onNext(Collections.unmodifiableList(out));
+230                     if (debug.on()) debug.log(&quot;Chunk sent&quot;);
+231                 }
+232                 assert state == ChunkState.DONE || !b.hasRemaining();
+233             } catch(Throwable t) {
+234                 if (debug.on())
+235                     debug.log(&quot;Error while processing buffer: %s&quot;, (Object)t );
+236                 closedExceptionally = t;
+237                 if (!completed) onComplete.accept(t);
+238             }
+239         }
+240 
+241         // reads and returns chunklen. Position of chunkbuf is first byte
+242         // of chunk on return. chunklen includes the CR LF at end of chunk
+243         // returns -1 if needs more bytes
+244         private int tryReadChunkLen(ByteBuffer chunkbuf) throws IOException {
+245             assert state == ChunkState.READING_LENGTH;
+246             while (chunkbuf.hasRemaining()) {
+<a name="7" id="anc7"></a><span class="line-added">247                 if (chunkext + digits &gt;= MAX_CHUNK_HEADER_SIZE) {</span>
+<span class="line-added">248                     throw new IOException(&quot;Chunk header size too long: &quot; + (chunkext + digits));</span>
+<span class="line-added">249                 }</span>
+250                 int c = chunkbuf.get();
+251                 if (cr) {
+252                     if (c == LF) {
+253                         return partialChunklen;
+254                     } else {
+255                         throw new IOException(&quot;invalid chunk header&quot;);
+256                     }
+257                 }
+258                 if (c == CR) {
+259                     cr = true;
+<a name="8" id="anc8"></a><span class="line-added">260                     if (digits == 0 &amp;&amp; debug.on()) {</span>
+<span class="line-added">261                         debug.log(&quot;tryReadChunkLen: invalid chunk header? No digits in chunkLen?&quot;);</span>
+<span class="line-added">262                     }</span>
+<span class="line-added">263                 } else if (cr == false &amp;&amp; chunkext &gt; 0) {</span>
+<span class="line-added">264                     // we have seen a non digit character after the chunk length.</span>
+<span class="line-added">265                     // skip anything until CR is found.</span>
+<span class="line-added">266                     chunkext++;</span>
+<span class="line-added">267                     if (debug.on()) {</span>
+<span class="line-added">268                         debug.log(&quot;tryReadChunkLen: More extraneous character after chunk length: &quot; + c);</span>
+<span class="line-added">269                     }</span>
+270                 } else {
+271                     int digit = toDigit(c);
+<a name="9" id="anc9"></a><span class="line-modified">272                     if (digit &lt; 0) {</span>
+<span class="line-added">273                         if (digits &gt; 0) {</span>
+<span class="line-added">274                             // first non-digit character after chunk length.</span>
+<span class="line-added">275                             // skip anything until CR is found.</span>
+<span class="line-added">276                             chunkext++;</span>
+<span class="line-added">277                             if (debug.on()) {</span>
+<span class="line-added">278                                 debug.log(&quot;tryReadChunkLen: Extraneous character after chunk length: &quot; + c);</span>
+<span class="line-added">279                             }</span>
+<span class="line-added">280                         } else {</span>
+<span class="line-added">281                             // there should be at list one digit in chunk length</span>
+<span class="line-added">282                             throw new IOException(&quot;Illegal character in chunk size: &quot; + c);</span>
+<span class="line-added">283                         }</span>
+<span class="line-added">284                     } else {</span>
+<span class="line-added">285                         digits++;</span>
+<span class="line-added">286                         partialChunklen = partialChunklen * 16 + digit;</span>
+<span class="line-added">287                     }</span>
+288                 }
+289             }
+290             return -1;
+291         }
+292 
+293 
+294         // try to consume as many bytes as specified by bytesToConsume.
+295         // returns the number of bytes that still need to be consumed.
+296         // In practice this method is only called to consume one CRLF pair
+297         // with bytesToConsume set to 2, so it will only return 0 (if completed),
+298         // 1, or 2 (if chunkbuf doesn&#39;t have the 2 chars).
+299         private int tryConsumeBytes(ByteBuffer chunkbuf) throws IOException {
+300             int n = bytesToConsume;
+301             if (n &gt; 0) {
+302                 int e = Math.min(chunkbuf.remaining(), n);
+303 
+304                 // verifies some assertions
+305                 // this methods is called only to consume CRLF
+306                 if (Utils.ASSERTIONSENABLED) {
+307                     assert n &lt;= 2 &amp;&amp; e &lt;= 2;
+308                     ByteBuffer tmp = chunkbuf.slice();
+309                     // if n == 2 assert that we will first consume CR
+310                     assert (n == 2 &amp;&amp; e &gt; 0) ? tmp.get() == CR : true;
+311                     // if n == 1 || n == 2 &amp;&amp; e == 2 assert that we then consume LF
+312                     assert (n == 1 || e == 2) ? tmp.get() == LF : true;
+313                 }
+314 
+315                 chunkbuf.position(chunkbuf.position() + e);
+316                 n -= e;
+317                 bytesToConsume = n;
+318             }
+319             assert n &gt;= 0;
+320             return n;
+321         }
+322 
+323         /**
+324          * Returns a ByteBuffer containing chunk of data or a &quot;hunk&quot; of data
+325          * (a chunk of a chunk if the chunk size is larger than our ByteBuffers).
+326          * If the given chunk does not have enough data this method return
+327          * an empty ByteBuffer (READMORE).
+328          * If we encounter the final chunk (an empty chunk) this method
+329          * returns null.
+330          */
+331         ByteBuffer tryReadOneHunk(ByteBuffer chunk) throws IOException {
+332             int unfulfilled = bytesremaining;
+333             int toconsume = bytesToConsume;
+334             ChunkState st = state;
+335             if (st == ChunkState.READING_LENGTH &amp;&amp; chunklen == -1) {
+336                 if (debug.on()) debug.log(() -&gt;  &quot;Trying to read chunk len&quot;
+337                         + &quot; (remaining in buffer:&quot;+chunk.remaining()+&quot;)&quot;);
+338                 int clen = chunklen = tryReadChunkLen(chunk);
+339                 if (clen == -1) return READMORE;
+<a name="10" id="anc10"></a><span class="line-added">340                 digits = chunkext = 0;</span>
+341                 if (debug.on()) debug.log(&quot;Got chunk len %d&quot;, clen);
+342                 cr = false; partialChunklen = 0;
+343                 unfulfilled = bytesremaining =  clen;
+344                 if (clen == 0) toconsume = bytesToConsume = 2; // that was the last chunk
+345                 else st = state = ChunkState.READING_DATA; // read the data
+346             }
+347 
+348             if (toconsume &gt; 0) {
+349                 if (debug.on())
+350                     debug.log(&quot;Trying to consume bytes: %d (remaining in buffer: %s)&quot;,
+351                               toconsume, chunk.remaining());
+352                 if (tryConsumeBytes(chunk) &gt; 0) {
+353                     return READMORE;
+354                 }
+355             }
+356 
+357             toconsume = bytesToConsume;
+358             assert toconsume == 0;
+359 
+360 
+361             if (st == ChunkState.READING_LENGTH) {
+362                 // we will come here only if chunklen was 0, after having
+363                 // consumed the trailing CRLF
+364                 int clen = chunklen;
+365                 assert clen == 0;
+366                 if (debug.on()) debug.log(&quot;No more chunks: %d&quot;, clen);
+367                 // the DONE state is not really needed but it helps with
+368                 // assertions...
+369                 state = ChunkState.DONE;
+370                 return null;
+371             }
+372 
+373             int clen = chunklen;
+374             assert clen &gt; 0;
+375             assert st == ChunkState.READING_DATA;
+376 
+377             ByteBuffer returnBuffer = READMORE; // May be a hunk or a chunk
+378             if (unfulfilled &gt; 0) {
+379                 int bytesread = chunk.remaining();
+380                 if (debug.on())
+381                     debug.log(&quot;Reading chunk: available %d, needed %d&quot;,
+382                               bytesread, unfulfilled);
+383 
+384                 int bytes2return = Math.min(bytesread, unfulfilled);
+385                 if (debug.on())
+386                     debug.log( &quot;Returning chunk bytes: %d&quot;, bytes2return);
+387                 returnBuffer = Utils.sliceWithLimitedCapacity(chunk, bytes2return).asReadOnlyBuffer();
+388                 unfulfilled = bytesremaining -= bytes2return;
+389                 if (unfulfilled == 0) bytesToConsume = 2;
+390             }
+391 
+392             assert unfulfilled &gt;= 0;
+393 
+394             if (unfulfilled == 0) {
+395                 if (debug.on())
+396                     debug.log(&quot;No more bytes to read - %d yet to consume.&quot;,
+397                               unfulfilled);
+398                 // check whether the trailing CRLF is consumed, try to
+399                 // consume it if not. If tryConsumeBytes needs more bytes
+400                 // then we will come back here later - skipping the block
+401                 // that reads data because remaining==0, and finding
+402                 // that the two bytes are now consumed.
+403                 if (tryConsumeBytes(chunk) == 0) {
+404                     // we&#39;re done for this chunk! reset all states and
+405                     // prepare to read the next chunk.
+406                     chunklen = -1;
+407                     partialChunklen = 0;
+408                     cr = false;
+<a name="11" id="anc11"></a><span class="line-added">409                     digits = chunkext = 0;</span>
+410                     state = ChunkState.READING_LENGTH;
+411                     if (debug.on()) debug.log(&quot;Ready to read next chunk&quot;);
+412                 }
+413             }
+414             if (returnBuffer == READMORE) {
+415                 if (debug.on()) debug.log(&quot;Need more data&quot;);
+416             }
+417             return returnBuffer;
+418         }
+419 
+420 
+421         // Attempt to parse and push one hunk from the buffer.
+422         // Returns true if the final chunk was parsed.
+423         // Returns false if we need to push more chunks.
+424         private boolean tryPushOneHunk(ByteBuffer b, List&lt;ByteBuffer&gt; out)
+425                 throws IOException {
+426             assert state != ChunkState.DONE;
+427             ByteBuffer b1 = tryReadOneHunk(b);
+428             if (b1 != null) {
+429                 //assert b1.hasRemaining() || b1 == READMORE;
+430                 if (b1.hasRemaining()) {
+431                     if (debug.on())
+432                         debug.log(&quot;Sending chunk to consumer (%d)&quot;, b1.remaining());
+433                     out.add(b1);
+434                 }
+435                 return false; // we haven&#39;t parsed the final chunk yet.
+436             } else {
+437                 return true; // we&#39;re done! the final chunk was parsed.
+438             }
+439         }
+440 
+441         private int toDigit(int b) throws IOException {
+442             if (b &gt;= 0x30 &amp;&amp; b &lt;= 0x39) {
+443                 return b - 0x30;
+444             }
+445             if (b &gt;= 0x41 &amp;&amp; b &lt;= 0x46) {
+446                 return b - 0x41 + 10;
+447             }
+448             if (b &gt;= 0x61 &amp;&amp; b &lt;= 0x66) {
+449                 return b - 0x61 + 10;
+450             }
+<a name="12" id="anc12"></a><span class="line-modified">451             return -1;</span>
+452         }
+453 
+454     }
+455 
+456     class UnknownLengthBodyParser implements BodyParser {
+457         final Consumer&lt;Throwable&gt; onComplete;
+458         final Logger debug = Utils.getDebugLogger(this::dbgString, Utils.DEBUG);
+459         final String dbgTag = ResponseContent.this.dbgTag + &quot;/UnknownLengthBodyParser&quot;;
+460         volatile Throwable closedExceptionally;
+461         volatile AbstractSubscription sub;
+462         volatile int breceived = 0;
+463 
+464         UnknownLengthBodyParser(Consumer&lt;Throwable&gt; onComplete) {
+465             this.onComplete = onComplete;
+466         }
+467 
+468         String dbgString() {
+469             return dbgTag;
+470         }
+471 
+472         @Override
+473         public void onSubscribe(AbstractSubscription sub) {
+474             if (debug.on())
+475                 debug.log(&quot;onSubscribe: &quot; + pusher.getClass().getName());
+476             pusher.onSubscribe(this.sub = sub);
+477         }
+478 
+479         @Override
+480         public String currentStateMessage() {
+481             return format(&quot;http1_0 content, bytes received: %d&quot;, breceived);
+482         }
+483 
+484         @Override
+485         public void accept(ByteBuffer b) {
+486             if (closedExceptionally != null) {
+487                 if (debug.on())
+488                     debug.log(&quot;already closed: &quot; + closedExceptionally);
+489                 return;
+490             }
+491             boolean completed = false;
+492             try {
+493                 if (debug.on())
+494                     debug.log(&quot;Parser got %d bytes &quot;, b.remaining());
+495 
+496                 if (b.hasRemaining()) {
+497                     // only reduce demand if we actually push something.
+498                     // we would not have come here if there was no
+499                     // demand.
+500                     boolean hasDemand = sub.demand().tryDecrement();
+501                     assert hasDemand;
+502                     breceived += b.remaining();
+503                     pusher.onNext(List.of(b.asReadOnlyBuffer()));
+504                 }
+505             } catch (Throwable t) {
+506                 if (debug.on()) debug.log(&quot;Unexpected exception&quot;, t);
+507                 closedExceptionally = t;
+508                 if (!completed) {
+509                     onComplete.accept(t);
+510                 }
+511             }
+512         }
+513 
+514         /**
+515          * Must be called externally when connection has closed
+516          * and therefore no more bytes can be read
+517          */
+518         public void complete() {
+519             // We&#39;re done! All data has been received.
+520             if (debug.on())
+521                 debug.log(&quot;Parser got all expected bytes: completing&quot;);
+522             assert closedExceptionally == null;
+523             onFinished.run();
+524             pusher.onComplete();
+525             onComplete.accept(closedExceptionally); // should be null
+526         }
+527     }
+528 
+529     class FixedLengthBodyParser implements BodyParser {
+530         final long contentLength;
+531         final Consumer&lt;Throwable&gt; onComplete;
+532         final Logger debug = Utils.getDebugLogger(this::dbgString, Utils.DEBUG);
+533         final String dbgTag = ResponseContent.this.dbgTag + &quot;/FixedLengthBodyParser&quot;;
+534         volatile long remaining;
+535         volatile Throwable closedExceptionally;
+536         volatile AbstractSubscription sub;
+537         FixedLengthBodyParser(long contentLength, Consumer&lt;Throwable&gt; onComplete) {
+538             this.contentLength = this.remaining = contentLength;
+539             this.onComplete = onComplete;
+540         }
+541 
+542         String dbgString() {
+543             return dbgTag;
+544         }
+545 
+546         @Override
+547         public void onSubscribe(AbstractSubscription sub) {
+548             if (debug.on())
+549                 debug.log(&quot;length=&quot; + contentLength +&quot;, onSubscribe: &quot;
+550                            + pusher.getClass().getName());
+551             pusher.onSubscribe(this.sub = sub);
+552             try {
+553                 if (contentLength == 0) {
+554                     onFinished.run();
+555                     pusher.onComplete();
+556                     onComplete.accept(null);
+557                 }
+558             } catch (Throwable t) {
+559                 closedExceptionally = t;
+560                 try {
+561                     pusher.onError(t);
+562                 } finally {
+563                     onComplete.accept(t);
+564                 }
+565             }
+566         }
+567 
+568         @Override
+569         public String currentStateMessage() {
+570             return format(&quot;fixed content-length: %d, bytes received: %d&quot;,
+571                           contentLength, contentLength - remaining);
+572         }
+573 
+574         @Override
+575         public void accept(ByteBuffer b) {
+576             if (closedExceptionally != null) {
+577                 if (debug.on())
+578                     debug.log(&quot;already closed: &quot; + closedExceptionally);
+579                 return;
+580             }
+581             boolean completed = false;
+582             try {
+583                 long unfulfilled = remaining;
+584                 if (debug.on())
+585                     debug.log(&quot;Parser got %d bytes (%d remaining / %d)&quot;,
+586                               b.remaining(), unfulfilled, contentLength);
+587                 assert unfulfilled != 0 || contentLength == 0 || b.remaining() == 0;
+588 
+589                 if (unfulfilled == 0 &amp;&amp; contentLength &gt; 0) return;
+590 
+591                 if (b.hasRemaining() &amp;&amp; unfulfilled &gt; 0) {
+592                     // only reduce demand if we actually push something.
+593                     // we would not have come here if there was no
+594                     // demand.
+595                     boolean hasDemand = sub.demand().tryDecrement();
+596                     assert hasDemand;
+597                     int amount = (int)Math.min(b.remaining(), unfulfilled); // safe cast
+598                     unfulfilled = remaining -= amount;
+599                     ByteBuffer buffer = Utils.sliceWithLimitedCapacity(b, amount);
+600                     pusher.onNext(List.of(buffer.asReadOnlyBuffer()));
+601                 }
+602                 if (unfulfilled == 0) {
+603                     // We&#39;re done! All data has been received.
+604                     if (debug.on())
+605                         debug.log(&quot;Parser got all expected bytes: completing&quot;);
+606                     assert closedExceptionally == null;
+607                     onFinished.run();
+608                     pusher.onComplete();
+609                     completed = true;
+610                     onComplete.accept(closedExceptionally); // should be null
+611                 } else {
+612                     assert b.remaining() == 0;
+613                 }
+614             } catch (Throwable t) {
+615                 if (debug.on()) debug.log(&quot;Unexpected exception&quot;, t);
+616                 closedExceptionally = t;
+617                 if (!completed) {
+618                     onComplete.accept(t);
+619                 }
+620             }
+621         }
+622     }
+623 }
+<a name="13" id="anc13"></a><b style="font-size: large; color: red">--- EOF ---</b>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+</pre>
+<input id="eof" value="13" type="hidden" />
+</body>
+</html>
