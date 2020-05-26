@@ -1,0 +1,532 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>New src/hotspot/share/opto/loopUnswitch.cpp</title>
+    <link rel="stylesheet" href="../../../../style.css" />
+  </head>
+  <body>
+    <pre>
+  1 /*
+  2  * Copyright (c) 2006, 2019, Oracle and/or its affiliates. All rights reserved.
+  3  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  4  *
+  5  * This code is free software; you can redistribute it and/or modify it
+  6  * under the terms of the GNU General Public License version 2 only, as
+  7  * published by the Free Software Foundation.
+  8  *
+  9  * This code is distributed in the hope that it will be useful, but WITHOUT
+ 10  * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ 11  * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ 12  * version 2 for more details (a copy is included in the LICENSE file that
+ 13  * accompanied this code).
+ 14  *
+ 15  * You should have received a copy of the GNU General Public License version
+ 16  * 2 along with this work; if not, write to the Free Software Foundation,
+ 17  * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ 18  *
+ 19  * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ 20  * or visit www.oracle.com if you need additional information or have any
+ 21  * questions.
+ 22  *
+ 23  */
+ 24 
+ 25 #include &quot;precompiled.hpp&quot;
+ 26 #include &quot;memory/allocation.inline.hpp&quot;
+ 27 #include &quot;opto/mulnode.hpp&quot;
+ 28 #include &quot;opto/addnode.hpp&quot;
+ 29 #include &quot;opto/connode.hpp&quot;
+ 30 #include &quot;opto/convertnode.hpp&quot;
+ 31 #include &quot;opto/loopnode.hpp&quot;
+ 32 #include &quot;opto/opaquenode.hpp&quot;
+ 33 #include &quot;opto/rootnode.hpp&quot;
+ 34 
+ 35 //================= Loop Unswitching =====================
+ 36 //
+ 37 // orig:                       transformed:
+ 38 //                               if (invariant-test) then
+ 39 //  predicate                      predicate
+ 40 //  loop                           loop
+ 41 //    stmt1                          stmt1
+ 42 //    if (invariant-test) then       stmt2
+ 43 //      stmt2                        stmt4
+ 44 //    else                         endloop
+ 45 //      stmt3                    else
+ 46 //    endif                        predicate [clone]
+ 47 //    stmt4                        loop [clone]
+ 48 //  endloop                          stmt1 [clone]
+ 49 //                                   stmt3
+ 50 //                                   stmt4 [clone]
+ 51 //                                 endloop
+ 52 //                               endif
+ 53 //
+ 54 // Note: the &quot;else&quot; clause may be empty
+ 55 
+ 56 
+ 57 //------------------------------policy_unswitching-----------------------------
+ 58 // Return TRUE or FALSE if the loop should be unswitched
+ 59 // (ie. clone loop with an invariant test that does not exit the loop)
+ 60 bool IdealLoopTree::policy_unswitching( PhaseIdealLoop *phase ) const {
+ 61   if (!LoopUnswitching) {
+ 62     return false;
+ 63   }
+ 64   if (!_head-&gt;is_Loop()) {
+ 65     return false;
+ 66   }
+ 67 
+ 68   // If nodes are depleted, some transform has miscalculated its needs.
+ 69   assert(!phase-&gt;exceeding_node_budget(), &quot;sanity&quot;);
+ 70 
+ 71   // check for vectorized loops, any unswitching was already applied
+ 72   if (_head-&gt;is_CountedLoop() &amp;&amp; _head-&gt;as_CountedLoop()-&gt;is_unroll_only()) {
+ 73     return false;
+ 74   }
+ 75 
+ 76   LoopNode* head = _head-&gt;as_Loop();
+ 77   if (head-&gt;unswitch_count() + 1 &gt; head-&gt;unswitch_max()) {
+ 78     return false;
+ 79   }
+ 80 
+ 81   if (head-&gt;is_flattened_arrays()) {
+ 82     return false;
+ 83   }
+ 84 
+ 85   Node_List unswitch_iffs;
+ 86   if (phase-&gt;find_unswitching_candidate(this, unswitch_iffs) == NULL) {
+ 87     return false;
+ 88   }
+ 89 
+ 90   // Too speculative if running low on nodes.
+ 91   return phase-&gt;may_require_nodes(est_loop_clone_sz(2));
+ 92 }
+ 93 
+ 94 //------------------------------find_unswitching_candidate-----------------------------
+ 95 // Find candidate &quot;if&quot; for unswitching
+ 96 IfNode* PhaseIdealLoop::find_unswitching_candidate(const IdealLoopTree *loop, Node_List&amp; unswitch_iffs) const {
+ 97 
+ 98   // Find first invariant test that doesn&#39;t exit the loop
+ 99   LoopNode *head = loop-&gt;_head-&gt;as_Loop();
+100   IfNode* unswitch_iff = NULL;
+101   Node* n = head-&gt;in(LoopNode::LoopBackControl);
+102   while (n != head) {
+103     Node* n_dom = idom(n);
+104     if (n-&gt;is_Region()) {
+105       if (n_dom-&gt;is_If()) {
+106         IfNode* iff = n_dom-&gt;as_If();
+107         if (iff-&gt;in(1)-&gt;is_Bool()) {
+108           BoolNode* bol = iff-&gt;in(1)-&gt;as_Bool();
+109           if (bol-&gt;in(1)-&gt;is_Cmp()) {
+110             // If condition is invariant and not a loop exit,
+111             // then found reason to unswitch.
+112             if (loop-&gt;is_invariant(bol) &amp;&amp; !loop-&gt;is_loop_exit(iff)) {
+113               unswitch_iff = iff;
+114             }
+115           }
+116         }
+117       }
+118     }
+119     n = n_dom;
+120   }
+121   if (unswitch_iff != NULL) {
+122     unswitch_iffs.push(unswitch_iff);
+123   }
+124 
+125   // Collect all non-flattened array checks for unswitching to create a fast loop
+126   // without checks (only non-flattened array accesses) and a slow loop with checks.
+127   if (unswitch_iff == NULL || unswitch_iff-&gt;is_non_flattened_array_check(&amp;_igvn)) {
+128     for (uint i = 0; i &lt; loop-&gt;_body.size(); i++) {
+129       IfNode* n = loop-&gt;_body.at(i)-&gt;isa_If();
+130       if (n != NULL &amp;&amp; n != unswitch_iff &amp;&amp; n-&gt;is_non_flattened_array_check(&amp;_igvn) &amp;&amp;
+131           loop-&gt;is_invariant(n-&gt;in(1)) &amp;&amp; !loop-&gt;is_loop_exit(n)) {
+132         unswitch_iffs.push(n);
+133         if (unswitch_iff == NULL) {
+134           unswitch_iff = n;
+135         }
+136       }
+137     }
+138   }
+139   return unswitch_iff;
+140 }
+141 
+142 //------------------------------do_unswitching-----------------------------
+143 // Clone loop with an invariant test (that does not exit) and
+144 // insert a clone of the test that selects which version to
+145 // execute.
+146 void PhaseIdealLoop::do_unswitching(IdealLoopTree *loop, Node_List &amp;old_new) {
+147 
+148   LoopNode *head = loop-&gt;_head-&gt;as_Loop();
+149   Node* entry = head-&gt;skip_strip_mined()-&gt;in(LoopNode::EntryControl);
+150   if (find_predicate_insertion_point(entry, Deoptimization::Reason_loop_limit_check) != NULL
+151       || (UseProfiledLoopPredicate &amp;&amp; find_predicate_insertion_point(entry, Deoptimization::Reason_profile_predicate) != NULL)
+152       || (UseLoopPredicate &amp;&amp; find_predicate_insertion_point(entry, Deoptimization::Reason_predicate) != NULL)) {
+153     assert(entry-&gt;is_IfProj(), &quot;sanity - must be ifProj since there is at least one predicate&quot;);
+154     if (entry-&gt;outcnt() &gt; 1) {
+155       // Bailout if there are loop predicates from which there are additional control dependencies (i.e. from
+156       // loop entry &#39;entry&#39;) to previously partially peeled statements since this case is not handled and can lead
+157       // to wrong execution. Remove this bailout, once this is fixed.
+158       return;
+159     }
+160   }
+161   // Find first invariant test that doesn&#39;t exit the loop
+162   Node_List unswitch_iffs;
+163   IfNode* unswitch_iff = find_unswitching_candidate((const IdealLoopTree *)loop, unswitch_iffs);
+164   assert(unswitch_iff != NULL &amp;&amp; unswitch_iffs.size() &gt; 0, &quot;should be at least one&quot;);
+165 
+166 #ifndef PRODUCT
+167   if (TraceLoopOpts) {
+168     tty-&gt;print(&quot;Unswitch   %d &quot;, head-&gt;unswitch_count()+1);
+169     loop-&gt;dump_head();
+170     for (uint i = 0; i &lt; unswitch_iffs.size(); i++) {
+171       unswitch_iffs.at(i)-&gt;dump(3);
+172       tty-&gt;cr();
+173     }
+174   }
+175 #endif
+176 
+177   // Need to revert back to normal loop
+178   if (head-&gt;is_CountedLoop() &amp;&amp; !head-&gt;as_CountedLoop()-&gt;is_normal_loop()) {
+179     head-&gt;as_CountedLoop()-&gt;set_normal_loop();
+180   }
+181 
+182   ProjNode* proj_true = create_slow_version_of_loop(loop, old_new, unswitch_iff-&gt;Opcode(), CloneIncludesStripMined);
+183 
+184 #ifdef ASSERT
+185   assert(proj_true-&gt;is_IfTrue(), &quot;must be true projection&quot;);
+186   entry = head-&gt;skip_strip_mined()-&gt;in(LoopNode::EntryControl);
+187   Node* predicate = find_predicate(entry);
+188   if (predicate == NULL) {
+189     // No empty predicate
+190     Node* uniqc = proj_true-&gt;unique_ctrl_out();
+191     assert((uniqc == head &amp;&amp; !head-&gt;is_strip_mined()) || (uniqc == head-&gt;in(LoopNode::EntryControl)
+192            &amp;&amp; head-&gt;is_strip_mined()), &quot;must hold by construction if no predicates&quot;);
+193   } else {
+194     // There is at least one empty predicate. When calling &#39;skip_loop_predicates&#39; on each found empty predicate,
+195     // we should end up at &#39;proj_true&#39;.
+196     Node* proj_before_first_empty_predicate = skip_loop_predicates(entry);
+197     if (UseProfiledLoopPredicate) {
+198       predicate = find_predicate(proj_before_first_empty_predicate);
+199       if (predicate != NULL) {
+200         proj_before_first_empty_predicate = skip_loop_predicates(predicate);
+201       }
+202     }
+203     if (UseLoopPredicate) {
+204       predicate = find_predicate(proj_before_first_empty_predicate);
+205       if (predicate != NULL) {
+206         proj_before_first_empty_predicate = skip_loop_predicates(predicate);
+207       }
+208     }
+209     assert(proj_true == proj_before_first_empty_predicate, &quot;must hold by construction if at least one predicate&quot;);
+210   }
+211 #endif
+212   // Increment unswitch count
+213   LoopNode* head_clone = old_new[head-&gt;_idx]-&gt;as_Loop();
+214   int nct = head-&gt;unswitch_count() + 1;
+215   head-&gt;set_unswitch_count(nct);
+216   head_clone-&gt;set_unswitch_count(nct);
+217 
+218   // Add test to new &quot;if&quot; outside of loop
+219   IfNode* invar_iff   = proj_true-&gt;in(0)-&gt;as_If();
+220   Node* invar_iff_c   = invar_iff-&gt;in(0);
+221   invar_iff-&gt;_prob    = unswitch_iff-&gt;_prob;
+222   BoolNode* bol       = unswitch_iff-&gt;in(1)-&gt;as_Bool();
+223   if (unswitch_iffs.size() &gt; 1) {
+224     // Flattened array checks are used on array access to switch between
+225     // a legacy object array access and a flattened value type array
+226     // access. We want the performance impact on legacy accesses to be
+227     // as small as possible so we make two copies of the loop: a fast
+228     // one where all accesses are known to be legacy, a slow one where
+229     // some accesses are to flattened arrays. Flattened array checks
+230     // can be removed from the fast loop but not from the slow loop
+231     // as it can have a mix of flattened/legacy accesses.
+232     bol = bol-&gt;clone()-&gt;as_Bool();
+233     register_new_node(bol, invar_iff-&gt;in(0));
+234     Node* cmp = bol-&gt;in(1)-&gt;clone();
+235     register_new_node(cmp, invar_iff-&gt;in(0));
+236     bol-&gt;set_req(1, cmp);
+237     // Combine all checks into a single one that fails if one array is flattened
+238     Node* in1 = NULL;
+239     for (uint i = 0; i &lt; unswitch_iffs.size(); i++) {
+240       Node* array_tag = unswitch_iffs.at(i)-&gt;in(1)-&gt;in(1)-&gt;in(1);
+241       array_tag = new AndINode(array_tag, _igvn.intcon(Klass::_lh_array_tag_vt_value));
+242       register_new_node(array_tag, invar_iff-&gt;in(0));
+243       if (in1 == NULL) {
+244         in1 = array_tag;
+245       } else {
+246         in1 = new OrINode(in1, array_tag);
+247         register_new_node(in1, invar_iff-&gt;in(0));
+248       }
+249     }
+250     cmp-&gt;set_req(1, in1);
+251   }
+252   invar_iff-&gt;set_req(1, bol);
+253 
+254   // Hoist invariant casts out of each loop to the appropriate control projection.
+255   Node_List worklist;
+256   for (uint i = 0; i &lt; unswitch_iffs.size(); i++) {
+257     IfNode* iff = unswitch_iffs.at(i)-&gt;as_If();
+258     for (DUIterator_Fast imax, i = iff-&gt;fast_outs(imax); i &lt; imax; i++) {
+259       ProjNode* proj = iff-&gt;fast_out(i)-&gt;as_Proj();
+260       // Copy to a worklist for easier manipulation
+261       for (DUIterator_Fast jmax, j = proj-&gt;fast_outs(jmax); j &lt; jmax; j++) {
+262         Node* use = proj-&gt;fast_out(j);
+263         if (use-&gt;Opcode() == Op_CheckCastPP &amp;&amp; loop-&gt;is_invariant(use-&gt;in(1))) {
+264           worklist.push(use);
+265         }
+266       }
+267       ProjNode* invar_proj = invar_iff-&gt;proj_out(proj-&gt;_con)-&gt;as_Proj();
+268       while (worklist.size() &gt; 0) {
+269         Node* use = worklist.pop();
+270         Node* nuse = use-&gt;clone();
+271         nuse-&gt;set_req(0, invar_proj);
+272         _igvn.replace_input_of(use, 1, nuse);
+273         register_new_node(nuse, invar_proj);
+274         // Same for the clone if we are removing checks from the slow loop
+275         if (unswitch_iffs.size() == 1) {
+276           Node* use_clone = old_new[use-&gt;_idx];
+277           _igvn.replace_input_of(use_clone, 1, nuse);
+278         }
+279       }
+280     }
+281   }
+282 
+283   // Hardwire the control paths in the loops into if(true) and if(false)
+284   for (uint i = 0; i &lt; unswitch_iffs.size(); i++) {
+285     IfNode* iff = unswitch_iffs.at(i)-&gt;as_If();
+286     _igvn.rehash_node_delayed(iff);
+287     dominated_by(proj_true, iff, false, false);
+288   }
+289   IfNode* unswitch_iff_clone = old_new[unswitch_iff-&gt;_idx]-&gt;as_If();
+290   if (unswitch_iffs.size() == 1) {
+291     ProjNode* proj_false = invar_iff-&gt;proj_out(0)-&gt;as_Proj();
+292     _igvn.rehash_node_delayed(unswitch_iff_clone);
+293     dominated_by(proj_false, unswitch_iff_clone, false, false);
+294   } else {
+295     // Leave the flattened array checks in the slow loop and
+296     // prevent it from being unswitched again based on these checks.
+297     head_clone-&gt;mark_flattened_arrays();
+298   }
+299 
+300   // Reoptimize loops
+301   loop-&gt;record_for_igvn();
+302   for(int i = loop-&gt;_body.size() - 1; i &gt;= 0 ; i--) {
+303     Node *n = loop-&gt;_body[i];
+304     Node *n_clone = old_new[n-&gt;_idx];
+305     _igvn._worklist.push(n_clone);
+306   }
+307 
+308 #ifndef PRODUCT
+309   if (TraceLoopUnswitching) {
+310     for (uint i = 0; i &lt; unswitch_iffs.size(); i++) {
+311       tty-&gt;print_cr(&quot;Loop unswitching orig: %d @ %d  new: %d @ %d&quot;,
+312                     head-&gt;_idx,                unswitch_iffs.at(i)-&gt;_idx,
+313                     old_new[head-&gt;_idx]-&gt;_idx, old_new[unswitch_iffs.at(i)-&gt;_idx]-&gt;_idx);
+314     }
+315   }
+316 #endif
+317 
+318   C-&gt;set_major_progress();
+319 }
+320 
+321 //-------------------------create_slow_version_of_loop------------------------
+322 // Create a slow version of the loop by cloning the loop
+323 // and inserting an if to select fast-slow versions.
+324 // Return control projection of the entry to the fast version.
+325 ProjNode* PhaseIdealLoop::create_slow_version_of_loop(IdealLoopTree *loop,
+326                                                       Node_List &amp;old_new,
+327                                                       int opcode,
+328                                                       CloneLoopMode mode) {
+329   LoopNode* head  = loop-&gt;_head-&gt;as_Loop();
+330   bool counted_loop = head-&gt;is_CountedLoop();
+331   Node*     entry = head-&gt;skip_strip_mined()-&gt;in(LoopNode::EntryControl);
+332   _igvn.rehash_node_delayed(entry);
+333   IdealLoopTree* outer_loop = loop-&gt;_parent;
+334 
+335   head-&gt;verify_strip_mined(1);
+336 
+337   Node *cont      = _igvn.intcon(1);
+338   set_ctrl(cont, C-&gt;root());
+339   Node* opq       = new Opaque1Node(C, cont);
+340   register_node(opq, outer_loop, entry, dom_depth(entry));
+341   Node *bol       = new Conv2BNode(opq);
+342   register_node(bol, outer_loop, entry, dom_depth(entry));
+343   IfNode* iff = (opcode == Op_RangeCheck) ? new RangeCheckNode(entry, bol, PROB_MAX, COUNT_UNKNOWN) :
+344     new IfNode(entry, bol, PROB_MAX, COUNT_UNKNOWN);
+345   register_node(iff, outer_loop, entry, dom_depth(entry));
+346   ProjNode* iffast = new IfTrueNode(iff);
+347   register_node(iffast, outer_loop, iff, dom_depth(iff));
+348   ProjNode* ifslow = new IfFalseNode(iff);
+349   register_node(ifslow, outer_loop, iff, dom_depth(iff));
+350   uint idx_before_clone = Compile::current()-&gt;unique();
+351 
+352   // Clone the loop body.  The clone becomes the slow loop.  The
+353   // original pre-header will (illegally) have 3 control users
+354   // (old &amp; new loops &amp; new if).
+355   clone_loop(loop, old_new, dom_depth(head-&gt;skip_strip_mined()), mode, iff);
+356   assert(old_new[head-&gt;_idx]-&gt;is_Loop(), &quot;&quot; );
+357 
+358   // Fast (true) control
+359   Node* iffast_pred = clone_loop_predicates(entry, iffast, !counted_loop, false, idx_before_clone, old_new);
+360 
+361   // Slow (false) control
+362   Node* ifslow_pred = clone_loop_predicates(entry, ifslow, !counted_loop, true, idx_before_clone, old_new);
+363 
+364   Node* l = head-&gt;skip_strip_mined();
+365   _igvn.replace_input_of(l, LoopNode::EntryControl, iffast_pred);
+366   set_idom(l, iffast_pred, dom_depth(l));
+367   LoopNode* slow_l = old_new[head-&gt;_idx]-&gt;as_Loop()-&gt;skip_strip_mined();
+368   _igvn.replace_input_of(slow_l, LoopNode::EntryControl, ifslow_pred);
+369   set_idom(slow_l, ifslow_pred, dom_depth(l));
+370 
+371   recompute_dom_depth();
+372 
+373   return iffast;
+374 }
+375 
+376 LoopNode* PhaseIdealLoop::create_reserve_version_of_loop(IdealLoopTree *loop, CountedLoopReserveKit* lk) {
+377   Node_List old_new;
+378   LoopNode* head  = loop-&gt;_head-&gt;as_Loop();
+379   bool counted_loop = head-&gt;is_CountedLoop();
+380   Node*     entry = head-&gt;skip_strip_mined()-&gt;in(LoopNode::EntryControl);
+381   _igvn.rehash_node_delayed(entry);
+382   IdealLoopTree* outer_loop = head-&gt;is_strip_mined() ? loop-&gt;_parent-&gt;_parent : loop-&gt;_parent;
+383 
+384   ConINode* const_1 = _igvn.intcon(1);
+385   set_ctrl(const_1, C-&gt;root());
+386   IfNode* iff = new IfNode(entry, const_1, PROB_MAX, COUNT_UNKNOWN);
+387   register_node(iff, outer_loop, entry, dom_depth(entry));
+388   ProjNode* iffast = new IfTrueNode(iff);
+389   register_node(iffast, outer_loop, iff, dom_depth(iff));
+390   ProjNode* ifslow = new IfFalseNode(iff);
+391   register_node(ifslow, outer_loop, iff, dom_depth(iff));
+392 
+393   // Clone the loop body.  The clone becomes the slow loop.  The
+394   // original pre-header will (illegally) have 3 control users
+395   // (old &amp; new loops &amp; new if).
+396   clone_loop(loop, old_new, dom_depth(head), CloneIncludesStripMined, iff);
+397   assert(old_new[head-&gt;_idx]-&gt;is_Loop(), &quot;&quot; );
+398 
+399   LoopNode* slow_head = old_new[head-&gt;_idx]-&gt;as_Loop();
+400 
+401 #ifndef PRODUCT
+402   if (TraceLoopOpts) {
+403     tty-&gt;print_cr(&quot;PhaseIdealLoop::create_reserve_version_of_loop:&quot;);
+404     tty-&gt;print(&quot;\t iff = %d, &quot;, iff-&gt;_idx); iff-&gt;dump();
+405     tty-&gt;print(&quot;\t iffast = %d, &quot;, iffast-&gt;_idx); iffast-&gt;dump();
+406     tty-&gt;print(&quot;\t ifslow = %d, &quot;, ifslow-&gt;_idx); ifslow-&gt;dump();
+407     tty-&gt;print(&quot;\t before replace_input_of: head = %d, &quot;, head-&gt;_idx); head-&gt;dump();
+408     tty-&gt;print(&quot;\t before replace_input_of: slow_head = %d, &quot;, slow_head-&gt;_idx); slow_head-&gt;dump();
+409   }
+410 #endif
+411 
+412   // Fast (true) control
+413   _igvn.replace_input_of(head-&gt;skip_strip_mined(), LoopNode::EntryControl, iffast);
+414   // Slow (false) control
+415   _igvn.replace_input_of(slow_head-&gt;skip_strip_mined(), LoopNode::EntryControl, ifslow);
+416 
+417   recompute_dom_depth();
+418 
+419   lk-&gt;set_iff(iff);
+420 
+421 #ifndef PRODUCT
+422   if (TraceLoopOpts ) {
+423     tty-&gt;print(&quot;\t after  replace_input_of: head = %d, &quot;, head-&gt;_idx); head-&gt;dump();
+424     tty-&gt;print(&quot;\t after  replace_input_of: slow_head = %d, &quot;, slow_head-&gt;_idx); slow_head-&gt;dump();
+425   }
+426 #endif
+427 
+428   return slow_head-&gt;as_Loop();
+429 }
+430 
+431 CountedLoopReserveKit::CountedLoopReserveKit(PhaseIdealLoop* phase, IdealLoopTree *loop, bool active = true) :
+432   _phase(phase),
+433   _lpt(loop),
+434   _lp(NULL),
+435   _iff(NULL),
+436   _lp_reserved(NULL),
+437   _has_reserved(false),
+438   _use_new(false),
+439   _active(active)
+440   {
+441     create_reserve();
+442   };
+443 
+444 CountedLoopReserveKit::~CountedLoopReserveKit() {
+445   if (!_active) {
+446     return;
+447   }
+448 
+449   if (_has_reserved &amp;&amp; !_use_new) {
+450     // intcon(0)-&gt;iff-node reverts CF to the reserved copy
+451     ConINode* const_0 = _phase-&gt;_igvn.intcon(0);
+452     _phase-&gt;set_ctrl(const_0, _phase-&gt;C-&gt;root());
+453     _iff-&gt;set_req(1, const_0);
+454 
+455     #ifndef PRODUCT
+456       if (TraceLoopOpts) {
+457         tty-&gt;print_cr(&quot;CountedLoopReserveKit::~CountedLoopReserveKit()&quot;);
+458         tty-&gt;print(&quot;\t discard loop %d and revert to the reserved loop clone %d: &quot;, _lp-&gt;_idx, _lp_reserved-&gt;_idx);
+459         _lp_reserved-&gt;dump();
+460       }
+461     #endif
+462   }
+463 }
+464 
+465 bool CountedLoopReserveKit::create_reserve() {
+466   if (!_active) {
+467     return false;
+468   }
+469 
+470   if(!_lpt-&gt;_head-&gt;is_CountedLoop()) {
+471     if (TraceLoopOpts) {
+472       tty-&gt;print_cr(&quot;CountedLoopReserveKit::create_reserve: %d not counted loop&quot;, _lpt-&gt;_head-&gt;_idx);
+473     }
+474     return false;
+475   }
+476   CountedLoopNode *cl = _lpt-&gt;_head-&gt;as_CountedLoop();
+477   if (!cl-&gt;is_valid_counted_loop()) {
+478     if (TraceLoopOpts) {
+479       tty-&gt;print_cr(&quot;CountedLoopReserveKit::create_reserve: %d not valid counted loop&quot;, cl-&gt;_idx);
+480     }
+481     return false; // skip malformed counted loop
+482   }
+483   if (!cl-&gt;is_main_loop()) {
+484     bool loop_not_canonical = true;
+485     if (cl-&gt;is_post_loop() &amp;&amp; (cl-&gt;slp_max_unroll() &gt; 0)) {
+486       loop_not_canonical = false;
+487     }
+488     // only reject some loop forms
+489     if (loop_not_canonical) {
+490       if (TraceLoopOpts) {
+491         tty-&gt;print_cr(&quot;CountedLoopReserveKit::create_reserve: %d not canonical loop&quot;, cl-&gt;_idx);
+492       }
+493       return false; // skip normal, pre, and post (conditionally) loops
+494     }
+495   }
+496 
+497   _lp = _lpt-&gt;_head-&gt;as_Loop();
+498   _lp_reserved = _phase-&gt;create_reserve_version_of_loop(_lpt, this);
+499 
+500   if (!_lp_reserved-&gt;is_CountedLoop()) {
+501     return false;
+502   }
+503 
+504   Node* ifslow_pred = _lp_reserved-&gt;skip_strip_mined()-&gt;in(LoopNode::EntryControl);
+505 
+506   if (!ifslow_pred-&gt;is_IfFalse()) {
+507     return false;
+508   }
+509 
+510   Node* iff = ifslow_pred-&gt;in(0);
+511   if (!iff-&gt;is_If() || iff != _iff) {
+512     return false;
+513   }
+514 
+515   if (iff-&gt;in(1)-&gt;Opcode() != Op_ConI) {
+516     return false;
+517   }
+518 
+519   return _has_reserved = true;
+520 }
+    </pre>
+  </body>
+</html>
