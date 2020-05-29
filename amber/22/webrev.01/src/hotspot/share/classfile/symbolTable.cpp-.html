@@ -1,0 +1,941 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Old src/hotspot/share/classfile/symbolTable.cpp</title>
+    <link rel="stylesheet" href="../../../../style.css" />
+  </head>
+  <body>
+    <pre>
+  1 /*
+  2  * Copyright (c) 1997, 2020, Oracle and/or its affiliates. All rights reserved.
+  3  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  4  *
+  5  * This code is free software; you can redistribute it and/or modify it
+  6  * under the terms of the GNU General Public License version 2 only, as
+  7  * published by the Free Software Foundation.
+  8  *
+  9  * This code is distributed in the hope that it will be useful, but WITHOUT
+ 10  * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ 11  * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ 12  * version 2 for more details (a copy is included in the LICENSE file that
+ 13  * accompanied this code).
+ 14  *
+ 15  * You should have received a copy of the GNU General Public License version
+ 16  * 2 along with this work; if not, write to the Free Software Foundation,
+ 17  * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ 18  *
+ 19  * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ 20  * or visit www.oracle.com if you need additional information or have any
+ 21  * questions.
+ 22  *
+ 23  */
+ 24 
+ 25 #include &quot;precompiled.hpp&quot;
+ 26 #include &quot;classfile/altHashing.hpp&quot;
+ 27 #include &quot;classfile/compactHashtable.hpp&quot;
+ 28 #include &quot;classfile/javaClasses.hpp&quot;
+ 29 #include &quot;classfile/symbolTable.hpp&quot;
+ 30 #include &quot;memory/allocation.inline.hpp&quot;
+ 31 #include &quot;memory/dynamicArchive.hpp&quot;
+ 32 #include &quot;memory/metaspaceClosure.hpp&quot;
+ 33 #include &quot;memory/metaspaceShared.hpp&quot;
+ 34 #include &quot;memory/resourceArea.hpp&quot;
+ 35 #include &quot;oops/oop.inline.hpp&quot;
+ 36 #include &quot;runtime/atomic.hpp&quot;
+ 37 #include &quot;runtime/interfaceSupport.inline.hpp&quot;
+ 38 #include &quot;runtime/timerTrace.hpp&quot;
+ 39 #include &quot;services/diagnosticCommand.hpp&quot;
+ 40 #include &quot;utilities/concurrentHashTable.inline.hpp&quot;
+ 41 #include &quot;utilities/concurrentHashTableTasks.inline.hpp&quot;
+ 42 #include &quot;utilities/utf8.hpp&quot;
+ 43 
+ 44 // We used to not resize at all, so let&#39;s be conservative
+ 45 // and not set it too short before we decide to resize,
+ 46 // to match previous startup behavior
+ 47 const double PREF_AVG_LIST_LEN = 8.0;
+ 48 // 2^24 is max size, like StringTable.
+ 49 const size_t END_SIZE = 24;
+ 50 // If a chain gets to 100 something might be wrong
+ 51 const size_t REHASH_LEN = 100;
+ 52 
+ 53 const size_t ON_STACK_BUFFER_LENGTH = 128;
+ 54 
+ 55 // --------------------------------------------------------------------------
+ 56 
+ 57 inline bool symbol_equals_compact_hashtable_entry(Symbol* value, const char* key, int len) {
+ 58   if (value-&gt;equals(key, len)) {
+ 59     assert(value-&gt;is_permanent(), &quot;must be shared&quot;);
+ 60     return true;
+ 61   } else {
+ 62     return false;
+ 63   }
+ 64 }
+ 65 
+ 66 static OffsetCompactHashtable&lt;
+ 67   const char*, Symbol*,
+ 68   symbol_equals_compact_hashtable_entry
+ 69 &gt; _shared_table;
+ 70 
+ 71 static OffsetCompactHashtable&lt;
+ 72   const char*, Symbol*,
+ 73   symbol_equals_compact_hashtable_entry
+ 74 &gt; _dynamic_shared_table;
+ 75 
+ 76 // --------------------------------------------------------------------------
+ 77 
+ 78 typedef ConcurrentHashTable&lt;SymbolTableConfig, mtSymbol&gt; SymbolTableHash;
+ 79 static SymbolTableHash* _local_table = NULL;
+ 80 
+ 81 volatile bool SymbolTable::_has_work = 0;
+ 82 volatile bool SymbolTable::_needs_rehashing = false;
+ 83 
+ 84 // For statistics
+ 85 static size_t _symbols_removed = 0;
+ 86 static size_t _symbols_counted = 0;
+ 87 static size_t _current_size = 0;
+ 88 
+ 89 static volatile size_t _items_count = 0;
+ 90 static volatile bool   _has_items_to_clean = false;
+ 91 
+ 92 
+ 93 static volatile bool _alt_hash = false;
+ 94 static volatile bool _lookup_shared_first = false;
+ 95 
+ 96 // Static arena for symbols that are not deallocated
+ 97 Arena* SymbolTable::_arena = NULL;
+ 98 
+ 99 static juint murmur_seed = 0;
+100 
+101 static inline void log_trace_symboltable_helper(Symbol* sym, const char* msg) {
+102 #ifndef PRODUCT
+103   ResourceMark rm;
+104   log_trace(symboltable)(&quot;%s [%s]&quot;, msg, sym-&gt;as_quoted_ascii());
+105 #endif // PRODUCT
+106 }
+107 
+108 // Pick hashing algorithm.
+109 static uintx hash_symbol(const char* s, int len, bool useAlt) {
+110   return useAlt ?
+111   AltHashing::murmur3_32(murmur_seed, (const jbyte*)s, len) :
+112   java_lang_String::hash_code((const jbyte*)s, len);
+113 }
+114 
+115 #if INCLUDE_CDS
+116 static uintx hash_shared_symbol(const char* s, int len) {
+117   return java_lang_String::hash_code((const jbyte*)s, len);
+118 }
+119 #endif
+120 
+121 class SymbolTableConfig : public AllStatic {
+122 private:
+123 public:
+124   typedef Symbol* Value;  // value of the Node in the hashtable
+125 
+126   static uintx get_hash(Value const&amp; value, bool* is_dead) {
+127     *is_dead = (value-&gt;refcount() == 0);
+128     if (*is_dead) {
+129       return 0;
+130     } else {
+131       return hash_symbol((const char*)value-&gt;bytes(), value-&gt;utf8_length(), _alt_hash);
+132     }
+133   }
+134   // We use default allocation/deallocation but counted
+135   static void* allocate_node(size_t size, Value const&amp; value) {
+136     SymbolTable::item_added();
+137     return AllocateHeap(size, mtSymbol);
+138   }
+139   static void free_node(void* memory, Value const&amp; value) {
+140     // We get here because #1 some threads lost a race to insert a newly created Symbol
+141     // or #2 we&#39;re cleaning up unused symbol.
+142     // If #1, then the symbol can be either permanent,
+143     // or regular newly created one (refcount==1)
+144     // If #2, then the symbol is dead (refcount==0)
+145     assert(value-&gt;is_permanent() || (value-&gt;refcount() == 1) || (value-&gt;refcount() == 0),
+146            &quot;refcount %d&quot;, value-&gt;refcount());
+147     if (value-&gt;refcount() == 1) {
+148       value-&gt;decrement_refcount();
+149       assert(value-&gt;refcount() == 0, &quot;expected dead symbol&quot;);
+150     }
+151     SymbolTable::delete_symbol(value);
+152     FreeHeap(memory);
+153     SymbolTable::item_removed();
+154   }
+155 };
+156 
+157 static size_t ceil_log2(size_t value) {
+158   size_t ret;
+159   for (ret = 1; ((size_t)1 &lt;&lt; ret) &lt; value; ++ret);
+160   return ret;
+161 }
+162 
+163 void SymbolTable::create_table ()  {
+164   size_t start_size_log_2 = ceil_log2(SymbolTableSize);
+165   _current_size = ((size_t)1) &lt;&lt; start_size_log_2;
+166   log_trace(symboltable)(&quot;Start size: &quot; SIZE_FORMAT &quot; (&quot; SIZE_FORMAT &quot;)&quot;,
+167                          _current_size, start_size_log_2);
+168   _local_table = new SymbolTableHash(start_size_log_2, END_SIZE, REHASH_LEN);
+169 
+170   // Initialize the arena for global symbols, size passed in depends on CDS.
+171   if (symbol_alloc_arena_size == 0) {
+172     _arena = new (mtSymbol) Arena(mtSymbol);
+173   } else {
+174     _arena = new (mtSymbol) Arena(mtSymbol, symbol_alloc_arena_size);
+175   }
+176 }
+177 
+178 void SymbolTable::delete_symbol(Symbol* sym) {
+179   if (Arguments::is_dumping_archive()) {
+180     // Do not delete symbols as we may be in the middle of preparing the
+181     // symbols for dumping.
+182     return;
+183   }
+184   if (sym-&gt;is_permanent()) {
+185     MutexLocker ml(SymbolArena_lock, Mutex::_no_safepoint_check_flag); // Protect arena
+186     // Deleting permanent symbol should not occur very often (insert race condition),
+187     // so log it.
+188     log_trace_symboltable_helper(sym, &quot;Freeing permanent symbol&quot;);
+189     if (!arena()-&gt;Afree(sym, sym-&gt;size())) {
+190       log_trace_symboltable_helper(sym, &quot;Leaked permanent symbol&quot;);
+191     }
+192   } else {
+193     delete sym;
+194   }
+195 }
+196 
+197 void SymbolTable::reset_has_items_to_clean() { Atomic::store(&amp;_has_items_to_clean, false); }
+198 void SymbolTable::mark_has_items_to_clean()  { Atomic::store(&amp;_has_items_to_clean, true); }
+199 bool SymbolTable::has_items_to_clean()       { return Atomic::load(&amp;_has_items_to_clean); }
+200 
+201 void SymbolTable::item_added() {
+202   Atomic::inc(&amp;_items_count);
+203 }
+204 
+205 void SymbolTable::item_removed() {
+206   Atomic::inc(&amp;(_symbols_removed));
+207   Atomic::dec(&amp;_items_count);
+208 }
+209 
+210 double SymbolTable::get_load_factor() {
+211   return (double)_items_count/_current_size;
+212 }
+213 
+214 size_t SymbolTable::table_size() {
+215   return ((size_t)1) &lt;&lt; _local_table-&gt;get_size_log2(Thread::current());
+216 }
+217 
+218 void SymbolTable::trigger_cleanup() {
+219   MutexLocker ml(Service_lock, Mutex::_no_safepoint_check_flag);
+220   _has_work = true;
+221   Service_lock-&gt;notify_all();
+222 }
+223 
+224 Symbol* SymbolTable::allocate_symbol(const char* name, int len, bool c_heap) {
+225   assert (len &lt;= Symbol::max_length(), &quot;should be checked by caller&quot;);
+226 
+227   Symbol* sym;
+228   if (Arguments::is_dumping_archive()) {
+229     // Need to make all symbols permanent -- or else some symbols may be GC&#39;ed
+230     // during the archive dumping code that&#39;s executed outside of a safepoint.
+231     c_heap = false;
+232   }
+233   if (c_heap) {
+234     // refcount starts as 1
+235     sym = new (len) Symbol((const u1*)name, len, 1);
+236     assert(sym != NULL, &quot;new should call vm_exit_out_of_memory if C_HEAP is exhausted&quot;);
+237   } else if (DumpSharedSpaces) {
+238     // See comments inside Symbol::operator new(size_t, int)
+239     sym = new (len) Symbol((const u1*)name, len, PERM_REFCOUNT);
+240     assert(sym != NULL, &quot;new should call vm_exit_out_of_memory if failed to allocate symbol during DumpSharedSpaces&quot;);
+241   } else {
+242     // Allocate to global arena
+243     MutexLocker ml(SymbolArena_lock, Mutex::_no_safepoint_check_flag); // Protect arena
+244     sym = new (len, arena()) Symbol((const u1*)name, len, PERM_REFCOUNT);
+245   }
+246   return sym;
+247 }
+248 
+249 class SymbolsDo : StackObj {
+250   SymbolClosure *_cl;
+251 public:
+252   SymbolsDo(SymbolClosure *cl) : _cl(cl) {}
+253   bool operator()(Symbol** value) {
+254     assert(value != NULL, &quot;expected valid value&quot;);
+255     assert(*value != NULL, &quot;value should point to a symbol&quot;);
+256     _cl-&gt;do_symbol(value);
+257     return true;
+258   };
+259 };
+260 
+261 class SharedSymbolIterator {
+262   SymbolClosure* _symbol_closure;
+263 public:
+264   SharedSymbolIterator(SymbolClosure* f) : _symbol_closure(f) {}
+265   void do_value(Symbol* symbol) {
+266     _symbol_closure-&gt;do_symbol(&amp;symbol);
+267   }
+268 };
+269 
+270 // Call function for all symbols in the symbol table.
+271 void SymbolTable::symbols_do(SymbolClosure *cl) {
+272   // all symbols from shared table
+273   SharedSymbolIterator iter(cl);
+274   _shared_table.iterate(&amp;iter);
+275   _dynamic_shared_table.iterate(&amp;iter);
+276 
+277   // all symbols from the dynamic table
+278   SymbolsDo sd(cl);
+279   if (!_local_table-&gt;try_scan(Thread::current(), sd)) {
+280     log_info(symboltable)(&quot;symbols_do unavailable at this moment&quot;);
+281   }
+282 }
+283 
+284 class MetaspacePointersDo : StackObj {
+285   MetaspaceClosure *_it;
+286 public:
+287   MetaspacePointersDo(MetaspaceClosure *it) : _it(it) {}
+288   bool operator()(Symbol** value) {
+289     assert(value != NULL, &quot;expected valid value&quot;);
+290     assert(*value != NULL, &quot;value should point to a symbol&quot;);
+291     _it-&gt;push(value);
+292     return true;
+293   };
+294 };
+295 
+296 void SymbolTable::metaspace_pointers_do(MetaspaceClosure* it) {
+297   Arguments::assert_is_dumping_archive();
+298   MetaspacePointersDo mpd(it);
+299   _local_table-&gt;do_safepoint_scan(mpd);
+300 }
+301 
+302 Symbol* SymbolTable::lookup_dynamic(const char* name,
+303                                     int len, unsigned int hash) {
+304   Symbol* sym = do_lookup(name, len, hash);
+305   assert((sym == NULL) || sym-&gt;refcount() != 0, &quot;refcount must not be zero&quot;);
+306   return sym;
+307 }
+308 
+309 #if INCLUDE_CDS
+310 Symbol* SymbolTable::lookup_shared(const char* name,
+311                                    int len, unsigned int hash) {
+312   Symbol* sym = NULL;
+313   if (!_shared_table.empty()) {
+314     if (_alt_hash) {
+315       // hash_code parameter may use alternate hashing algorithm but the shared table
+316       // always uses the same original hash code.
+317       hash = hash_shared_symbol(name, len);
+318     }
+319     sym = _shared_table.lookup(name, hash, len);
+320     if (sym == NULL &amp;&amp; DynamicArchive::is_mapped()) {
+321       sym = _dynamic_shared_table.lookup(name, hash, len);
+322     }
+323   }
+324   return sym;
+325 }
+326 #endif
+327 
+328 Symbol* SymbolTable::lookup_common(const char* name,
+329                             int len, unsigned int hash) {
+330   Symbol* sym;
+331   if (_lookup_shared_first) {
+332     sym = lookup_shared(name, len, hash);
+333     if (sym == NULL) {
+334       _lookup_shared_first = false;
+335       sym = lookup_dynamic(name, len, hash);
+336     }
+337   } else {
+338     sym = lookup_dynamic(name, len, hash);
+339     if (sym == NULL) {
+340       sym = lookup_shared(name, len, hash);
+341       if (sym != NULL) {
+342         _lookup_shared_first = true;
+343       }
+344     }
+345   }
+346   return sym;
+347 }
+348 
+349 Symbol* SymbolTable::new_symbol(const char* name, int len) {
+350   unsigned int hash = hash_symbol(name, len, _alt_hash);
+351   Symbol* sym = lookup_common(name, len, hash);
+352   if (sym == NULL) {
+353     sym = do_add_if_needed(name, len, hash, true);
+354   }
+355   assert(sym-&gt;refcount() != 0, &quot;lookup should have incremented the count&quot;);
+356   assert(sym-&gt;equals(name, len), &quot;symbol must be properly initialized&quot;);
+357   return sym;
+358 }
+359 
+360 Symbol* SymbolTable::new_symbol(const Symbol* sym, int begin, int end) {
+361   assert(begin &lt;= end &amp;&amp; end &lt;= sym-&gt;utf8_length(), &quot;just checking&quot;);
+362   assert(sym-&gt;refcount() != 0, &quot;require a valid symbol&quot;);
+363   const char* name = (const char*)sym-&gt;base() + begin;
+364   int len = end - begin;
+365   unsigned int hash = hash_symbol(name, len, _alt_hash);
+366   Symbol* found = lookup_common(name, len, hash);
+367   if (found == NULL) {
+368     found = do_add_if_needed(name, len, hash, true);
+369   }
+370   return found;
+371 }
+372 
+373 class SymbolTableLookup : StackObj {
+374 private:
+375   Thread* _thread;
+376   uintx _hash;
+377   int _len;
+378   const char* _str;
+379 public:
+380   SymbolTableLookup(const char* key, int len, uintx hash)
+381   : _hash(hash), _len(len), _str(key) {}
+382   uintx get_hash() const {
+383     return _hash;
+384   }
+385   bool equals(Symbol** value, bool* is_dead) {
+386     assert(value != NULL, &quot;expected valid value&quot;);
+387     assert(*value != NULL, &quot;value should point to a symbol&quot;);
+388     Symbol *sym = *value;
+389     if (sym-&gt;equals(_str, _len)) {
+390       if (sym-&gt;try_increment_refcount()) {
+391         // something is referencing this symbol now.
+392         return true;
+393       } else {
+394         assert(sym-&gt;refcount() == 0, &quot;expected dead symbol&quot;);
+395         *is_dead = true;
+396         return false;
+397       }
+398     } else {
+399       *is_dead = (sym-&gt;refcount() == 0);
+400       return false;
+401     }
+402   }
+403 };
+404 
+405 class SymbolTableGet : public StackObj {
+406   Symbol* _return;
+407 public:
+408   SymbolTableGet() : _return(NULL) {}
+409   void operator()(Symbol** value) {
+410     assert(value != NULL, &quot;expected valid value&quot;);
+411     assert(*value != NULL, &quot;value should point to a symbol&quot;);
+412     _return = *value;
+413   }
+414   Symbol* get_res_sym() const {
+415     return _return;
+416   }
+417 };
+418 
+419 Symbol* SymbolTable::do_lookup(const char* name, int len, uintx hash) {
+420   Thread* thread = Thread::current();
+421   SymbolTableLookup lookup(name, len, hash);
+422   SymbolTableGet stg;
+423   bool rehash_warning = false;
+424   _local_table-&gt;get(thread, lookup, stg, &amp;rehash_warning);
+425   update_needs_rehash(rehash_warning);
+426   Symbol* sym = stg.get_res_sym();
+427   assert((sym == NULL) || sym-&gt;refcount() != 0, &quot;found dead symbol&quot;);
+428   return sym;
+429 }
+430 
+431 Symbol* SymbolTable::lookup_only(const char* name, int len, unsigned int&amp; hash) {
+432   hash = hash_symbol(name, len, _alt_hash);
+433   return lookup_common(name, len, hash);
+434 }
+435 
+436 // Suggestion: Push unicode-based lookup all the way into the hashing
+437 // and probing logic, so there is no need for convert_to_utf8 until
+438 // an actual new Symbol* is created.
+439 Symbol* SymbolTable::new_symbol(const jchar* name, int utf16_length) {
+440   int utf8_length = UNICODE::utf8_length((jchar*) name, utf16_length);
+441   char stack_buf[ON_STACK_BUFFER_LENGTH];
+442   if (utf8_length &lt; (int) sizeof(stack_buf)) {
+443     char* chars = stack_buf;
+444     UNICODE::convert_to_utf8(name, utf16_length, chars);
+445     return new_symbol(chars, utf8_length);
+446   } else {
+447     ResourceMark rm;
+448     char* chars = NEW_RESOURCE_ARRAY(char, utf8_length + 1);
+449     UNICODE::convert_to_utf8(name, utf16_length, chars);
+450     return new_symbol(chars, utf8_length);
+451   }
+452 }
+453 
+454 Symbol* SymbolTable::lookup_only_unicode(const jchar* name, int utf16_length,
+455                                          unsigned int&amp; hash) {
+456   int utf8_length = UNICODE::utf8_length((jchar*) name, utf16_length);
+457   char stack_buf[ON_STACK_BUFFER_LENGTH];
+458   if (utf8_length &lt; (int) sizeof(stack_buf)) {
+459     char* chars = stack_buf;
+460     UNICODE::convert_to_utf8(name, utf16_length, chars);
+461     return lookup_only(chars, utf8_length, hash);
+462   } else {
+463     ResourceMark rm;
+464     char* chars = NEW_RESOURCE_ARRAY(char, utf8_length + 1);
+465     UNICODE::convert_to_utf8(name, utf16_length, chars);
+466     return lookup_only(chars, utf8_length, hash);
+467   }
+468 }
+469 
+470 void SymbolTable::new_symbols(ClassLoaderData* loader_data, const constantPoolHandle&amp; cp,
+471                               int names_count, const char** names, int* lengths,
+472                               int* cp_indices, unsigned int* hashValues) {
+473   // Note that c_heap will be true for non-strong hidden classes and unsafe anonymous classes
+474   // even if their loader is the boot loader because they will have a different cld.
+475   bool c_heap = !loader_data-&gt;is_the_null_class_loader_data();
+476   for (int i = 0; i &lt; names_count; i++) {
+477     const char *name = names[i];
+478     int len = lengths[i];
+479     unsigned int hash = hashValues[i];
+480     assert(lookup_shared(name, len, hash) == NULL, &quot;must have checked already&quot;);
+481     Symbol* sym = do_add_if_needed(name, len, hash, c_heap);
+482     assert(sym-&gt;refcount() != 0, &quot;lookup should have incremented the count&quot;);
+483     cp-&gt;symbol_at_put(cp_indices[i], sym);
+484   }
+485 }
+486 
+487 Symbol* SymbolTable::do_add_if_needed(const char* name, int len, uintx hash, bool heap) {
+488   SymbolTableLookup lookup(name, len, hash);
+489   SymbolTableGet stg;
+490   bool clean_hint = false;
+491   bool rehash_warning = false;
+492   Symbol* sym = NULL;
+493   Thread* THREAD = Thread::current();
+494 
+495   do {
+496     // Callers have looked up the symbol once, insert the symbol.
+497     sym = allocate_symbol(name, len, heap);
+498     if (_local_table-&gt;insert(THREAD, lookup, sym, &amp;rehash_warning, &amp;clean_hint)) {
+499       break;
+500     }
+501     // In case another thread did a concurrent add, return value already in the table.
+502     // This could fail if the symbol got deleted concurrently, so loop back until success.
+503     if (_local_table-&gt;get(THREAD, lookup, stg, &amp;rehash_warning)) {
+504       sym = stg.get_res_sym();
+505       break;
+506     }
+507   } while(true);
+508 
+509   update_needs_rehash(rehash_warning);
+510 
+511   if (clean_hint) {
+512     mark_has_items_to_clean();
+513     check_concurrent_work();
+514   }
+515 
+516   assert((sym == NULL) || sym-&gt;refcount() != 0, &quot;found dead symbol&quot;);
+517   return sym;
+518 }
+519 
+520 Symbol* SymbolTable::new_permanent_symbol(const char* name) {
+521   unsigned int hash = 0;
+522   int len = (int)strlen(name);
+523   Symbol* sym = SymbolTable::lookup_only(name, len, hash);
+524   if (sym == NULL) {
+525     sym = do_add_if_needed(name, len, hash, false);
+526   }
+527   if (!sym-&gt;is_permanent()) {
+528     sym-&gt;make_permanent();
+529     log_trace_symboltable_helper(sym, &quot;Asked for a permanent symbol, but got a regular one&quot;);
+530   }
+531   return sym;
+532 }
+533 
+534 struct SizeFunc : StackObj {
+535   size_t operator()(Symbol** value) {
+536     assert(value != NULL, &quot;expected valid value&quot;);
+537     assert(*value != NULL, &quot;value should point to a symbol&quot;);
+538     return (*value)-&gt;size() * HeapWordSize;
+539   };
+540 };
+541 
+542 TableStatistics SymbolTable::get_table_statistics() {
+543   static TableStatistics ts;
+544   SizeFunc sz;
+545   ts = _local_table-&gt;statistics_get(Thread::current(), sz, ts);
+546   return ts;
+547 }
+548 
+549 void SymbolTable::print_table_statistics(outputStream* st,
+550                                          const char* table_name) {
+551   SizeFunc sz;
+552   _local_table-&gt;statistics_to(Thread::current(), sz, st, table_name);
+553 }
+554 
+555 // Verification
+556 class VerifySymbols : StackObj {
+557 public:
+558   bool operator()(Symbol** value) {
+559     guarantee(value != NULL, &quot;expected valid value&quot;);
+560     guarantee(*value != NULL, &quot;value should point to a symbol&quot;);
+561     Symbol* sym = *value;
+562     guarantee(sym-&gt;equals((const char*)sym-&gt;bytes(), sym-&gt;utf8_length()),
+563               &quot;symbol must be internally consistent&quot;);
+564     return true;
+565   };
+566 };
+567 
+568 void SymbolTable::verify() {
+569   Thread* thr = Thread::current();
+570   VerifySymbols vs;
+571   if (!_local_table-&gt;try_scan(thr, vs)) {
+572     log_info(symboltable)(&quot;verify unavailable at this moment&quot;);
+573   }
+574 }
+575 
+576 // Dumping
+577 class DumpSymbol : StackObj {
+578   Thread* _thr;
+579   outputStream* _st;
+580 public:
+581   DumpSymbol(Thread* thr, outputStream* st) : _thr(thr), _st(st) {}
+582   bool operator()(Symbol** value) {
+583     assert(value != NULL, &quot;expected valid value&quot;);
+584     assert(*value != NULL, &quot;value should point to a symbol&quot;);
+585     Symbol* sym = *value;
+586     const char* utf8_string = (const char*)sym-&gt;bytes();
+587     int utf8_length = sym-&gt;utf8_length();
+588     _st-&gt;print(&quot;%d %d: &quot;, utf8_length, sym-&gt;refcount());
+589     HashtableTextDump::put_utf8(_st, utf8_string, utf8_length);
+590     _st-&gt;cr();
+591     return true;
+592   };
+593 };
+594 
+595 void SymbolTable::dump(outputStream* st, bool verbose) {
+596   if (!verbose) {
+597     print_table_statistics(st, &quot;SymbolTable&quot;);
+598   } else {
+599     Thread* thr = Thread::current();
+600     ResourceMark rm(thr);
+601     st-&gt;print_cr(&quot;VERSION: 1.1&quot;);
+602     DumpSymbol ds(thr, st);
+603     if (!_local_table-&gt;try_scan(thr, ds)) {
+604       log_info(symboltable)(&quot;dump unavailable at this moment&quot;);
+605     }
+606   }
+607 }
+608 
+609 #if INCLUDE_CDS
+610 struct CopyToArchive : StackObj {
+611   CompactHashtableWriter* _writer;
+612   CopyToArchive(CompactHashtableWriter* writer) : _writer(writer) {}
+613   bool operator()(Symbol** value) {
+614     assert(value != NULL, &quot;expected valid value&quot;);
+615     assert(*value != NULL, &quot;value should point to a symbol&quot;);
+616     Symbol* sym = *value;
+617     unsigned int fixed_hash = hash_shared_symbol((const char*)sym-&gt;bytes(), sym-&gt;utf8_length());
+618     assert(fixed_hash == hash_symbol((const char*)sym-&gt;bytes(), sym-&gt;utf8_length(), false),
+619            &quot;must not rehash during dumping&quot;);
+620     if (DynamicDumpSharedSpaces) {
+621       sym = DynamicArchive::original_to_target(sym);
+622     }
+623     _writer-&gt;add(fixed_hash, MetaspaceShared::object_delta_u4(sym));
+624     return true;
+625   }
+626 };
+627 
+628 void SymbolTable::copy_shared_symbol_table(CompactHashtableWriter* writer) {
+629   CopyToArchive copy(writer);
+630   _local_table-&gt;do_safepoint_scan(copy);
+631 }
+632 
+633 size_t SymbolTable::estimate_size_for_archive() {
+634   return CompactHashtableWriter::estimate_size(int(_items_count));
+635 }
+636 
+637 void SymbolTable::write_to_archive(bool is_static_archive) {
+638   CompactHashtableWriter writer(int(_items_count),
+639                                 &amp;MetaspaceShared::stats()-&gt;symbol);
+640   copy_shared_symbol_table(&amp;writer);
+641   if (is_static_archive) {
+642     _shared_table.reset();
+643     writer.dump(&amp;_shared_table, &quot;symbol&quot;);
+644 
+645     // Verify table is correct
+646     Symbol* sym = vmSymbols::java_lang_Object();
+647     const char* name = (const char*)sym-&gt;bytes();
+648     int len = sym-&gt;utf8_length();
+649     unsigned int hash = hash_symbol(name, len, _alt_hash);
+650     assert(sym == _shared_table.lookup(name, hash, len), &quot;sanity&quot;);
+651   } else {
+652     _dynamic_shared_table.reset();
+653     writer.dump(&amp;_dynamic_shared_table, &quot;symbol&quot;);
+654   }
+655 }
+656 
+657 void SymbolTable::serialize_shared_table_header(SerializeClosure* soc,
+658                                                 bool is_static_archive) {
+659   OffsetCompactHashtable&lt;const char*, Symbol*, symbol_equals_compact_hashtable_entry&gt; * table;
+660   if (is_static_archive) {
+661     table = &amp;_shared_table;
+662   } else {
+663     table = &amp;_dynamic_shared_table;
+664   }
+665   table-&gt;serialize_header(soc);
+666   if (soc-&gt;writing()) {
+667     // Sanity. Make sure we don&#39;t use the shared table at dump time
+668     table-&gt;reset();
+669   }
+670 }
+671 #endif //INCLUDE_CDS
+672 
+673 // Concurrent work
+674 void SymbolTable::grow(JavaThread* jt) {
+675   SymbolTableHash::GrowTask gt(_local_table);
+676   if (!gt.prepare(jt)) {
+677     return;
+678   }
+679   log_trace(symboltable)(&quot;Started to grow&quot;);
+680   {
+681     TraceTime timer(&quot;Grow&quot;, TRACETIME_LOG(Debug, symboltable, perf));
+682     while (gt.do_task(jt)) {
+683       gt.pause(jt);
+684       {
+685         ThreadBlockInVM tbivm(jt);
+686       }
+687       gt.cont(jt);
+688     }
+689   }
+690   gt.done(jt);
+691   _current_size = table_size();
+692   log_debug(symboltable)(&quot;Grown to size:&quot; SIZE_FORMAT, _current_size);
+693 }
+694 
+695 struct SymbolTableDoDelete : StackObj {
+696   size_t _deleted;
+697   SymbolTableDoDelete() : _deleted(0) {}
+698   void operator()(Symbol** value) {
+699     assert(value != NULL, &quot;expected valid value&quot;);
+700     assert(*value != NULL, &quot;value should point to a symbol&quot;);
+701     Symbol *sym = *value;
+702     assert(sym-&gt;refcount() == 0, &quot;refcount&quot;);
+703     _deleted++;
+704   }
+705 };
+706 
+707 struct SymbolTableDeleteCheck : StackObj {
+708   size_t _processed;
+709   SymbolTableDeleteCheck() : _processed(0) {}
+710   bool operator()(Symbol** value) {
+711     assert(value != NULL, &quot;expected valid value&quot;);
+712     assert(*value != NULL, &quot;value should point to a symbol&quot;);
+713     _processed++;
+714     Symbol *sym = *value;
+715     return (sym-&gt;refcount() == 0);
+716   }
+717 };
+718 
+719 void SymbolTable::clean_dead_entries(JavaThread* jt) {
+720   SymbolTableHash::BulkDeleteTask bdt(_local_table);
+721   if (!bdt.prepare(jt)) {
+722     return;
+723   }
+724 
+725   SymbolTableDeleteCheck stdc;
+726   SymbolTableDoDelete stdd;
+727   {
+728     TraceTime timer(&quot;Clean&quot;, TRACETIME_LOG(Debug, symboltable, perf));
+729     while (bdt.do_task(jt, stdc, stdd)) {
+730       bdt.pause(jt);
+731       {
+732         ThreadBlockInVM tbivm(jt);
+733       }
+734       bdt.cont(jt);
+735     }
+736     reset_has_items_to_clean();
+737     bdt.done(jt);
+738   }
+739 
+740   Atomic::add(&amp;_symbols_counted, stdc._processed);
+741 
+742   log_debug(symboltable)(&quot;Cleaned &quot; SIZE_FORMAT &quot; of &quot; SIZE_FORMAT,
+743                          stdd._deleted, stdc._processed);
+744 }
+745 
+746 void SymbolTable::check_concurrent_work() {
+747   if (_has_work) {
+748     return;
+749   }
+750   // We should clean/resize if we have
+751   // more items than preferred load factor or
+752   // more dead items than water mark.
+753   if (has_items_to_clean() || (get_load_factor() &gt; PREF_AVG_LIST_LEN)) {
+754     log_debug(symboltable)(&quot;Concurrent work triggered, load factor: %f, items to clean: %s&quot;,
+755                            get_load_factor(), has_items_to_clean() ? &quot;true&quot; : &quot;false&quot;);
+756     trigger_cleanup();
+757   }
+758 }
+759 
+760 void SymbolTable::do_concurrent_work(JavaThread* jt) {
+761   double load_factor = get_load_factor();
+762   log_debug(symboltable, perf)(&quot;Concurrent work, live factor: %g&quot;, load_factor);
+763   // We prefer growing, since that also removes dead items
+764   if (load_factor &gt; PREF_AVG_LIST_LEN &amp;&amp; !_local_table-&gt;is_max_size_reached()) {
+765     grow(jt);
+766   } else {
+767     clean_dead_entries(jt);
+768   }
+769   _has_work = false;
+770 }
+771 
+772 // Rehash
+773 bool SymbolTable::do_rehash() {
+774   if (!_local_table-&gt;is_safepoint_safe()) {
+775     return false;
+776   }
+777 
+778   // We use current size
+779   size_t new_size = _local_table-&gt;get_size_log2(Thread::current());
+780   SymbolTableHash* new_table = new SymbolTableHash(new_size, END_SIZE, REHASH_LEN);
+781   // Use alt hash from now on
+782   _alt_hash = true;
+783   if (!_local_table-&gt;try_move_nodes_to(Thread::current(), new_table)) {
+784     _alt_hash = false;
+785     delete new_table;
+786     return false;
+787   }
+788 
+789   // free old table
+790   delete _local_table;
+791   _local_table = new_table;
+792 
+793   return true;
+794 }
+795 
+796 void SymbolTable::rehash_table() {
+797   static bool rehashed = false;
+798   log_debug(symboltable)(&quot;Table imbalanced, rehashing called.&quot;);
+799 
+800   // Grow instead of rehash.
+801   if (get_load_factor() &gt; PREF_AVG_LIST_LEN &amp;&amp;
+802       !_local_table-&gt;is_max_size_reached()) {
+803     log_debug(symboltable)(&quot;Choosing growing over rehashing.&quot;);
+804     trigger_cleanup();
+805     _needs_rehashing = false;
+806     return;
+807   }
+808 
+809   // Already rehashed.
+810   if (rehashed) {
+811     log_warning(symboltable)(&quot;Rehashing already done, still long lists.&quot;);
+812     trigger_cleanup();
+813     _needs_rehashing = false;
+814     return;
+815   }
+816 
+817   murmur_seed = AltHashing::compute_seed();
+818 
+819   if (do_rehash()) {
+820     rehashed = true;
+821   } else {
+822     log_info(symboltable)(&quot;Resizes in progress rehashing skipped.&quot;);
+823   }
+824 
+825   _needs_rehashing = false;
+826 }
+827 
+828 //---------------------------------------------------------------------------
+829 // Non-product code
+830 
+831 #ifndef PRODUCT
+832 
+833 class HistogramIterator : StackObj {
+834 public:
+835   static const size_t results_length = 100;
+836   size_t counts[results_length];
+837   size_t sizes[results_length];
+838   size_t total_size;
+839   size_t total_count;
+840   size_t total_length;
+841   size_t max_length;
+842   size_t out_of_range_count;
+843   size_t out_of_range_size;
+844   HistogramIterator() : total_size(0), total_count(0), total_length(0),
+845                         max_length(0), out_of_range_count(0), out_of_range_size(0) {
+846     // initialize results to zero
+847     for (size_t i = 0; i &lt; results_length; i++) {
+848       counts[i] = 0;
+849       sizes[i] = 0;
+850     }
+851   }
+852   bool operator()(Symbol** value) {
+853     assert(value != NULL, &quot;expected valid value&quot;);
+854     assert(*value != NULL, &quot;value should point to a symbol&quot;);
+855     Symbol* sym = *value;
+856     size_t size = sym-&gt;size();
+857     size_t len = sym-&gt;utf8_length();
+858     if (len &lt; results_length) {
+859       counts[len]++;
+860       sizes[len] += size;
+861     } else {
+862       out_of_range_count++;
+863       out_of_range_size += size;
+864     }
+865     total_count++;
+866     total_size += size;
+867     total_length += len;
+868     max_length = MAX2(max_length, len);
+869 
+870     return true;
+871   };
+872 };
+873 
+874 void SymbolTable::print_histogram() {
+875   HistogramIterator hi;
+876   _local_table-&gt;do_scan(Thread::current(), hi);
+877   tty-&gt;print_cr(&quot;Symbol Table Histogram:&quot;);
+878   tty-&gt;print_cr(&quot;  Total number of symbols  &quot; SIZE_FORMAT_W(7), hi.total_count);
+879   tty-&gt;print_cr(&quot;  Total size in memory     &quot; SIZE_FORMAT_W(7) &quot;K&quot;,
+880           (hi.total_size * wordSize) / 1024);
+881   tty-&gt;print_cr(&quot;  Total counted            &quot; SIZE_FORMAT_W(7), _symbols_counted);
+882   tty-&gt;print_cr(&quot;  Total removed            &quot; SIZE_FORMAT_W(7), _symbols_removed);
+883   if (_symbols_counted &gt; 0) {
+884     tty-&gt;print_cr(&quot;  Percent removed          %3.2f&quot;,
+885           ((float)_symbols_removed / _symbols_counted) * 100);
+886   }
+887   tty-&gt;print_cr(&quot;  Reference counts         &quot; SIZE_FORMAT_W(7), Symbol::_total_count);
+888   tty-&gt;print_cr(&quot;  Symbol arena used        &quot; SIZE_FORMAT_W(7) &quot;K&quot;, arena()-&gt;used() / 1024);
+889   tty-&gt;print_cr(&quot;  Symbol arena size        &quot; SIZE_FORMAT_W(7) &quot;K&quot;, arena()-&gt;size_in_bytes() / 1024);
+890   tty-&gt;print_cr(&quot;  Total symbol length      &quot; SIZE_FORMAT_W(7), hi.total_length);
+891   tty-&gt;print_cr(&quot;  Maximum symbol length    &quot; SIZE_FORMAT_W(7), hi.max_length);
+892   tty-&gt;print_cr(&quot;  Average symbol length    %7.2f&quot;, ((float)hi.total_length / hi.total_count));
+893   tty-&gt;print_cr(&quot;  Symbol length histogram:&quot;);
+894   tty-&gt;print_cr(&quot;    %6s %10s %10s&quot;, &quot;Length&quot;, &quot;#Symbols&quot;, &quot;Size&quot;);
+895   for (size_t i = 0; i &lt; hi.results_length; i++) {
+896     if (hi.counts[i] &gt; 0) {
+897       tty-&gt;print_cr(&quot;    &quot; SIZE_FORMAT_W(6) &quot; &quot; SIZE_FORMAT_W(10) &quot; &quot; SIZE_FORMAT_W(10) &quot;K&quot;,
+898                     i, hi.counts[i], (hi.sizes[i] * wordSize) / 1024);
+899     }
+900   }
+901   tty-&gt;print_cr(&quot;  &gt;=&quot; SIZE_FORMAT_W(6) &quot; &quot; SIZE_FORMAT_W(10) &quot; &quot; SIZE_FORMAT_W(10) &quot;K\n&quot;,
+902                 hi.results_length, hi.out_of_range_count, (hi.out_of_range_size*wordSize) / 1024);
+903 }
+904 #endif // PRODUCT
+905 
+906 // Utility for dumping symbols
+907 SymboltableDCmd::SymboltableDCmd(outputStream* output, bool heap) :
+908                                  DCmdWithParser(output, heap),
+909   _verbose(&quot;-verbose&quot;, &quot;Dump the content of each symbol in the table&quot;,
+910            &quot;BOOLEAN&quot;, false, &quot;false&quot;) {
+911   _dcmdparser.add_dcmd_option(&amp;_verbose);
+912 }
+913 
+914 void SymboltableDCmd::execute(DCmdSource source, TRAPS) {
+915   VM_DumpHashtable dumper(output(), VM_DumpHashtable::DumpSymbols,
+916                          _verbose.value());
+917   VMThread::execute(&amp;dumper);
+918 }
+919 
+920 int SymboltableDCmd::num_arguments() {
+921   ResourceMark rm;
+922   SymboltableDCmd* dcmd = new SymboltableDCmd(NULL, false);
+923   if (dcmd != NULL) {
+924     DCmdMark mark(dcmd);
+925     return dcmd-&gt;_dcmdparser.num_arguments();
+926   } else {
+927     return 0;
+928   }
+929 }
+    </pre>
+  </body>
+</html>
