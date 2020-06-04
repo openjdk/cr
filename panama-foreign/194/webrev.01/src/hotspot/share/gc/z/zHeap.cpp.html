@@ -1,0 +1,547 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>New src/hotspot/share/gc/z/zHeap.cpp</title>
+    <link rel="stylesheet" href="../../../../../style.css" />
+  </head>
+  <body>
+    <pre>
+  1 /*
+  2  * Copyright (c) 2015, 2020, Oracle and/or its affiliates. All rights reserved.
+  3  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  4  *
+  5  * This code is free software; you can redistribute it and/or modify it
+  6  * under the terms of the GNU General Public License version 2 only, as
+  7  * published by the Free Software Foundation.
+  8  *
+  9  * This code is distributed in the hope that it will be useful, but WITHOUT
+ 10  * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ 11  * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ 12  * version 2 for more details (a copy is included in the LICENSE file that
+ 13  * accompanied this code).
+ 14  *
+ 15  * You should have received a copy of the GNU General Public License version
+ 16  * 2 along with this work; if not, write to the Free Software Foundation,
+ 17  * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ 18  *
+ 19  * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ 20  * or visit www.oracle.com if you need additional information or have any
+ 21  * questions.
+ 22  */
+ 23 
+ 24 #include &quot;precompiled.hpp&quot;
+ 25 #include &quot;gc/shared/locationPrinter.hpp&quot;
+ 26 #include &quot;gc/z/zAddress.inline.hpp&quot;
+ 27 #include &quot;gc/z/zGlobals.hpp&quot;
+ 28 #include &quot;gc/z/zHeap.inline.hpp&quot;
+ 29 #include &quot;gc/z/zHeapIterator.hpp&quot;
+ 30 #include &quot;gc/z/zMark.inline.hpp&quot;
+ 31 #include &quot;gc/z/zPage.inline.hpp&quot;
+ 32 #include &quot;gc/z/zPageTable.inline.hpp&quot;
+ 33 #include &quot;gc/z/zRelocationSet.inline.hpp&quot;
+ 34 #include &quot;gc/z/zRelocationSetSelector.inline.hpp&quot;
+ 35 #include &quot;gc/z/zResurrection.hpp&quot;
+ 36 #include &quot;gc/z/zStat.hpp&quot;
+ 37 #include &quot;gc/z/zThread.inline.hpp&quot;
+ 38 #include &quot;gc/z/zVerify.hpp&quot;
+ 39 #include &quot;gc/z/zWorkers.inline.hpp&quot;
+ 40 #include &quot;logging/log.hpp&quot;
+ 41 #include &quot;memory/iterator.hpp&quot;
+ 42 #include &quot;memory/resourceArea.hpp&quot;
+ 43 #include &quot;runtime/handshake.hpp&quot;
+ 44 #include &quot;runtime/safepoint.hpp&quot;
+ 45 #include &quot;runtime/thread.hpp&quot;
+ 46 #include &quot;utilities/debug.hpp&quot;
+ 47 
+ 48 static const ZStatSampler ZSamplerHeapUsedBeforeMark(&quot;Memory&quot;, &quot;Heap Used Before Mark&quot;, ZStatUnitBytes);
+ 49 static const ZStatSampler ZSamplerHeapUsedAfterMark(&quot;Memory&quot;, &quot;Heap Used After Mark&quot;, ZStatUnitBytes);
+ 50 static const ZStatSampler ZSamplerHeapUsedBeforeRelocation(&quot;Memory&quot;, &quot;Heap Used Before Relocation&quot;, ZStatUnitBytes);
+ 51 static const ZStatSampler ZSamplerHeapUsedAfterRelocation(&quot;Memory&quot;, &quot;Heap Used After Relocation&quot;, ZStatUnitBytes);
+ 52 static const ZStatCounter ZCounterUndoPageAllocation(&quot;Memory&quot;, &quot;Undo Page Allocation&quot;, ZStatUnitOpsPerSecond);
+ 53 static const ZStatCounter ZCounterOutOfMemory(&quot;Memory&quot;, &quot;Out Of Memory&quot;, ZStatUnitOpsPerSecond);
+ 54 
+ 55 ZHeap* ZHeap::_heap = NULL;
+ 56 
+ 57 ZHeap::ZHeap() :
+ 58     _workers(),
+ 59     _object_allocator(),
+ 60     _page_allocator(&amp;_workers, heap_min_size(), heap_initial_size(), heap_max_size(), heap_max_reserve_size()),
+ 61     _page_table(),
+ 62     _forwarding_table(),
+ 63     _mark(&amp;_workers, &amp;_page_table),
+ 64     _reference_processor(&amp;_workers),
+ 65     _weak_roots_processor(&amp;_workers),
+ 66     _relocate(&amp;_workers),
+ 67     _relocation_set(),
+ 68     _unload(&amp;_workers),
+ 69     _serviceability(heap_min_size(), heap_max_size()) {
+ 70   // Install global heap instance
+ 71   assert(_heap == NULL, &quot;Already initialized&quot;);
+ 72   _heap = this;
+ 73 
+ 74   // Update statistics
+ 75   ZStatHeap::set_at_initialize(heap_min_size(), heap_max_size(), heap_max_reserve_size());
+ 76 }
+ 77 
+ 78 size_t ZHeap::heap_min_size() const {
+ 79   return MinHeapSize;
+ 80 }
+ 81 
+ 82 size_t ZHeap::heap_initial_size() const {
+ 83   return InitialHeapSize;
+ 84 }
+ 85 
+ 86 size_t ZHeap::heap_max_size() const {
+ 87   return MaxHeapSize;
+ 88 }
+ 89 
+ 90 size_t ZHeap::heap_max_reserve_size() const {
+ 91   // Reserve one small page per worker plus one shared medium page. This is still just
+ 92   // an estimate and doesn&#39;t guarantee that we can&#39;t run out of memory during relocation.
+ 93   const size_t max_reserve_size = (_workers.nworkers() * ZPageSizeSmall) + ZPageSizeMedium;
+ 94   return MIN2(max_reserve_size, heap_max_size());
+ 95 }
+ 96 
+ 97 bool ZHeap::is_initialized() const {
+ 98   return _page_allocator.is_initialized() &amp;&amp; _mark.is_initialized();
+ 99 }
+100 
+101 size_t ZHeap::min_capacity() const {
+102   return _page_allocator.min_capacity();
+103 }
+104 
+105 size_t ZHeap::max_capacity() const {
+106   return _page_allocator.max_capacity();
+107 }
+108 
+109 size_t ZHeap::soft_max_capacity() const {
+110   return _page_allocator.soft_max_capacity();
+111 }
+112 
+113 size_t ZHeap::capacity() const {
+114   return _page_allocator.capacity();
+115 }
+116 
+117 size_t ZHeap::max_reserve() const {
+118   return _page_allocator.max_reserve();
+119 }
+120 
+121 size_t ZHeap::used_high() const {
+122   return _page_allocator.used_high();
+123 }
+124 
+125 size_t ZHeap::used_low() const {
+126   return _page_allocator.used_low();
+127 }
+128 
+129 size_t ZHeap::used() const {
+130   return _page_allocator.used();
+131 }
+132 
+133 size_t ZHeap::unused() const {
+134   return _page_allocator.unused();
+135 }
+136 
+137 size_t ZHeap::allocated() const {
+138   return _page_allocator.allocated();
+139 }
+140 
+141 size_t ZHeap::reclaimed() const {
+142   return _page_allocator.reclaimed();
+143 }
+144 
+145 size_t ZHeap::tlab_capacity() const {
+146   return capacity();
+147 }
+148 
+149 size_t ZHeap::tlab_used() const {
+150   return _object_allocator.used();
+151 }
+152 
+153 size_t ZHeap::max_tlab_size() const {
+154   return ZObjectSizeLimitSmall;
+155 }
+156 
+157 size_t ZHeap::unsafe_max_tlab_alloc() const {
+158   size_t size = _object_allocator.remaining();
+159 
+160   if (size &lt; MinTLABSize) {
+161     // The remaining space in the allocator is not enough to
+162     // fit the smallest possible TLAB. This means that the next
+163     // TLAB allocation will force the allocator to get a new
+164     // backing page anyway, which in turn means that we can then
+165     // fit the largest possible TLAB.
+166     size = max_tlab_size();
+167   }
+168 
+169   return MIN2(size, max_tlab_size());
+170 }
+171 
+172 bool ZHeap::is_in(uintptr_t addr) const {
+173   // An address is considered to be &quot;in the heap&quot; if it points into
+174   // the allocated part of a page, regardless of which heap view is
+175   // used. Note that an address with the finalizable metadata bit set
+176   // is not pointing into a heap view, and therefore not considered
+177   // to be &quot;in the heap&quot;.
+178 
+179   if (ZAddress::is_in(addr)) {
+180     const ZPage* const page = _page_table.get(addr);
+181     if (page != NULL) {
+182       return page-&gt;is_in(addr);
+183     }
+184   }
+185 
+186   return false;
+187 }
+188 
+189 uint ZHeap::nconcurrent_worker_threads() const {
+190   return _workers.nconcurrent();
+191 }
+192 
+193 uint ZHeap::nconcurrent_no_boost_worker_threads() const {
+194   return _workers.nconcurrent_no_boost();
+195 }
+196 
+197 void ZHeap::set_boost_worker_threads(bool boost) {
+198   _workers.set_boost(boost);
+199 }
+200 
+201 void ZHeap::worker_threads_do(ThreadClosure* tc) const {
+202   _workers.threads_do(tc);
+203 }
+204 
+205 void ZHeap::print_worker_threads_on(outputStream* st) const {
+206   _workers.print_threads_on(st);
+207 }
+208 
+209 void ZHeap::out_of_memory() {
+210   ResourceMark rm;
+211 
+212   ZStatInc(ZCounterOutOfMemory);
+213   log_info(gc)(&quot;Out Of Memory (%s)&quot;, Thread::current()-&gt;name());
+214 }
+215 
+216 ZPage* ZHeap::alloc_page(uint8_t type, size_t size, ZAllocationFlags flags) {
+217   ZPage* const page = _page_allocator.alloc_page(type, size, flags);
+218   if (page != NULL) {
+219     // Insert page table entry
+220     _page_table.insert(page);
+221   }
+222 
+223   return page;
+224 }
+225 
+226 void ZHeap::undo_alloc_page(ZPage* page) {
+227   assert(page-&gt;is_allocating(), &quot;Invalid page state&quot;);
+228 
+229   ZStatInc(ZCounterUndoPageAllocation);
+230   log_trace(gc)(&quot;Undo page allocation, thread: &quot; PTR_FORMAT &quot; (%s), page: &quot; PTR_FORMAT &quot;, size: &quot; SIZE_FORMAT,
+231                 ZThread::id(), ZThread::name(), p2i(page), page-&gt;size());
+232 
+233   free_page(page, false /* reclaimed */);
+234 }
+235 
+236 void ZHeap::free_page(ZPage* page, bool reclaimed) {
+237   // Remove page table entry
+238   _page_table.remove(page);
+239 
+240   // Free page
+241   _page_allocator.free_page(page, reclaimed);
+242 }
+243 
+244 uint64_t ZHeap::uncommit(uint64_t delay) {
+245   return _page_allocator.uncommit(delay);
+246 }
+247 
+248 void ZHeap::flip_to_marked() {
+249   ZVerifyViewsFlip flip(&amp;_page_allocator);
+250   ZAddress::flip_to_marked();
+251 }
+252 
+253 void ZHeap::flip_to_remapped() {
+254   ZVerifyViewsFlip flip(&amp;_page_allocator);
+255   ZAddress::flip_to_remapped();
+256 }
+257 
+258 void ZHeap::mark_start() {
+259   assert(SafepointSynchronize::is_at_safepoint(), &quot;Should be at safepoint&quot;);
+260 
+261   // Update statistics
+262   ZStatSample(ZSamplerHeapUsedBeforeMark, used());
+263 
+264   // Flip address view
+265   flip_to_marked();
+266 
+267   // Retire allocating pages
+268   _object_allocator.retire_pages();
+269 
+270   // Reset allocated/reclaimed/used statistics
+271   _page_allocator.reset_statistics();
+272 
+273   // Reset encountered/dropped/enqueued statistics
+274   _reference_processor.reset_statistics();
+275 
+276   // Enter mark phase
+277   ZGlobalPhase = ZPhaseMark;
+278 
+279   // Reset marking information and mark roots
+280   _mark.start();
+281 
+282   // Update statistics
+283   ZStatHeap::set_at_mark_start(soft_max_capacity(), capacity(), used());
+284 }
+285 
+286 void ZHeap::mark(bool initial) {
+287   _mark.mark(initial);
+288 }
+289 
+290 void ZHeap::mark_flush_and_free(Thread* thread) {
+291   _mark.flush_and_free(thread);
+292 }
+293 
+294 bool ZHeap::mark_end() {
+295   assert(SafepointSynchronize::is_at_safepoint(), &quot;Should be at safepoint&quot;);
+296 
+297   // Try end marking
+298   if (!_mark.end()) {
+299     // Marking not completed, continue concurrent mark
+300     return false;
+301   }
+302 
+303   // Enter mark completed phase
+304   ZGlobalPhase = ZPhaseMarkCompleted;
+305 
+306   // Verify after mark
+307   ZVerify::after_mark();
+308 
+309   // Update statistics
+310   ZStatSample(ZSamplerHeapUsedAfterMark, used());
+311   ZStatHeap::set_at_mark_end(capacity(), allocated(), used());
+312 
+313   // Block resurrection of weak/phantom references
+314   ZResurrection::block();
+315 
+316   // Process weak roots
+317   _weak_roots_processor.process_weak_roots();
+318 
+319   // Prepare to unload stale metadata and nmethods
+320   _unload.prepare();
+321 
+322   return true;
+323 }
+324 
+325 void ZHeap::keep_alive(oop obj) {
+326   ZBarrier::keep_alive_barrier_on_oop(obj);
+327 }
+328 
+329 void ZHeap::set_soft_reference_policy(bool clear) {
+330   _reference_processor.set_soft_reference_policy(clear);
+331 }
+332 
+333 class ZRendezvousClosure : public HandshakeClosure {
+334 public:
+335   ZRendezvousClosure() :
+336       HandshakeClosure(&quot;ZRendezvous&quot;) {}
+337 
+338   void do_thread(Thread* thread) {}
+339 };
+340 
+341 void ZHeap::process_non_strong_references() {
+342   // Process Soft/Weak/Final/PhantomReferences
+343   _reference_processor.process_references();
+344 
+345   // Process concurrent weak roots
+346   _weak_roots_processor.process_concurrent_weak_roots();
+347 
+348   // Unlink stale metadata and nmethods
+349   _unload.unlink();
+350 
+351   // Perform a handshake. This is needed 1) to make sure that stale
+352   // metadata and nmethods are no longer observable. And 2), to
+353   // prevent the race where a mutator first loads an oop, which is
+354   // logically null but not yet cleared. Then this oop gets cleared
+355   // by the reference processor and resurrection is unblocked. At
+356   // this point the mutator could see the unblocked state and pass
+357   // this invalid oop through the normal barrier path, which would
+358   // incorrectly try to mark the oop.
+359   ZRendezvousClosure cl;
+360   Handshake::execute(&amp;cl);
+361 
+362   // Unblock resurrection of weak/phantom references
+363   ZResurrection::unblock();
+364 
+365   // Purge stale metadata and nmethods that were unlinked
+366   _unload.purge();
+367 
+368   // Enqueue Soft/Weak/Final/PhantomReferences. Note that this
+369   // must be done after unblocking resurrection. Otherwise the
+370   // Finalizer thread could call Reference.get() on the Finalizers
+371   // that were just enqueued, which would incorrectly return null
+372   // during the resurrection block window, since such referents
+373   // are only Finalizable marked.
+374   _reference_processor.enqueue_references();
+375 }
+376 
+377 void ZHeap::select_relocation_set() {
+378   // Do not allow pages to be deleted
+379   _page_allocator.enable_deferred_delete();
+380 
+381   // Register relocatable pages with selector
+382   ZRelocationSetSelector selector;
+383   ZPageTableIterator pt_iter(&amp;_page_table);
+384   for (ZPage* page; pt_iter.next(&amp;page);) {
+385     if (!page-&gt;is_relocatable()) {
+386       // Not relocatable, don&#39;t register
+387       continue;
+388     }
+389 
+390     if (page-&gt;is_marked()) {
+391       // Register live page
+392       selector.register_live_page(page);
+393     } else {
+394       // Register garbage page
+395       selector.register_garbage_page(page);
+396 
+397       // Reclaim page immediately
+398       free_page(page, true /* reclaimed */);
+399     }
+400   }
+401 
+402   // Allow pages to be deleted
+403   _page_allocator.disable_deferred_delete();
+404 
+405   // Select pages to relocate
+406   selector.select(&amp;_relocation_set);
+407 
+408   // Setup forwarding table
+409   ZRelocationSetIterator rs_iter(&amp;_relocation_set);
+410   for (ZForwarding* forwarding; rs_iter.next(&amp;forwarding);) {
+411     _forwarding_table.insert(forwarding);
+412   }
+413 
+414   // Update statistics
+415   ZStatRelocation::set_at_select_relocation_set(selector.stats());
+416   ZStatHeap::set_at_select_relocation_set(selector.stats(), reclaimed());
+417 }
+418 
+419 void ZHeap::reset_relocation_set() {
+420   // Reset forwarding table
+421   ZRelocationSetIterator iter(&amp;_relocation_set);
+422   for (ZForwarding* forwarding; iter.next(&amp;forwarding);) {
+423     _forwarding_table.remove(forwarding);
+424   }
+425 
+426   // Reset relocation set
+427   _relocation_set.reset();
+428 }
+429 
+430 void ZHeap::relocate_start() {
+431   assert(SafepointSynchronize::is_at_safepoint(), &quot;Should be at safepoint&quot;);
+432 
+433   // Finish unloading stale metadata and nmethods
+434   _unload.finish();
+435 
+436   // Flip address view
+437   flip_to_remapped();
+438 
+439   // Enter relocate phase
+440   ZGlobalPhase = ZPhaseRelocate;
+441 
+442   // Update statistics
+443   ZStatSample(ZSamplerHeapUsedBeforeRelocation, used());
+444   ZStatHeap::set_at_relocate_start(capacity(), allocated(), used());
+445 
+446   // Remap/Relocate roots
+447   _relocate.start();
+448 }
+449 
+450 void ZHeap::relocate() {
+451   // Relocate relocation set
+452   const bool success = _relocate.relocate(&amp;_relocation_set);
+453 
+454   // Update statistics
+455   ZStatSample(ZSamplerHeapUsedAfterRelocation, used());
+456   ZStatRelocation::set_at_relocate_end(success);
+457   ZStatHeap::set_at_relocate_end(capacity(), allocated(), reclaimed(),
+458                                  used(), used_high(), used_low());
+459 }
+460 
+461 void ZHeap::object_iterate(ObjectClosure* cl, bool visit_weaks) {
+462   assert(SafepointSynchronize::is_at_safepoint(), &quot;Should be at safepoint&quot;);
+463 
+464   ZHeapIterator iter;
+465   iter.objects_do(cl, visit_weaks);
+466 }
+467 
+468 void ZHeap::pages_do(ZPageClosure* cl) {
+469   ZPageTableIterator iter(&amp;_page_table);
+470   for (ZPage* page; iter.next(&amp;page);) {
+471     cl-&gt;do_page(page);
+472   }
+473   _page_allocator.pages_do(cl);
+474 }
+475 
+476 void ZHeap::serviceability_initialize() {
+477   _serviceability.initialize();
+478 }
+479 
+480 GCMemoryManager* ZHeap::serviceability_memory_manager() {
+481   return _serviceability.memory_manager();
+482 }
+483 
+484 MemoryPool* ZHeap::serviceability_memory_pool() {
+485   return _serviceability.memory_pool();
+486 }
+487 
+488 ZServiceabilityCounters* ZHeap::serviceability_counters() {
+489   return _serviceability.counters();
+490 }
+491 
+492 void ZHeap::print_on(outputStream* st) const {
+493   st-&gt;print_cr(&quot; ZHeap           used &quot; SIZE_FORMAT &quot;M, capacity &quot; SIZE_FORMAT &quot;M, max capacity &quot; SIZE_FORMAT &quot;M&quot;,
+494                used() / M,
+495                capacity() / M,
+496                max_capacity() / M);
+497   MetaspaceUtils::print_on(st);
+498 }
+499 
+500 void ZHeap::print_extended_on(outputStream* st) const {
+501   print_on(st);
+502   st-&gt;cr();
+503 
+504   // Do not allow pages to be deleted
+505   _page_allocator.enable_deferred_delete();
+506 
+507   // Print all pages
+508   st-&gt;print_cr(&quot;ZGC Page Table:&quot;);
+509   ZPageTableIterator iter(&amp;_page_table);
+510   for (ZPage* page; iter.next(&amp;page);) {
+511     page-&gt;print_on(st);
+512   }
+513 
+514   // Allow pages to be deleted
+515   _page_allocator.enable_deferred_delete();
+516 }
+517 
+518 bool ZHeap::print_location(outputStream* st, uintptr_t addr) const {
+519   if (LocationPrinter::is_valid_obj((void*)addr)) {
+520     st-&gt;print(PTR_FORMAT &quot; is a %s oop: &quot;, addr, ZAddress::is_good(addr) ? &quot;good&quot; : &quot;bad&quot;);
+521     ZOop::from_address(addr)-&gt;print_on(st);
+522     return true;
+523   }
+524 
+525   return false;
+526 }
+527 
+528 void ZHeap::verify() {
+529   // Heap verification can only be done between mark end and
+530   // relocate start. This is the only window where all oop are
+531   // good and the whole heap is in a consistent state.
+532   guarantee(ZGlobalPhase == ZPhaseMarkCompleted, &quot;Invalid phase&quot;);
+533 
+534   ZVerify::after_weak_processing();
+535 }
+    </pre>
+  </body>
+</html>
