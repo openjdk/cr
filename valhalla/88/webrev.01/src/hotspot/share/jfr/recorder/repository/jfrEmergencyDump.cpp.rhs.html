@@ -1,0 +1,666 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Frames src/hotspot/share/jfr/recorder/repository/jfrEmergencyDump.cpp</title>
+    <link rel="stylesheet" href="../../../../../../style.css" />
+    <script type="text/javascript" src="../../../../../../navigation.js"></script>
+  </head>
+<body onkeypress="keypress(event);">
+<a name="0"></a>
+<hr />
+<pre>  1 /*
+  2  * Copyright (c) 2012, 2020, Oracle and/or its affiliates. All rights reserved.
+  3  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  4  *
+  5  * This code is free software; you can redistribute it and/or modify it
+  6  * under the terms of the GNU General Public License version 2 only, as
+  7  * published by the Free Software Foundation.
+  8  *
+  9  * This code is distributed in the hope that it will be useful, but WITHOUT
+ 10  * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ 11  * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ 12  * version 2 for more details (a copy is included in the LICENSE file that
+ 13  * accompanied this code).
+ 14  *
+ 15  * You should have received a copy of the GNU General Public License version
+ 16  * 2 along with this work; if not, write to the Free Software Foundation,
+ 17  * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ 18  *
+ 19  * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ 20  * or visit www.oracle.com if you need additional information or have any
+ 21  * questions.
+ 22  *
+ 23  */
+ 24 
+ 25 #include &quot;precompiled.hpp&quot;
+ 26 #include &quot;jfr/jfrEvents.hpp&quot;
+ 27 #include &quot;jfr/jni/jfrJavaSupport.hpp&quot;
+ 28 #include &quot;jfr/leakprofiler/leakProfiler.hpp&quot;
+ 29 #include &quot;jfr/recorder/repository/jfrEmergencyDump.hpp&quot;
+ 30 #include &quot;jfr/recorder/service/jfrPostBox.hpp&quot;
+ 31 #include &quot;jfr/recorder/service/jfrRecorderService.hpp&quot;
+ 32 #include &quot;jfr/utilities/jfrTypes.hpp&quot;
+ 33 #include &quot;logging/log.hpp&quot;
+ 34 #include &quot;runtime/atomic.hpp&quot;
+ 35 #include &quot;runtime/globals.hpp&quot;
+ 36 #include &quot;runtime/mutexLocker.hpp&quot;
+ 37 #include &quot;runtime/os.hpp&quot;
+ 38 #include &quot;runtime/thread.inline.hpp&quot;
+ 39 #include &quot;utilities/growableArray.hpp&quot;
+ 40 #include &quot;utilities/ostream.hpp&quot;
+ 41 
+ 42 static const char vm_error_filename_fmt[] = &quot;hs_err_pid%p.jfr&quot;;
+ 43 static const char vm_oom_filename_fmt[] = &quot;hs_oom_pid%p.jfr&quot;;
+ 44 static const char vm_soe_filename_fmt[] = &quot;hs_soe_pid%p.jfr&quot;;
+ 45 static const char chunk_file_jfr_ext[] = &quot;.jfr&quot;;
+ 46 static const size_t iso8601_len = 19; // &quot;YYYY-MM-DDTHH:MM:SS&quot;
+ 47 static fio_fd emergency_fd = invalid_fd;
+ 48 static const int64_t chunk_file_header_size = 68;
+ 49 static const size_t chunk_file_extension_length = sizeof chunk_file_jfr_ext - 1;
+ 50 
+ 51 /*
+ 52  * The emergency dump logic is restrictive when it comes to
+ 53  * using internal VM constructs such as ResourceArea / Handle / Arena.
+ 54  * The reason being that the thread context is unknown.
+ 55  *
+ 56  * A single static buffer of size JVM_MAXPATHLEN is used for building paths.
+ 57  * os::malloc / os::free are used in a few places.
+ 58  */
+ 59 
+ 60 static char _path_buffer[JVM_MAXPATHLEN] = { 0 };
+ 61 
+ 62 static bool is_path_empty() {
+ 63   return *_path_buffer == &#39;\0&#39;;
+ 64 }
+ 65 
+ 66 // returns with an appended file separator (if successful)
+ 67 static size_t get_current_directory() {
+ 68   if (os::get_current_directory(_path_buffer, sizeof(_path_buffer)) == NULL) {
+ 69     return 0;
+ 70   }
+ 71   const size_t cwd_len = strlen(_path_buffer);
+ 72   const int result = jio_snprintf(_path_buffer + cwd_len,
+ 73                                   sizeof(_path_buffer),
+ 74                                   &quot;%s&quot;,
+ 75                                   os::file_separator());
+ 76   return (result == -1) ? 0 : strlen(_path_buffer);
+ 77 }
+ 78 
+ 79 static fio_fd open_exclusivly(const char* path) {
+ 80   assert((path != NULL) &amp;&amp; (*path != &#39;\0&#39;), &quot;invariant&quot;);
+ 81   return os::open(path, O_CREAT | O_RDWR, S_IREAD | S_IWRITE);
+ 82 }
+ 83 
+ 84 static bool is_emergency_dump_file_open() {
+ 85   return emergency_fd != invalid_fd;
+ 86 }
+ 87 
+ 88 static bool open_emergency_dump_fd(const char* path) {
+ 89   if (path == NULL) {
+ 90     return false;
+ 91   }
+ 92   assert(emergency_fd == invalid_fd, &quot;invariant&quot;);
+ 93   emergency_fd = open_exclusivly(path);
+ 94   return emergency_fd != invalid_fd;
+ 95 }
+ 96 
+ 97 static void close_emergency_dump_file() {
+ 98   if (is_emergency_dump_file_open()) {
+ 99     os::close(emergency_fd);
+100   }
+101 }
+102 
+103 static const char* create_emergency_dump_path() {
+104   assert(is_path_empty(), &quot;invariant&quot;);
+105 
+106   const size_t path_len = get_current_directory();
+107   if (path_len == 0) {
+108     return NULL;
+109   }
+110   const char* filename_fmt = NULL;
+111   // fetch specific error cause
+112   switch (JfrJavaSupport::cause()) {
+113     case JfrJavaSupport::OUT_OF_MEMORY:
+114       filename_fmt = vm_oom_filename_fmt;
+115       break;
+116     case JfrJavaSupport::STACK_OVERFLOW:
+117       filename_fmt = vm_soe_filename_fmt;
+118       break;
+119     default:
+120       filename_fmt = vm_error_filename_fmt;
+121   }
+122   const bool result = Arguments::copy_expand_pid(filename_fmt, strlen(filename_fmt), _path_buffer + path_len, JVM_MAXPATHLEN - path_len);
+123   return result ? _path_buffer : NULL;
+124 }
+125 
+126 static bool open_emergency_dump_file() {
+127   if (is_emergency_dump_file_open()) {
+128     // opened already
+129     return true;
+130   }
+131   return open_emergency_dump_fd(create_emergency_dump_path());
+132 }
+133 
+134 static void report(outputStream* st, bool emergency_file_opened, const char* repository_path) {
+135   assert(st != NULL, &quot;invariant&quot;);
+136   if (emergency_file_opened) {
+137     st-&gt;print_raw(&quot;# JFR recording file will be written. Location: &quot;);
+138     st-&gt;print_raw_cr(_path_buffer);
+139     st-&gt;print_raw_cr(&quot;#&quot;);
+140   } else if (repository_path != NULL) {
+141     st-&gt;print_raw(&quot;# The JFR repository may contain useful JFR files. Location: &quot;);
+142     st-&gt;print_raw_cr(repository_path);
+143     st-&gt;print_raw_cr(&quot;#&quot;);
+144   } else if (!is_path_empty()) {
+145     st-&gt;print_raw(&quot;# Unable to create a JFR recording file at location: &quot;);
+146     st-&gt;print_raw_cr(_path_buffer);
+147     st-&gt;print_raw_cr(&quot;#&quot;);
+148   }
+149 }
+150 
+151 void JfrEmergencyDump::on_vm_error_report(outputStream* st, const char* repository_path) {
+152   assert(st != NULL, &quot;invariant&quot;);
+153   Thread* thread = Thread::current_or_null_safe();
+154   if (thread != NULL) {
+155     report(st, open_emergency_dump_file(), repository_path);
+156   } else if (repository_path != NULL) {
+157     // a non-attached thread will not be able to write anything later
+158     report(st, false, repository_path);
+159   }
+160 }
+161 
+162 static int file_sort(const char** const file1, const char** file2) {
+163   assert(NULL != *file1 &amp;&amp; NULL != *file2, &quot;invariant&quot;);
+164   int cmp = strncmp(*file1, *file2, iso8601_len);
+165   if (0 == cmp) {
+166     const char* const dot1 = strchr(*file1, &#39;.&#39;);
+167     assert(NULL != dot1, &quot;invariant&quot;);
+168     const char* const dot2 = strchr(*file2, &#39;.&#39;);
+169     assert(NULL != dot2, &quot;invariant&quot;);
+170     ptrdiff_t file1_len = dot1 - *file1;
+171     ptrdiff_t file2_len = dot2 - *file2;
+172     if (file1_len &lt; file2_len) {
+173       return -1;
+174     }
+175     if (file1_len &gt; file2_len) {
+176       return 1;
+177     }
+178     assert(file1_len == file2_len, &quot;invariant&quot;);
+179     cmp = strncmp(*file1, *file2, file1_len);
+180   }
+181   assert(cmp != 0, &quot;invariant&quot;);
+182   return cmp;
+183 }
+184 
+185 static void iso8601_to_date_time(char* iso8601_str) {
+186   assert(iso8601_str != NULL, &quot;invariant&quot;);
+187   assert(strlen(iso8601_str) == iso8601_len, &quot;invariant&quot;);
+188   // &quot;YYYY-MM-DDTHH:MM:SS&quot;
+189   for (size_t i = 0; i &lt; iso8601_len; ++i) {
+190     switch (iso8601_str[i]) {
+191     case &#39;T&#39;:
+192     case &#39;-&#39;:
+193     case &#39;:&#39;:
+194       iso8601_str[i] = &#39;_&#39;;
+195       break;
+196     }
+197   }
+198   // &quot;YYYY_MM_DD_HH_MM_SS&quot;
+199 }
+200 
+201 static void date_time(char* buffer, size_t buffer_len) {
+202   assert(buffer != NULL, &quot;invariant&quot;);
+203   assert(buffer_len &gt;= iso8601_len, &quot;buffer too small&quot;);
+204   os::iso8601_time(buffer, buffer_len);
+205   assert(strlen(buffer) &gt;= iso8601_len + 1, &quot;invariant&quot;);
+206   // &quot;YYYY-MM-DDTHH:MM:SS&quot;
+207   buffer[iso8601_len] = &#39;\0&#39;;
+208   iso8601_to_date_time(buffer);
+209 }
+210 
+211 static int64_t file_size(fio_fd fd) {
+212   assert(fd != invalid_fd, &quot;invariant&quot;);
+213   const int64_t current_offset = os::current_file_offset(fd);
+214   const int64_t size = os::lseek(fd, 0, SEEK_END);
+215   os::seek_to_file_offset(fd, current_offset);
+216   return size;
+217 }
+218 
+219 class RepositoryIterator : public StackObj {
+220  private:
+221   GrowableArray&lt;const char*&gt;* _file_names;
+222   int _path_buffer_file_name_offset;
+223   mutable int _iterator;
+224   const char* fully_qualified(const char* file_name) const;
+225   const char* filter(const char* file_name) const;
+226  public:
+227   RepositoryIterator(const char* repository_path);
+228   ~RepositoryIterator();
+229   bool has_next() const;
+230   const char* next() const;
+231 };
+232 
+233 // append the file_name at the _path_buffer_file_name_offset position
+234 const char* RepositoryIterator::fully_qualified(const char* file_name) const {
+235   assert(NULL != file_name, &quot;invariant&quot;);
+236   assert(!is_path_empty(), &quot;invariant&quot;);
+237   assert(_path_buffer_file_name_offset != 0, &quot;invariant&quot;);
+238 
+239   const int result = jio_snprintf(_path_buffer + _path_buffer_file_name_offset,
+240                                   sizeof(_path_buffer) - _path_buffer_file_name_offset,
+241                                   &quot;%s&quot;,
+242                                   file_name);
+243   return result != -1 ? _path_buffer : NULL;
+244 }
+245 
+246 // caller responsible for deallocation
+247 const char* RepositoryIterator::filter(const char* file_name) const {
+248   if (file_name == NULL) {
+249     return NULL;
+250   }
+251   const size_t len = strlen(file_name);
+252   if ((len &lt; chunk_file_extension_length) ||
+253       (strncmp(&amp;file_name[len - chunk_file_extension_length],
+254                chunk_file_jfr_ext,
+255                chunk_file_extension_length) != 0)) {
+256     // not a .jfr file
+257     return NULL;
+258   }
+259   const char* fqn = fully_qualified(file_name);
+260   if (fqn == NULL) {
+261     return NULL;
+262   }
+263   const fio_fd fd = open_exclusivly(fqn);
+264   if (invalid_fd == fd) {
+265     return NULL;
+266   }
+267   const int64_t size = file_size(fd);
+268   os::close(fd);
+269   if (size &lt;= chunk_file_header_size) {
+270     return NULL;
+271   }
+272   char* const file_name_copy = (char*)os::malloc(len + 1, mtTracing);
+273   if (file_name_copy == NULL) {
+274     log_error(jfr, system)(&quot;Unable to malloc memory during jfr emergency dump&quot;);
+275     return NULL;
+276   }
+277   strncpy(file_name_copy, file_name, len + 1);
+278   return file_name_copy;
+279 }
+280 
+281 RepositoryIterator::RepositoryIterator(const char* repository_path) :
+282   _file_names(NULL),
+283   _path_buffer_file_name_offset(0),
+284   _iterator(0) {
+285     DIR* dirp = os::opendir(repository_path);
+286     if (dirp == NULL) {
+287       log_error(jfr, system)(&quot;Unable to open repository %s&quot;, repository_path);
+288       return;
+289     }
+290     // store repository path in the path buffer and save that position
+291     _path_buffer_file_name_offset = jio_snprintf(_path_buffer,
+292                                                  sizeof(_path_buffer),
+293                                                  &quot;%s%s&quot;,
+294                                                  repository_path,
+295                                                  os::file_separator());
+296     if (_path_buffer_file_name_offset == -1) {
+297       return;
+298     }
+299     _file_names = new (ResourceObj::C_HEAP, mtTracing) GrowableArray&lt;const char*&gt;(10, true, mtTracing);
+300     if (_file_names == NULL) {
+301       log_error(jfr, system)(&quot;Unable to malloc memory during jfr emergency dump&quot;);
+302       return;
+303     }
+304     // iterate files in the repository and append filtered file names to the files array
+305     struct dirent* dentry;
+306     while ((dentry = os::readdir(dirp)) != NULL) {
+307       const char* file_name = filter(dentry-&gt;d_name);
+308       if (file_name != NULL) {
+309         _file_names-&gt;append(file_name);
+310       }
+311     }
+312     os::closedir(dirp);
+313     if (_file_names-&gt;length() &gt; 1) {
+314       _file_names-&gt;sort(file_sort);
+315     }
+316 }
+317 
+318 RepositoryIterator::~RepositoryIterator() {
+319   if (_file_names != NULL) {
+320     for (int i = 0; i &lt; _file_names-&gt;length(); ++i) {
+321       os::free(const_cast&lt;char*&gt;(_file_names-&gt;at(i)));
+322     }
+323     delete _file_names;
+324   }
+325 }
+326 
+327 bool RepositoryIterator::has_next() const {
+328   return _file_names != NULL &amp;&amp; _iterator &lt; _file_names-&gt;length();
+329 }
+330 
+331 const char* RepositoryIterator::next() const {
+332   return _iterator &gt;= _file_names-&gt;length() ? NULL : fully_qualified(_file_names-&gt;at(_iterator++));
+333 }
+334 
+335 static void write_repository_files(const RepositoryIterator&amp; iterator, char* const copy_block, size_t block_size) {
+336   assert(is_emergency_dump_file_open(), &quot;invariant&quot;);
+337   while (iterator.has_next()) {
+338     fio_fd current_fd = invalid_fd;
+339     const char* const fqn = iterator.next();
+340     assert(fqn != NULL, &quot;invariant&quot;);
+341     current_fd = open_exclusivly(fqn);
+342     if (current_fd != invalid_fd) {
+343       const int64_t size = file_size(current_fd);
+344       assert(size &gt; 0, &quot;invariant&quot;);
+345       int64_t bytes_read = 0;
+346       int64_t bytes_written = 0;
+347       while (bytes_read &lt; size) {
+348         const ssize_t read_result = os::read_at(current_fd, copy_block, (int)block_size, bytes_read);
+349         if (-1 == read_result) {
+350           log_info(jfr)( // For user, should not be &quot;jfr, system&quot;
+351               &quot;Unable to recover JFR data&quot;);
+352           break;
+353         }
+354         bytes_read += (int64_t)read_result;
+355         assert(bytes_read - bytes_written &lt;= (int64_t)block_size, &quot;invariant&quot;);
+356         bytes_written += (int64_t)os::write(emergency_fd, copy_block, bytes_read - bytes_written);
+357         assert(bytes_read == bytes_written, &quot;invariant&quot;);
+358       }
+359       os::close(current_fd);
+360     }
+361   }
+362 }
+363 
+364 static void write_emergency_dump_file(const RepositoryIterator&amp; iterator) {
+365   static const size_t block_size = 1 * M; // 1 mb
+366   char* const copy_block = (char*)os::malloc(block_size, mtTracing);
+367   if (copy_block == NULL) {
+368     log_error(jfr, system)(&quot;Unable to malloc memory during jfr emergency dump&quot;);
+369     log_error(jfr, system)(&quot;Unable to write jfr emergency dump file&quot;);
+370   }
+371   write_repository_files(iterator, copy_block, block_size);
+372   os::free(copy_block);
+373 }
+374 
+375 void JfrEmergencyDump::on_vm_error(const char* repository_path) {
+376   assert(repository_path != NULL, &quot;invariant&quot;);
+377   if (open_emergency_dump_file()) {
+378     RepositoryIterator iterator(repository_path);
+379     write_emergency_dump_file(iterator);
+380     close_emergency_dump_file();
+381   }
+382 }
+383 
+384 static const char* create_emergency_chunk_path(const char* repository_path) {
+385   const size_t repository_path_len = strlen(repository_path);
+386   char date_time_buffer[32] = { 0 };
+387   date_time(date_time_buffer, sizeof(date_time_buffer));
+388   // append the individual substrings
+389   const int result = jio_snprintf(_path_buffer,
+390                                   JVM_MAXPATHLEN,
+391                                   &quot;%s%s%s%s&quot;,
+392                                   repository_path,
+393                                   os::file_separator(),
+394                                   date_time_buffer,
+395                                   chunk_file_jfr_ext);
+396   return result == -1 ? NULL : _path_buffer;
+397 }
+398 
+399 const char* JfrEmergencyDump::chunk_path(const char* repository_path) {
+400   if (repository_path == NULL) {
+401     if (!open_emergency_dump_file()) {
+402       return NULL;
+403     }
+404     // We can directly use the emergency dump file name as the chunk.
+405     // The chunk writer will open its own fd so we close this descriptor.
+406     close_emergency_dump_file();
+407     assert(!is_path_empty(), &quot;invariant&quot;);
+408     return _path_buffer;
+409   }
+410   return create_emergency_chunk_path(repository_path);
+411 }
+412 
+413 /*
+414 * We are just about to exit the VM, so we will be very aggressive
+415 * at this point in order to increase overall success of dumping jfr data.
+416 *
+417 * If we end up deadlocking in the attempt of dumping out jfr data,
+418 * we rely on the WatcherThread task &quot;is_error_reported()&quot;,
+419 * to exit the VM after a hard-coded timeout (disallow WatcherThread to emergency dump).
+420 * This &quot;safety net&quot; somewhat explains the aggressiveness in this attempt.
+421 *
+422 */
+423 static bool prepare_for_emergency_dump(Thread* thread) {
+424   assert(thread != NULL, &quot;invariant&quot;);
+<a name="1" id="anc1"></a><span class="line-modified">425   DEBUG_ONLY(JfrJavaSupport::check_java_thread_in_vm(thread));</span>
+426   if (thread-&gt;is_Watcher_thread()) {
+427     // need WatcherThread as a safeguard against potential deadlocks
+428     return false;
+429   }
+<a name="2" id="anc2"></a>
+
+
+
+430 
+431 #ifdef ASSERT
+432   Mutex* owned_lock = thread-&gt;owned_locks();
+433   while (owned_lock != NULL) {
+434     Mutex* next = owned_lock-&gt;next();
+435     owned_lock-&gt;unlock();
+436     owned_lock = next;
+437   }
+438 #endif // ASSERT
+439 
+440   if (Threads_lock-&gt;owned_by_self()) {
+441     Threads_lock-&gt;unlock();
+442   }
+443 
+444   if (Module_lock-&gt;owned_by_self()) {
+445     Module_lock-&gt;unlock();
+446   }
+447 
+448   if (ClassLoaderDataGraph_lock-&gt;owned_by_self()) {
+449     ClassLoaderDataGraph_lock-&gt;unlock();
+450   }
+451 
+452   if (Heap_lock-&gt;owned_by_self()) {
+453     Heap_lock-&gt;unlock();
+454   }
+455 
+456   if (VMOperationQueue_lock-&gt;owned_by_self()) {
+457     VMOperationQueue_lock-&gt;unlock();
+458   }
+459 
+460   if (VMOperationRequest_lock-&gt;owned_by_self()) {
+461     VMOperationRequest_lock-&gt;unlock();
+462   }
+463 
+464   if (Service_lock-&gt;owned_by_self()) {
+465     Service_lock-&gt;unlock();
+466   }
+467 
+468   if (UseNotificationThread &amp;&amp; Notification_lock-&gt;owned_by_self()) {
+469     Notification_lock-&gt;unlock();
+470   }
+471 
+472   if (CodeCache_lock-&gt;owned_by_self()) {
+473     CodeCache_lock-&gt;unlock();
+474   }
+475 
+476   if (PeriodicTask_lock-&gt;owned_by_self()) {
+477     PeriodicTask_lock-&gt;unlock();
+478   }
+479 
+480   if (JfrMsg_lock-&gt;owned_by_self()) {
+481     JfrMsg_lock-&gt;unlock();
+482   }
+483 
+484   if (JfrBuffer_lock-&gt;owned_by_self()) {
+485     JfrBuffer_lock-&gt;unlock();
+486   }
+487 
+488   if (JfrStacktrace_lock-&gt;owned_by_self()) {
+489     JfrStacktrace_lock-&gt;unlock();
+490   }
+491   return true;
+492 }
+493 
+494 static volatile int jfr_shutdown_lock = 0;
+495 
+496 static bool guard_reentrancy() {
+497   return Atomic::cmpxchg(&amp;jfr_shutdown_lock, 0, 1) == 0;
+498 }
+499 
+<a name="3" id="anc3"></a><span class="line-modified">500 class JavaThreadInVMAndNative : public StackObj {</span>
+501  private:
+502   JavaThread* const _jt;
+503   JavaThreadState _original_state;
+504  public:
+505 
+<a name="4" id="anc4"></a><span class="line-modified">506   JavaThreadInVMAndNative(Thread* t) : _jt(t-&gt;is_Java_thread() ? (JavaThread*)t : NULL),</span>
+<span class="line-modified">507                                        _original_state(_thread_max_state) {</span>
+<span class="line-modified">508     if (_jt != NULL) {</span>
+509       _original_state = _jt-&gt;thread_state();
+<a name="5" id="anc5"></a><span class="line-modified">510       if (_original_state != _thread_in_vm) {</span>
+<span class="line-added">511         _jt-&gt;set_thread_state(_thread_in_vm);</span>
+<span class="line-added">512       }</span>
+513     }
+514   }
+515 
+<a name="6" id="anc6"></a><span class="line-modified">516   ~JavaThreadInVMAndNative() {</span>
+517     if (_original_state != _thread_max_state) {
+518       _jt-&gt;set_thread_state(_original_state);
+519     }
+520   }
+521 
+<a name="7" id="anc7"></a><span class="line-added">522   void transition_to_native() {</span>
+<span class="line-added">523     if (_jt != NULL) {</span>
+<span class="line-added">524       assert(_jt-&gt;thread_state() == _thread_in_vm, &quot;invariant&quot;);</span>
+<span class="line-added">525       _jt-&gt;set_thread_state(_thread_in_native);</span>
+<span class="line-added">526     }</span>
+<span class="line-added">527   }</span>
+528 };
+529 
+<a name="8" id="anc8"></a><span class="line-modified">530 static void post_events(bool exception_handler, Thread* thread) {</span>
+<span class="line-added">531   DEBUG_ONLY(JfrJavaSupport::check_java_thread_in_vm(thread));</span>
+532   if (exception_handler) {
+533     EventShutdown e;
+534     e.set_reason(&quot;VM Error&quot;);
+535     e.commit();
+536   } else {
+537     // OOM
+538     LeakProfiler::emit_events(max_jlong, false, false);
+539   }
+540   EventDumpReason event;
+541   event.set_reason(exception_handler ? &quot;Crash&quot; : &quot;Out of Memory&quot;);
+542   event.set_recordingId(-1);
+543   event.commit();
+544 }
+545 
+546 void JfrEmergencyDump::on_vm_shutdown(bool exception_handler) {
+547   if (!guard_reentrancy()) {
+548     return;
+549   }
+550   Thread* thread = Thread::current_or_null_safe();
+551   if (thread == NULL) {
+552     return;
+553   }
+554   // Ensure a JavaThread is _thread_in_vm when we make this call
+<a name="9" id="anc9"></a><span class="line-modified">555   JavaThreadInVMAndNative jtivm(thread);</span>
+556   if (!prepare_for_emergency_dump(thread)) {
+557     return;
+558   }
+<a name="10" id="anc10"></a><span class="line-modified">559   post_events(exception_handler, thread);</span>
+<span class="line-added">560   // if JavaThread, transition to _thread_in_native to issue a final flushpoint</span>
+<span class="line-added">561   NoHandleMark nhm;</span>
+<span class="line-added">562   jtivm.transition_to_native();</span>
+563   const int messages = MSGBIT(MSG_VM_ERROR);
+564   JfrRecorderService service;
+565   service.rotate(messages);
+566 }
+<a name="11" id="anc11"></a><b style="font-size: large; color: red">--- EOF ---</b>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+</pre>
+<input id="eof" value="11" type="hidden" />
+</body>
+</html>
