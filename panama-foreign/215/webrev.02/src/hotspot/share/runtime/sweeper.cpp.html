@@ -1,0 +1,685 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>New src/hotspot/share/runtime/sweeper.cpp</title>
+    <link rel="stylesheet" href="../../../../style.css" />
+  </head>
+  <body>
+    <pre>
+  1 /*
+  2  * Copyright (c) 1997, 2020, Oracle and/or its affiliates. All rights reserved.
+  3  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  4  *
+  5  * This code is free software; you can redistribute it and/or modify it
+  6  * under the terms of the GNU General Public License version 2 only, as
+  7  * published by the Free Software Foundation.
+  8  *
+  9  * This code is distributed in the hope that it will be useful, but WITHOUT
+ 10  * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ 11  * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ 12  * version 2 for more details (a copy is included in the LICENSE file that
+ 13  * accompanied this code).
+ 14  *
+ 15  * You should have received a copy of the GNU General Public License version
+ 16  * 2 along with this work; if not, write to the Free Software Foundation,
+ 17  * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ 18  *
+ 19  * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ 20  * or visit www.oracle.com if you need additional information or have any
+ 21  * questions.
+ 22  *
+ 23  */
+ 24 
+ 25 #include &quot;precompiled.hpp&quot;
+ 26 #include &quot;code/codeCache.hpp&quot;
+ 27 #include &quot;code/compiledIC.hpp&quot;
+ 28 #include &quot;code/icBuffer.hpp&quot;
+ 29 #include &quot;code/nmethod.hpp&quot;
+ 30 #include &quot;compiler/compileBroker.hpp&quot;
+ 31 #include &quot;gc/shared/collectedHeap.hpp&quot;
+ 32 #include &quot;gc/shared/workgroup.hpp&quot;
+ 33 #include &quot;jfr/jfrEvents.hpp&quot;
+ 34 #include &quot;logging/log.hpp&quot;
+ 35 #include &quot;logging/logStream.hpp&quot;
+ 36 #include &quot;memory/allocation.inline.hpp&quot;
+ 37 #include &quot;memory/resourceArea.hpp&quot;
+ 38 #include &quot;memory/universe.hpp&quot;
+ 39 #include &quot;oops/method.hpp&quot;
+ 40 #include &quot;runtime/interfaceSupport.inline.hpp&quot;
+ 41 #include &quot;runtime/handshake.hpp&quot;
+ 42 #include &quot;runtime/mutexLocker.hpp&quot;
+ 43 #include &quot;runtime/orderAccess.hpp&quot;
+ 44 #include &quot;runtime/os.hpp&quot;
+ 45 #include &quot;runtime/sweeper.hpp&quot;
+ 46 #include &quot;runtime/thread.inline.hpp&quot;
+ 47 #include &quot;runtime/vmOperations.hpp&quot;
+ 48 #include &quot;runtime/vmThread.hpp&quot;
+ 49 #include &quot;utilities/events.hpp&quot;
+ 50 #include &quot;utilities/xmlstream.hpp&quot;
+ 51 
+ 52 #ifdef ASSERT
+ 53 
+ 54 #define SWEEP(nm) record_sweep(nm, __LINE__)
+ 55 // Sweeper logging code
+ 56 class SweeperRecord {
+ 57  public:
+ 58   int traversal;
+ 59   int compile_id;
+ 60   long traversal_mark;
+ 61   int state;
+ 62   const char* kind;
+ 63   address vep;
+ 64   address uep;
+ 65   int line;
+ 66 
+ 67   void print() {
+ 68       tty-&gt;print_cr(&quot;traversal = %d compile_id = %d %s uep = &quot; PTR_FORMAT &quot; vep = &quot;
+ 69                     PTR_FORMAT &quot; state = %d traversal_mark %ld line = %d&quot;,
+ 70                     traversal,
+ 71                     compile_id,
+ 72                     kind == NULL ? &quot;&quot; : kind,
+ 73                     p2i(uep),
+ 74                     p2i(vep),
+ 75                     state,
+ 76                     traversal_mark,
+ 77                     line);
+ 78   }
+ 79 };
+ 80 
+ 81 static int _sweep_index = 0;
+ 82 static SweeperRecord* _records = NULL;
+ 83 
+ 84 void NMethodSweeper::record_sweep(CompiledMethod* nm, int line) {
+ 85   if (_records != NULL) {
+ 86     _records[_sweep_index].traversal = _traversals;
+ 87     _records[_sweep_index].traversal_mark = nm-&gt;is_nmethod() ? ((nmethod*)nm)-&gt;stack_traversal_mark() : 0;
+ 88     _records[_sweep_index].compile_id = nm-&gt;compile_id();
+ 89     _records[_sweep_index].kind = nm-&gt;compile_kind();
+ 90     _records[_sweep_index].state = nm-&gt;get_state();
+ 91     _records[_sweep_index].vep = nm-&gt;verified_entry_point();
+ 92     _records[_sweep_index].uep = nm-&gt;entry_point();
+ 93     _records[_sweep_index].line = line;
+ 94     _sweep_index = (_sweep_index + 1) % SweeperLogEntries;
+ 95   }
+ 96 }
+ 97 
+ 98 void NMethodSweeper::init_sweeper_log() {
+ 99  if (LogSweeper &amp;&amp; _records == NULL) {
+100    // Create the ring buffer for the logging code
+101    _records = NEW_C_HEAP_ARRAY(SweeperRecord, SweeperLogEntries, mtGC);
+102    memset(_records, 0, sizeof(SweeperRecord) * SweeperLogEntries);
+103   }
+104 }
+105 #else
+106 #define SWEEP(nm)
+107 #endif
+108 
+109 CompiledMethodIterator NMethodSweeper::_current(CompiledMethodIterator::all_blobs); // Current compiled method
+110 long     NMethodSweeper::_traversals                   = 0;    // Stack scan count, also sweep ID.
+111 long     NMethodSweeper::_total_nof_code_cache_sweeps  = 0;    // Total number of full sweeps of the code cache
+112 int      NMethodSweeper::_seen                         = 0;    // Nof. nmethod we have currently processed in current pass of CodeCache
+113 size_t   NMethodSweeper::_sweep_threshold_bytes        = 0;    // Threshold for when to sweep. Updated after ergonomics
+114 
+115 volatile bool NMethodSweeper::_should_sweep            = false;// Indicates if a normal sweep will be done
+116 volatile bool NMethodSweeper::_force_sweep             = false;// Indicates if a forced sweep will be done
+117 volatile size_t NMethodSweeper::_bytes_changed         = 0;    // Counts the total nmethod size if the nmethod changed from:
+118                                                                //   1) alive       -&gt; not_entrant
+119                                                                //   2) not_entrant -&gt; zombie
+120 int    NMethodSweeper::_hotness_counter_reset_val       = 0;
+121 
+122 long   NMethodSweeper::_total_nof_methods_reclaimed     = 0;   // Accumulated nof methods flushed
+123 long   NMethodSweeper::_total_nof_c2_methods_reclaimed  = 0;   // Accumulated nof methods flushed
+124 size_t NMethodSweeper::_total_flushed_size              = 0;   // Total number of bytes flushed from the code cache
+125 Tickspan NMethodSweeper::_total_time_sweeping;                 // Accumulated time sweeping
+126 Tickspan NMethodSweeper::_total_time_this_sweep;               // Total time this sweep
+127 Tickspan NMethodSweeper::_peak_sweep_time;                     // Peak time for a full sweep
+128 Tickspan NMethodSweeper::_peak_sweep_fraction_time;            // Peak time sweeping one fraction
+129 
+130 class MarkActivationClosure: public CodeBlobClosure {
+131 public:
+132   virtual void do_code_blob(CodeBlob* cb) {
+133     assert(cb-&gt;is_nmethod(), &quot;CodeBlob should be nmethod&quot;);
+134     nmethod* nm = (nmethod*)cb;
+135     nm-&gt;set_hotness_counter(NMethodSweeper::hotness_counter_reset_val());
+136     // If we see an activation belonging to a non_entrant nmethod, we mark it.
+137     if (nm-&gt;is_not_entrant()) {
+138       nm-&gt;mark_as_seen_on_stack();
+139     }
+140   }
+141 };
+142 static MarkActivationClosure mark_activation_closure;
+143 
+144 int NMethodSweeper::hotness_counter_reset_val() {
+145   if (_hotness_counter_reset_val == 0) {
+146     _hotness_counter_reset_val = (ReservedCodeCacheSize &lt; M) ? 1 : (ReservedCodeCacheSize / M) * 2;
+147   }
+148   return _hotness_counter_reset_val;
+149 }
+150 bool NMethodSweeper::wait_for_stack_scanning() {
+151   return _current.end();
+152 }
+153 
+154 class NMethodMarkingClosure : public HandshakeClosure {
+155 private:
+156   CodeBlobClosure* _cl;
+157 public:
+158   NMethodMarkingClosure(CodeBlobClosure* cl) : HandshakeClosure(&quot;NMethodMarking&quot;), _cl(cl) {}
+159   void do_thread(Thread* thread) {
+160     if (thread-&gt;is_Java_thread() &amp;&amp; ! thread-&gt;is_Code_cache_sweeper_thread()) {
+161       JavaThread* jt = (JavaThread*) thread;
+162       jt-&gt;nmethods_do(_cl);
+163     }
+164   }
+165 };
+166 
+167 CodeBlobClosure* NMethodSweeper::prepare_mark_active_nmethods() {
+168 #ifdef ASSERT
+169   assert(Thread::current()-&gt;is_Code_cache_sweeper_thread(), &quot;must be executed under CodeCache_lock and in sweeper thread&quot;);
+170   assert_lock_strong(CodeCache_lock);
+171 #endif
+172 
+173   // If we do not want to reclaim not-entrant or zombie methods there is no need
+174   // to scan stacks
+175   if (!MethodFlushing) {
+176     return NULL;
+177   }
+178 
+179   // Check for restart
+180   assert(_current.method() == NULL, &quot;should only happen between sweeper cycles&quot;);
+181   assert(wait_for_stack_scanning(), &quot;should only happen between sweeper cycles&quot;);
+182 
+183   _seen = 0;
+184   _current = CompiledMethodIterator(CompiledMethodIterator::all_blobs);
+185   // Initialize to first nmethod
+186   _current.next();
+187   _traversals += 1;
+188   _total_time_this_sweep = Tickspan();
+189 
+190   if (PrintMethodFlushing) {
+191     tty-&gt;print_cr(&quot;### Sweep: stack traversal %ld&quot;, _traversals);
+192   }
+193   return &amp;mark_activation_closure;
+194 }
+195 
+196 /**
+197   * This function triggers a VM operation that does stack scanning of active
+198   * methods. Stack scanning is mandatory for the sweeper to make progress.
+199   */
+200 void NMethodSweeper::do_stack_scanning() {
+201   assert(!CodeCache_lock-&gt;owned_by_self(), &quot;just checking&quot;);
+202   if (wait_for_stack_scanning()) {
+203     CodeBlobClosure* code_cl;
+204     {
+205       MutexLocker ccl(CodeCache_lock, Mutex::_no_safepoint_check_flag);
+206       code_cl = prepare_mark_active_nmethods();
+207     }
+208     if (code_cl != NULL) {
+209       NMethodMarkingClosure nm_cl(code_cl);
+210       Handshake::execute(&amp;nm_cl);
+211     }
+212   }
+213 }
+214 
+215 void NMethodSweeper::sweeper_loop() {
+216   bool timeout;
+217   while (true) {
+218     {
+219       ThreadBlockInVM tbivm(JavaThread::current());
+220       MonitorLocker waiter(CodeSweeper_lock, Mutex::_no_safepoint_check_flag);
+221       const long wait_time = 60*60*24 * 1000;
+222       timeout = waiter.wait(wait_time);
+223     }
+224     if (!timeout &amp;&amp; (_should_sweep || _force_sweep)) {
+225       sweep();
+226     }
+227   }
+228 }
+229 
+230 /**
+231   * Wakes up the sweeper thread to sweep if code cache space runs low
+232   */
+233 void NMethodSweeper::report_allocation(int code_blob_type) {
+234   if (should_start_aggressive_sweep(code_blob_type)) {
+235     MonitorLocker waiter(CodeSweeper_lock, Mutex::_no_safepoint_check_flag);
+236     _should_sweep = true;
+237     CodeSweeper_lock-&gt;notify();
+238   }
+239 }
+240 
+241 bool NMethodSweeper::should_start_aggressive_sweep(int code_blob_type) {
+242   // Makes sure that we do not invoke the sweeper too often during startup.
+243   double start_threshold = 100.0 / (double)StartAggressiveSweepingAt;
+244   double aggressive_sweep_threshold = MAX2(start_threshold, 1.1);
+245   return (CodeCache::reverse_free_ratio(code_blob_type) &gt;= aggressive_sweep_threshold);
+246 }
+247 
+248 /**
+249   * Wakes up the sweeper thread and forces a sweep. Blocks until it finished.
+250   */
+251 void NMethodSweeper::force_sweep() {
+252   ThreadBlockInVM tbivm(JavaThread::current());
+253   MonitorLocker waiter(CodeSweeper_lock, Mutex::_no_safepoint_check_flag);
+254   // Request forced sweep
+255   _force_sweep = true;
+256   while (_force_sweep) {
+257     // Notify sweeper that we want to force a sweep and wait for completion.
+258     // In case a sweep currently takes place we timeout and try again because
+259     // we want to enforce a full sweep.
+260     CodeSweeper_lock-&gt;notify();
+261     waiter.wait(1000);
+262   }
+263 }
+264 
+265 /**
+266  * Handle a safepoint request
+267  */
+268 void NMethodSweeper::handle_safepoint_request() {
+269   JavaThread* thread = JavaThread::current();
+270   if (SafepointMechanism::should_block(thread)) {
+271     if (PrintMethodFlushing &amp;&amp; Verbose) {
+272       tty-&gt;print_cr(&quot;### Sweep at %d out of %d, yielding to safepoint&quot;, _seen, CodeCache::nmethod_count());
+273     }
+274     MutexUnlocker mu(CodeCache_lock, Mutex::_no_safepoint_check_flag);
+275 
+276     ThreadBlockInVM tbivm(thread);
+277     thread-&gt;java_suspend_self();
+278   }
+279 }
+280 
+281 void NMethodSweeper::sweep() {
+282   assert(_should_sweep || _force_sweep, &quot;must have been set&quot;);
+283   assert(JavaThread::current()-&gt;thread_state() == _thread_in_vm, &quot;must run in vm mode&quot;);
+284   Atomic::store(&amp;_bytes_changed, static_cast&lt;size_t&gt;(0)); // reset regardless of sleep reason
+285   if (_should_sweep) {
+286     MutexLocker mu(CodeSweeper_lock, Mutex::_no_safepoint_check_flag);
+287     _should_sweep = false;
+288   }
+289 
+290   do_stack_scanning();
+291 
+292   init_sweeper_log();
+293   sweep_code_cache();
+294 
+295   // We are done with sweeping the code cache once.
+296   _total_nof_code_cache_sweeps++;
+297 
+298   if (_force_sweep) {
+299     // Notify requester that forced sweep finished
+300     MutexLocker mu(CodeSweeper_lock, Mutex::_no_safepoint_check_flag);
+301     _force_sweep = false;
+302     CodeSweeper_lock-&gt;notify();
+303   }
+304 }
+305 
+306 static void post_sweep_event(EventSweepCodeCache* event,
+307                              const Ticks&amp; start,
+308                              const Ticks&amp; end,
+309                              s4 traversals,
+310                              int swept,
+311                              int flushed,
+312                              int zombified) {
+313   assert(event != NULL, &quot;invariant&quot;);
+314   assert(event-&gt;should_commit(), &quot;invariant&quot;);
+315   event-&gt;set_starttime(start);
+316   event-&gt;set_endtime(end);
+317   event-&gt;set_sweepId(traversals);
+318   event-&gt;set_sweptCount(swept);
+319   event-&gt;set_flushedCount(flushed);
+320   event-&gt;set_zombifiedCount(zombified);
+321   event-&gt;commit();
+322 }
+323 
+324 void NMethodSweeper::sweep_code_cache() {
+325   ResourceMark rm;
+326   Ticks sweep_start_counter = Ticks::now();
+327 
+328   log_debug(codecache, sweep, start)(&quot;CodeCache flushing&quot;);
+329 
+330   int flushed_count                = 0;
+331   int zombified_count              = 0;
+332   int flushed_c2_count     = 0;
+333 
+334   if (PrintMethodFlushing &amp;&amp; Verbose) {
+335     tty-&gt;print_cr(&quot;### Sweep at %d out of %d&quot;, _seen, CodeCache::nmethod_count());
+336   }
+337 
+338   int swept_count = 0;
+339   assert(!SafepointSynchronize::is_at_safepoint(), &quot;should not be in safepoint when we get here&quot;);
+340   assert(!CodeCache_lock-&gt;owned_by_self(), &quot;just checking&quot;);
+341 
+342   int freed_memory = 0;
+343   {
+344     MutexLocker mu(CodeCache_lock, Mutex::_no_safepoint_check_flag);
+345 
+346     while (!_current.end()) {
+347       swept_count++;
+348       // Since we will give up the CodeCache_lock, always skip ahead
+349       // to the next nmethod.  Other blobs can be deleted by other
+350       // threads but nmethods are only reclaimed by the sweeper.
+351       CompiledMethod* nm = _current.method();
+352       _current.next();
+353 
+354       // Now ready to process nmethod and give up CodeCache_lock
+355       {
+356         MutexUnlocker mu(CodeCache_lock, Mutex::_no_safepoint_check_flag);
+357         // Save information before potentially flushing the nmethod
+358         // Only flushing nmethods so size only matters for them.
+359         int size = nm-&gt;is_nmethod() ? ((nmethod*)nm)-&gt;total_size() : 0;
+360         bool is_c2_method = nm-&gt;is_compiled_by_c2();
+361         bool is_osr = nm-&gt;is_osr_method();
+362         int compile_id = nm-&gt;compile_id();
+363         intptr_t address = p2i(nm);
+364         const char* state_before = nm-&gt;state();
+365         const char* state_after = &quot;&quot;;
+366 
+367         MethodStateChange type = process_compiled_method(nm);
+368         switch (type) {
+369           case Flushed:
+370             state_after = &quot;flushed&quot;;
+371             freed_memory += size;
+372             ++flushed_count;
+373             if (is_c2_method) {
+374               ++flushed_c2_count;
+375             }
+376             break;
+377           case MadeZombie:
+378             state_after = &quot;made zombie&quot;;
+379             ++zombified_count;
+380             break;
+381           case None:
+382             break;
+383           default:
+384            ShouldNotReachHere();
+385         }
+386         if (PrintMethodFlushing &amp;&amp; Verbose &amp;&amp; type != None) {
+387           tty-&gt;print_cr(&quot;### %s nmethod %3d/&quot; PTR_FORMAT &quot; (%s) %s&quot;, is_osr ? &quot;osr&quot; : &quot;&quot;, compile_id, address, state_before, state_after);
+388         }
+389       }
+390 
+391       _seen++;
+392       handle_safepoint_request();
+393     }
+394   }
+395 
+396   assert(_current.end(), &quot;must have scanned the whole cache&quot;);
+397 
+398   const Ticks sweep_end_counter = Ticks::now();
+399   const Tickspan sweep_time = sweep_end_counter - sweep_start_counter;
+400   {
+401     MutexLocker mu(NMethodSweeperStats_lock, Mutex::_no_safepoint_check_flag);
+402     _total_time_sweeping  += sweep_time;
+403     _total_time_this_sweep += sweep_time;
+404     _peak_sweep_fraction_time = MAX2(sweep_time, _peak_sweep_fraction_time);
+405     _total_flushed_size += freed_memory;
+406     _total_nof_methods_reclaimed += flushed_count;
+407     _total_nof_c2_methods_reclaimed += flushed_c2_count;
+408     _peak_sweep_time = MAX2(_peak_sweep_time, _total_time_this_sweep);
+409   }
+410 
+411   EventSweepCodeCache event(UNTIMED);
+412   if (event.should_commit()) {
+413     post_sweep_event(&amp;event, sweep_start_counter, sweep_end_counter, (s4)_traversals, swept_count, flushed_count, zombified_count);
+414   }
+415 
+416 #ifdef ASSERT
+417   if(PrintMethodFlushing) {
+418     tty-&gt;print_cr(&quot;### sweeper:      sweep time(&quot; JLONG_FORMAT &quot;): &quot;, sweep_time.value());
+419   }
+420 #endif
+421 
+422   Log(codecache, sweep) log;
+423   if (log.is_debug()) {
+424     LogStream ls(log.debug());
+425     CodeCache::print_summary(&amp;ls, false);
+426   }
+427   log_sweep(&quot;finished&quot;);
+428 
+429   // Sweeper is the only case where memory is released, check here if it
+430   // is time to restart the compiler. Only checking if there is a certain
+431   // amount of free memory in the code cache might lead to re-enabling
+432   // compilation although no memory has been released. For example, there are
+433   // cases when compilation was disabled although there is 4MB (or more) free
+434   // memory in the code cache. The reason is code cache fragmentation. Therefore,
+435   // it only makes sense to re-enable compilation if we have actually freed memory.
+436   // Note that typically several kB are released for sweeping 16MB of the code
+437   // cache. As a result, &#39;freed_memory&#39; &gt; 0 to restart the compiler.
+438   if (!CompileBroker::should_compile_new_jobs() &amp;&amp; (freed_memory &gt; 0)) {
+439     CompileBroker::set_should_compile_new_jobs(CompileBroker::run_compilation);
+440     log.debug(&quot;restart compiler&quot;);
+441     log_sweep(&quot;restart_compiler&quot;);
+442   }
+443 }
+444 
+445  // This function updates the sweeper statistics that keep track of nmethods
+446  // state changes. If there is &#39;enough&#39; state change, the sweeper is invoked
+447  // as soon as possible. Also, we are guaranteed to invoke the sweeper if
+448  // the code cache gets full.
+449 void NMethodSweeper::report_state_change(nmethod* nm) {
+450   Atomic::add(&amp;_bytes_changed, (size_t)nm-&gt;total_size());
+451   if (Atomic::load(&amp;_bytes_changed) &gt; _sweep_threshold_bytes) {
+452     MutexLocker mu(CodeSweeper_lock, Mutex::_no_safepoint_check_flag);
+453     _should_sweep = true;
+454     CodeSweeper_lock-&gt;notify(); // Wake up sweeper.
+455   }
+456 }
+457 
+458 class CompiledMethodMarker: public StackObj {
+459  private:
+460   CodeCacheSweeperThread* _thread;
+461  public:
+462   CompiledMethodMarker(CompiledMethod* cm) {
+463     JavaThread* current = JavaThread::current();
+464     assert (current-&gt;is_Code_cache_sweeper_thread(), &quot;Must be&quot;);
+465     _thread = (CodeCacheSweeperThread*)current;
+466     if (!cm-&gt;is_zombie() &amp;&amp; !cm-&gt;is_unloading()) {
+467       // Only expose live nmethods for scanning
+468       _thread-&gt;set_scanned_compiled_method(cm);
+469     }
+470   }
+471   ~CompiledMethodMarker() {
+472     _thread-&gt;set_scanned_compiled_method(NULL);
+473   }
+474 };
+475 
+476 NMethodSweeper::MethodStateChange NMethodSweeper::process_compiled_method(CompiledMethod* cm) {
+477   assert(cm != NULL, &quot;sanity&quot;);
+478   assert(!CodeCache_lock-&gt;owned_by_self(), &quot;just checking&quot;);
+479 
+480   MethodStateChange result = None;
+481   // Make sure this nmethod doesn&#39;t get unloaded during the scan,
+482   // since safepoints may happen during acquired below locks.
+483   CompiledMethodMarker nmm(cm);
+484   SWEEP(cm);
+485 
+486   // Skip methods that are currently referenced by the VM
+487   if (cm-&gt;is_locked_by_vm()) {
+488     // But still remember to clean-up inline caches for alive nmethods
+489     if (cm-&gt;is_alive()) {
+490       // Clean inline caches that point to zombie/non-entrant/unloaded nmethods
+491       cm-&gt;cleanup_inline_caches(false);
+492       SWEEP(cm);
+493     }
+494     return result;
+495   }
+496 
+497   if (cm-&gt;is_zombie()) {
+498     // All inline caches that referred to this nmethod were cleaned in the
+499     // previous sweeper cycle. Now flush the nmethod from the code cache.
+500     assert(!cm-&gt;is_locked_by_vm(), &quot;must not flush locked Compiled Methods&quot;);
+501     cm-&gt;flush();
+502     assert(result == None, &quot;sanity&quot;);
+503     result = Flushed;
+504   } else if (cm-&gt;is_not_entrant()) {
+505     // If there are no current activations of this method on the
+506     // stack we can safely convert it to a zombie method
+507     OrderAccess::loadload(); // _stack_traversal_mark and _state
+508     if (cm-&gt;can_convert_to_zombie()) {
+509       // Code cache state change is tracked in make_zombie()
+510       cm-&gt;make_zombie();
+511       SWEEP(cm);
+512       assert(result == None, &quot;sanity&quot;);
+513       result = MadeZombie;
+514       assert(cm-&gt;is_zombie(), &quot;nmethod must be zombie&quot;);
+515     } else {
+516       // Still alive, clean up its inline caches
+517       cm-&gt;cleanup_inline_caches(false);
+518       SWEEP(cm);
+519     }
+520   } else if (cm-&gt;is_unloaded()) {
+521     // Code is unloaded, so there are no activations on the stack.
+522     // Convert the nmethod to zombie.
+523     // Code cache state change is tracked in make_zombie()
+524     cm-&gt;make_zombie();
+525     SWEEP(cm);
+526     assert(result == None, &quot;sanity&quot;);
+527     result = MadeZombie;
+528   } else {
+529     if (cm-&gt;is_nmethod()) {
+530       possibly_flush((nmethod*)cm);
+531     }
+532     // Clean inline caches that point to zombie/non-entrant/unloaded nmethods
+533     cm-&gt;cleanup_inline_caches(false);
+534     SWEEP(cm);
+535   }
+536   return result;
+537 }
+538 
+539 
+540 void NMethodSweeper::possibly_flush(nmethod* nm) {
+541   if (UseCodeCacheFlushing) {
+542     if (!nm-&gt;is_locked_by_vm() &amp;&amp; !nm-&gt;is_native_method() &amp;&amp; !nm-&gt;is_not_installed() &amp;&amp; !nm-&gt;is_unloading()) {
+543       bool make_not_entrant = false;
+544 
+545       // Do not make native methods not-entrant
+546       nm-&gt;dec_hotness_counter();
+547       // Get the initial value of the hotness counter. This value depends on the
+548       // ReservedCodeCacheSize
+549       int reset_val = hotness_counter_reset_val();
+550       int time_since_reset = reset_val - nm-&gt;hotness_counter();
+551       int code_blob_type = CodeCache::get_code_blob_type(nm);
+552       double threshold = -reset_val + (CodeCache::reverse_free_ratio(code_blob_type) * NmethodSweepActivity);
+553       // The less free space in the code cache we have - the bigger reverse_free_ratio() is.
+554       // I.e., &#39;threshold&#39; increases with lower available space in the code cache and a higher
+555       // NmethodSweepActivity. If the current hotness counter - which decreases from its initial
+556       // value until it is reset by stack walking - is smaller than the computed threshold, the
+557       // corresponding nmethod is considered for removal.
+558       if ((NmethodSweepActivity &gt; 0) &amp;&amp; (nm-&gt;hotness_counter() &lt; threshold) &amp;&amp; (time_since_reset &gt; MinPassesBeforeFlush)) {
+559         // A method is marked as not-entrant if the method is
+560         // 1) &#39;old enough&#39;: nm-&gt;hotness_counter() &lt; threshold
+561         // 2) The method was in_use for a minimum amount of time: (time_since_reset &gt; MinPassesBeforeFlush)
+562         //    The second condition is necessary if we are dealing with very small code cache
+563         //    sizes (e.g., &lt;10m) and the code cache size is too small to hold all hot methods.
+564         //    The second condition ensures that methods are not immediately made not-entrant
+565         //    after compilation.
+566         make_not_entrant = true;
+567       }
+568 
+569       // The stack-scanning low-cost detection may not see the method was used (which can happen for
+570       // flat profiles). Check the age counter for possible data.
+571       if (UseCodeAging &amp;&amp; make_not_entrant &amp;&amp; (nm-&gt;is_compiled_by_c2() || nm-&gt;is_compiled_by_c1())) {
+572         MethodCounters* mc = nm-&gt;method()-&gt;get_method_counters(Thread::current());
+573         if (mc != NULL) {
+574           // Snapshot the value as it&#39;s changed concurrently
+575           int age = mc-&gt;nmethod_age();
+576           if (MethodCounters::is_nmethod_hot(age)) {
+577             // The method has gone through flushing, and it became relatively hot that it deopted
+578             // before we could take a look at it. Give it more time to appear in the stack traces,
+579             // proportional to the number of deopts.
+580             MethodData* md = nm-&gt;method()-&gt;method_data();
+581             if (md != NULL &amp;&amp; time_since_reset &gt; (int)(MinPassesBeforeFlush * (md-&gt;tenure_traps() + 1))) {
+582               // It&#39;s been long enough, we still haven&#39;t seen it on stack.
+583               // Try to flush it, but enable counters the next time.
+584               mc-&gt;reset_nmethod_age();
+585             } else {
+586               make_not_entrant = false;
+587             }
+588           } else if (MethodCounters::is_nmethod_warm(age)) {
+589             // Method has counters enabled, and the method was used within
+590             // previous MinPassesBeforeFlush sweeps. Reset the counter. Stay in the existing
+591             // compiled state.
+592             mc-&gt;reset_nmethod_age();
+593             // delay the next check
+594             nm-&gt;set_hotness_counter(NMethodSweeper::hotness_counter_reset_val());
+595             make_not_entrant = false;
+596           } else if (MethodCounters::is_nmethod_age_unset(age)) {
+597             // No counters were used before. Set the counters to the detection
+598             // limit value. If the method is going to be used again it will be compiled
+599             // with counters that we&#39;re going to use for analysis the the next time.
+600             mc-&gt;reset_nmethod_age();
+601           } else {
+602             // Method was totally idle for 10 sweeps
+603             // The counter already has the initial value, flush it and may be recompile
+604             // later with counters
+605           }
+606         }
+607       }
+608 
+609       if (make_not_entrant) {
+610         nm-&gt;make_not_entrant();
+611 
+612         // Code cache state change is tracked in make_not_entrant()
+613         if (PrintMethodFlushing &amp;&amp; Verbose) {
+614           tty-&gt;print_cr(&quot;### Nmethod %d/&quot; PTR_FORMAT &quot;made not-entrant: hotness counter %d/%d threshold %f&quot;,
+615               nm-&gt;compile_id(), p2i(nm), nm-&gt;hotness_counter(), reset_val, threshold);
+616         }
+617       }
+618     }
+619   }
+620 }
+621 
+622 // Print out some state information about the current sweep and the
+623 // state of the code cache if it&#39;s requested.
+624 void NMethodSweeper::log_sweep(const char* msg, const char* format, ...) {
+625   if (PrintMethodFlushing) {
+626     ResourceMark rm;
+627     stringStream s;
+628     // Dump code cache state into a buffer before locking the tty,
+629     // because log_state() will use locks causing lock conflicts.
+630     CodeCache::log_state(&amp;s);
+631 
+632     ttyLocker ttyl;
+633     tty-&gt;print(&quot;### sweeper: %s &quot;, msg);
+634     if (format != NULL) {
+635       va_list ap;
+636       va_start(ap, format);
+637       tty-&gt;vprint(format, ap);
+638       va_end(ap);
+639     }
+640     tty-&gt;print_cr(&quot;%s&quot;, s.as_string());
+641   }
+642 
+643   if (LogCompilation &amp;&amp; (xtty != NULL)) {
+644     ResourceMark rm;
+645     stringStream s;
+646     // Dump code cache state into a buffer before locking the tty,
+647     // because log_state() will use locks causing lock conflicts.
+648     CodeCache::log_state(&amp;s);
+649 
+650     ttyLocker ttyl;
+651     xtty-&gt;begin_elem(&quot;sweeper state=&#39;%s&#39; traversals=&#39;&quot; INTX_FORMAT &quot;&#39; &quot;, msg, (intx)traversal_count());
+652     if (format != NULL) {
+653       va_list ap;
+654       va_start(ap, format);
+655       xtty-&gt;vprint(format, ap);
+656       va_end(ap);
+657     }
+658     xtty-&gt;print(&quot;%s&quot;, s.as_string());
+659     xtty-&gt;stamp();
+660     xtty-&gt;end_elem();
+661   }
+662 }
+663 
+664 void NMethodSweeper::print(outputStream* out) {
+665   ttyLocker ttyl;
+666   out = (out == NULL) ? tty : out;
+667   out-&gt;print_cr(&quot;Code cache sweeper statistics:&quot;);
+668   out-&gt;print_cr(&quot;  Total sweep time:                %1.0lf ms&quot;, (double)_total_time_sweeping.value()/1000000);
+669   out-&gt;print_cr(&quot;  Total number of full sweeps:     %ld&quot;, _total_nof_code_cache_sweeps);
+670   out-&gt;print_cr(&quot;  Total number of flushed methods: %ld (thereof %ld C2 methods)&quot;, _total_nof_methods_reclaimed,
+671                                                     _total_nof_c2_methods_reclaimed);
+672   out-&gt;print_cr(&quot;  Total size of flushed methods:   &quot; SIZE_FORMAT &quot; kB&quot;, _total_flushed_size/K);
+673 }
+    </pre>
+  </body>
+</html>
