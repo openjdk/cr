@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2019, 2020, Oracle and/or its affiliates. All rights reserved.
+ *  Copyright (c) 2019, Oracle and/or its affiliates. All rights reserved.
  *  DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  *  This code is free software; you can redistribute it and/or modify it
@@ -135,4 +135,5 @@ public final class MemoryLayouts {
      * A value layout constant whose size is the same as that of a Java {@code double}, and byte order set to {@link ByteOrder#nativeOrder()}.
      */
     public static final ValueLayout JAVA_DOUBLE = MemoryLayout.ofValueBits(64, ByteOrder.nativeOrder());
+
 }
