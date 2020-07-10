@@ -1,0 +1,968 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Frames src/hotspot/share/gc/g1/c2/g1BarrierSetC2.cpp</title>
+    <link rel="stylesheet" href="../../../../../../style.css" />
+    <script type="text/javascript" src="../../../../../../navigation.js"></script>
+  </head>
+<body onkeypress="keypress(event);">
+<a name="0"></a>
+<hr />
+<pre>  1 /*
+  2  * Copyright (c) 2018, 2020, Oracle and/or its affiliates. All rights reserved.
+  3  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  4  *
+  5  * This code is free software; you can redistribute it and/or modify it
+  6  * under the terms of the GNU General Public License version 2 only, as
+  7  * published by the Free Software Foundation.
+  8  *
+  9  * This code is distributed in the hope that it will be useful, but WITHOUT
+ 10  * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ 11  * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ 12  * version 2 for more details (a copy is included in the LICENSE file that
+ 13  * accompanied this code).
+ 14  *
+ 15  * You should have received a copy of the GNU General Public License version
+ 16  * 2 along with this work; if not, write to the Free Software Foundation,
+ 17  * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ 18  *
+ 19  * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ 20  * or visit www.oracle.com if you need additional information or have any
+ 21  * questions.
+ 22  *
+ 23  */
+ 24 
+ 25 #include &quot;precompiled.hpp&quot;
+<a name="1" id="anc1"></a><span class="line-added"> 26 #include &quot;classfile/javaClasses.hpp&quot;</span>
+ 27 #include &quot;gc/g1/c2/g1BarrierSetC2.hpp&quot;
+ 28 #include &quot;gc/g1/g1BarrierSet.hpp&quot;
+ 29 #include &quot;gc/g1/g1BarrierSetRuntime.hpp&quot;
+ 30 #include &quot;gc/g1/g1CardTable.hpp&quot;
+ 31 #include &quot;gc/g1/g1ThreadLocalData.hpp&quot;
+ 32 #include &quot;gc/g1/heapRegion.hpp&quot;
+ 33 #include &quot;opto/arraycopynode.hpp&quot;
+ 34 #include &quot;opto/compile.hpp&quot;
+ 35 #include &quot;opto/escape.hpp&quot;
+ 36 #include &quot;opto/graphKit.hpp&quot;
+ 37 #include &quot;opto/idealKit.hpp&quot;
+ 38 #include &quot;opto/macro.hpp&quot;
+ 39 #include &quot;opto/rootnode.hpp&quot;
+ 40 #include &quot;opto/type.hpp&quot;
+ 41 #include &quot;utilities/macros.hpp&quot;
+ 42 
+ 43 const TypeFunc *G1BarrierSetC2::write_ref_field_pre_entry_Type() {
+ 44   const Type **fields = TypeTuple::fields(2);
+ 45   fields[TypeFunc::Parms+0] = TypeInstPtr::NOTNULL; // original field value
+ 46   fields[TypeFunc::Parms+1] = TypeRawPtr::NOTNULL; // thread
+ 47   const TypeTuple *domain = TypeTuple::make(TypeFunc::Parms+2, fields);
+ 48 
+ 49   // create result type (range)
+ 50   fields = TypeTuple::fields(0);
+ 51   const TypeTuple *range = TypeTuple::make(TypeFunc::Parms+0, fields);
+ 52 
+ 53   return TypeFunc::make(domain, range);
+ 54 }
+ 55 
+ 56 const TypeFunc *G1BarrierSetC2::write_ref_field_post_entry_Type() {
+ 57   const Type **fields = TypeTuple::fields(2);
+ 58   fields[TypeFunc::Parms+0] = TypeRawPtr::NOTNULL;  // Card addr
+ 59   fields[TypeFunc::Parms+1] = TypeRawPtr::NOTNULL;  // thread
+ 60   const TypeTuple *domain = TypeTuple::make(TypeFunc::Parms+2, fields);
+ 61 
+ 62   // create result type (range)
+ 63   fields = TypeTuple::fields(0);
+ 64   const TypeTuple *range = TypeTuple::make(TypeFunc::Parms, fields);
+ 65 
+ 66   return TypeFunc::make(domain, range);
+ 67 }
+ 68 
+ 69 #define __ ideal.
+ 70 /*
+ 71  * Determine if the G1 pre-barrier can be removed. The pre-barrier is
+ 72  * required by SATB to make sure all objects live at the start of the
+ 73  * marking are kept alive, all reference updates need to any previous
+ 74  * reference stored before writing.
+ 75  *
+ 76  * If the previous value is NULL there is no need to save the old value.
+ 77  * References that are NULL are filtered during runtime by the barrier
+ 78  * code to avoid unnecessary queuing.
+ 79  *
+ 80  * However in the case of newly allocated objects it might be possible to
+ 81  * prove that the reference about to be overwritten is NULL during compile
+ 82  * time and avoid adding the barrier code completely.
+ 83  *
+ 84  * The compiler needs to determine that the object in which a field is about
+ 85  * to be written is newly allocated, and that no prior store to the same field
+ 86  * has happened since the allocation.
+ 87  *
+ 88  * Returns true if the pre-barrier can be removed
+ 89  */
+ 90 bool G1BarrierSetC2::g1_can_remove_pre_barrier(GraphKit* kit,
+ 91                                                PhaseTransform* phase,
+ 92                                                Node* adr,
+ 93                                                BasicType bt,
+ 94                                                uint adr_idx) const {
+ 95   intptr_t offset = 0;
+ 96   Node* base = AddPNode::Ideal_base_and_offset(adr, phase, offset);
+ 97   AllocateNode* alloc = AllocateNode::Ideal_allocation(base, phase);
+ 98 
+ 99   if (offset == Type::OffsetBot) {
+100     return false; // cannot unalias unless there are precise offsets
+101   }
+102 
+103   if (alloc == NULL) {
+104     return false; // No allocation found
+105   }
+106 
+107   intptr_t size_in_bytes = type2aelembytes(bt);
+108 
+109   Node* mem = kit-&gt;memory(adr_idx); // start searching here...
+110 
+111   for (int cnt = 0; cnt &lt; 50; cnt++) {
+112 
+113     if (mem-&gt;is_Store()) {
+114 
+115       Node* st_adr = mem-&gt;in(MemNode::Address);
+116       intptr_t st_offset = 0;
+117       Node* st_base = AddPNode::Ideal_base_and_offset(st_adr, phase, st_offset);
+118 
+119       if (st_base == NULL) {
+120         break; // inscrutable pointer
+121       }
+122 
+123       // Break we have found a store with same base and offset as ours so break
+124       if (st_base == base &amp;&amp; st_offset == offset) {
+125         break;
+126       }
+127 
+128       if (st_offset != offset &amp;&amp; st_offset != Type::OffsetBot) {
+129         const int MAX_STORE = BytesPerLong;
+130         if (st_offset &gt;= offset + size_in_bytes ||
+131             st_offset &lt;= offset - MAX_STORE ||
+132             st_offset &lt;= offset - mem-&gt;as_Store()-&gt;memory_size()) {
+133           // Success:  The offsets are provably independent.
+134           // (You may ask, why not just test st_offset != offset and be done?
+135           // The answer is that stores of different sizes can co-exist
+136           // in the same sequence of RawMem effects.  We sometimes initialize
+137           // a whole &#39;tile&#39; of array elements with a single jint or jlong.)
+138           mem = mem-&gt;in(MemNode::Memory);
+139           continue; // advance through independent store memory
+140         }
+141       }
+142 
+143       if (st_base != base
+144           &amp;&amp; MemNode::detect_ptr_independence(base, alloc, st_base,
+145                                               AllocateNode::Ideal_allocation(st_base, phase),
+146                                               phase)) {
+147         // Success:  The bases are provably independent.
+148         mem = mem-&gt;in(MemNode::Memory);
+149         continue; // advance through independent store memory
+150       }
+151     } else if (mem-&gt;is_Proj() &amp;&amp; mem-&gt;in(0)-&gt;is_Initialize()) {
+152 
+153       InitializeNode* st_init = mem-&gt;in(0)-&gt;as_Initialize();
+154       AllocateNode* st_alloc = st_init-&gt;allocation();
+155 
+156       // Make sure that we are looking at the same allocation site.
+157       // The alloc variable is guaranteed to not be null here from earlier check.
+158       if (alloc == st_alloc) {
+159         // Check that the initialization is storing NULL so that no previous store
+160         // has been moved up and directly write a reference
+161         Node* captured_store = st_init-&gt;find_captured_store(offset,
+162                                                             type2aelembytes(T_OBJECT),
+163                                                             phase);
+164         if (captured_store == NULL || captured_store == st_init-&gt;zero_memory()) {
+165           return true;
+166         }
+167       }
+168     }
+169 
+170     // Unless there is an explicit &#39;continue&#39;, we must bail out here,
+171     // because &#39;mem&#39; is an inscrutable memory state (e.g., a call).
+172     break;
+173   }
+174 
+175   return false;
+176 }
+177 
+178 // G1 pre/post barriers
+179 void G1BarrierSetC2::pre_barrier(GraphKit* kit,
+180                                  bool do_load,
+181                                  Node* ctl,
+182                                  Node* obj,
+183                                  Node* adr,
+184                                  uint alias_idx,
+185                                  Node* val,
+186                                  const TypeOopPtr* val_type,
+187                                  Node* pre_val,
+188                                  BasicType bt) const {
+189   // Some sanity checks
+190   // Note: val is unused in this routine.
+191 
+192   if (do_load) {
+193     // We need to generate the load of the previous value
+194     assert(obj != NULL, &quot;must have a base&quot;);
+195     assert(adr != NULL, &quot;where are loading from?&quot;);
+196     assert(pre_val == NULL, &quot;loaded already?&quot;);
+197     assert(val_type != NULL, &quot;need a type&quot;);
+198 
+199     if (use_ReduceInitialCardMarks()
+200         &amp;&amp; g1_can_remove_pre_barrier(kit, &amp;kit-&gt;gvn(), adr, bt, alias_idx)) {
+201       return;
+202     }
+203 
+204   } else {
+205     // In this case both val_type and alias_idx are unused.
+206     assert(pre_val != NULL, &quot;must be loaded already&quot;);
+207     // Nothing to be done if pre_val is null.
+208     if (pre_val-&gt;bottom_type() == TypePtr::NULL_PTR) return;
+209     assert(pre_val-&gt;bottom_type()-&gt;basic_type() == T_OBJECT, &quot;or we shouldn&#39;t be here&quot;);
+210   }
+211   assert(bt == T_OBJECT, &quot;or we shouldn&#39;t be here&quot;);
+212 
+213   IdealKit ideal(kit, true);
+214 
+215   Node* tls = __ thread(); // ThreadLocalStorage
+216 
+217   Node* no_base = __ top();
+218   Node* zero  = __ ConI(0);
+219   Node* zeroX = __ ConX(0);
+220 
+221   float likely  = PROB_LIKELY(0.999);
+222   float unlikely  = PROB_UNLIKELY(0.999);
+223 
+224   BasicType active_type = in_bytes(SATBMarkQueue::byte_width_of_active()) == 4 ? T_INT : T_BYTE;
+225   assert(in_bytes(SATBMarkQueue::byte_width_of_active()) == 4 || in_bytes(SATBMarkQueue::byte_width_of_active()) == 1, &quot;flag width&quot;);
+226 
+227   // Offsets into the thread
+228   const int marking_offset = in_bytes(G1ThreadLocalData::satb_mark_queue_active_offset());
+229   const int index_offset   = in_bytes(G1ThreadLocalData::satb_mark_queue_index_offset());
+230   const int buffer_offset  = in_bytes(G1ThreadLocalData::satb_mark_queue_buffer_offset());
+231 
+232   // Now the actual pointers into the thread
+233   Node* marking_adr = __ AddP(no_base, tls, __ ConX(marking_offset));
+234   Node* buffer_adr  = __ AddP(no_base, tls, __ ConX(buffer_offset));
+235   Node* index_adr   = __ AddP(no_base, tls, __ ConX(index_offset));
+236 
+237   // Now some of the values
+238   Node* marking = __ load(__ ctrl(), marking_adr, TypeInt::INT, active_type, Compile::AliasIdxRaw);
+239 
+240   // if (!marking)
+241   __ if_then(marking, BoolTest::ne, zero, unlikely); {
+242     BasicType index_bt = TypeX_X-&gt;basic_type();
+243     assert(sizeof(size_t) == type2aelembytes(index_bt), &quot;Loading G1 SATBMarkQueue::_index with wrong size.&quot;);
+244     Node* index   = __ load(__ ctrl(), index_adr, TypeX_X, index_bt, Compile::AliasIdxRaw);
+245 
+246     if (do_load) {
+247       // load original value
+248       // alias_idx correct??
+249       pre_val = __ load(__ ctrl(), adr, val_type, bt, alias_idx);
+250     }
+251 
+252     // if (pre_val != NULL)
+253     __ if_then(pre_val, BoolTest::ne, kit-&gt;null()); {
+254       Node* buffer  = __ load(__ ctrl(), buffer_adr, TypeRawPtr::NOTNULL, T_ADDRESS, Compile::AliasIdxRaw);
+255 
+256       // is the queue for this thread full?
+257       __ if_then(index, BoolTest::ne, zeroX, likely); {
+258 
+259         // decrement the index
+260         Node* next_index = kit-&gt;gvn().transform(new SubXNode(index, __ ConX(sizeof(intptr_t))));
+261 
+262         // Now get the buffer location we will log the previous value into and store it
+263         Node *log_addr = __ AddP(no_base, buffer, next_index);
+264         __ store(__ ctrl(), log_addr, pre_val, T_OBJECT, Compile::AliasIdxRaw, MemNode::unordered);
+265         // update the index
+266         __ store(__ ctrl(), index_adr, next_index, index_bt, Compile::AliasIdxRaw, MemNode::unordered);
+267 
+268       } __ else_(); {
+269 
+270         // logging buffer is full, call the runtime
+271         const TypeFunc *tf = write_ref_field_pre_entry_Type();
+272         __ make_leaf_call(tf, CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::write_ref_field_pre_entry), &quot;write_ref_field_pre_entry&quot;, pre_val, tls);
+273       } __ end_if();  // (!index)
+274     } __ end_if();  // (pre_val != NULL)
+275   } __ end_if();  // (!marking)
+276 
+277   // Final sync IdealKit and GraphKit.
+278   kit-&gt;final_sync(ideal);
+279 }
+280 
+281 /*
+282  * G1 similar to any GC with a Young Generation requires a way to keep track of
+283  * references from Old Generation to Young Generation to make sure all live
+284  * objects are found. G1 also requires to keep track of object references
+285  * between different regions to enable evacuation of old regions, which is done
+286  * as part of mixed collections. References are tracked in remembered sets and
+287  * is continuously updated as reference are written to with the help of the
+288  * post-barrier.
+289  *
+290  * To reduce the number of updates to the remembered set the post-barrier
+291  * filters updates to fields in objects located in the Young Generation,
+292  * the same region as the reference, when the NULL is being written or
+293  * if the card is already marked as dirty by an earlier write.
+294  *
+295  * Under certain circumstances it is possible to avoid generating the
+296  * post-barrier completely if it is possible during compile time to prove
+297  * the object is newly allocated and that no safepoint exists between the
+298  * allocation and the store.
+299  *
+300  * In the case of slow allocation the allocation code must handle the barrier
+301  * as part of the allocation in the case the allocated object is not located
+302  * in the nursery; this would happen for humongous objects.
+303  *
+304  * Returns true if the post barrier can be removed
+305  */
+306 bool G1BarrierSetC2::g1_can_remove_post_barrier(GraphKit* kit,
+307                                                 PhaseTransform* phase, Node* store,
+308                                                 Node* adr) const {
+309   intptr_t      offset = 0;
+310   Node*         base   = AddPNode::Ideal_base_and_offset(adr, phase, offset);
+311   AllocateNode* alloc  = AllocateNode::Ideal_allocation(base, phase);
+312 
+313   if (offset == Type::OffsetBot) {
+314     return false; // cannot unalias unless there are precise offsets
+315   }
+316 
+317   if (alloc == NULL) {
+318      return false; // No allocation found
+319   }
+320 
+321   // Start search from Store node
+322   Node* mem = store-&gt;in(MemNode::Control);
+323   if (mem-&gt;is_Proj() &amp;&amp; mem-&gt;in(0)-&gt;is_Initialize()) {
+324 
+325     InitializeNode* st_init = mem-&gt;in(0)-&gt;as_Initialize();
+326     AllocateNode*  st_alloc = st_init-&gt;allocation();
+327 
+328     // Make sure we are looking at the same allocation
+329     if (alloc == st_alloc) {
+330       return true;
+331     }
+332   }
+333 
+334   return false;
+335 }
+336 
+337 //
+338 // Update the card table and add card address to the queue
+339 //
+340 void G1BarrierSetC2::g1_mark_card(GraphKit* kit,
+341                                   IdealKit&amp; ideal,
+342                                   Node* card_adr,
+343                                   Node* oop_store,
+344                                   uint oop_alias_idx,
+345                                   Node* index,
+346                                   Node* index_adr,
+347                                   Node* buffer,
+348                                   const TypeFunc* tf) const {
+349   Node* zero  = __ ConI(0);
+350   Node* zeroX = __ ConX(0);
+351   Node* no_base = __ top();
+352   BasicType card_bt = T_BYTE;
+353   // Smash zero into card. MUST BE ORDERED WRT TO STORE
+354   __ storeCM(__ ctrl(), card_adr, zero, oop_store, oop_alias_idx, card_bt, Compile::AliasIdxRaw);
+355 
+356   //  Now do the queue work
+357   __ if_then(index, BoolTest::ne, zeroX); {
+358 
+359     Node* next_index = kit-&gt;gvn().transform(new SubXNode(index, __ ConX(sizeof(intptr_t))));
+360     Node* log_addr = __ AddP(no_base, buffer, next_index);
+361 
+362     // Order, see storeCM.
+363     __ store(__ ctrl(), log_addr, card_adr, T_ADDRESS, Compile::AliasIdxRaw, MemNode::unordered);
+364     __ store(__ ctrl(), index_adr, next_index, TypeX_X-&gt;basic_type(), Compile::AliasIdxRaw, MemNode::unordered);
+365 
+366   } __ else_(); {
+367     __ make_leaf_call(tf, CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::write_ref_field_post_entry), &quot;write_ref_field_post_entry&quot;, card_adr, __ thread());
+368   } __ end_if();
+369 
+370 }
+371 
+372 void G1BarrierSetC2::post_barrier(GraphKit* kit,
+373                                   Node* ctl,
+374                                   Node* oop_store,
+375                                   Node* obj,
+376                                   Node* adr,
+377                                   uint alias_idx,
+378                                   Node* val,
+379                                   BasicType bt,
+380                                   bool use_precise) const {
+381   // If we are writing a NULL then we need no post barrier
+382 
+383   if (val != NULL &amp;&amp; val-&gt;is_Con() &amp;&amp; val-&gt;bottom_type() == TypePtr::NULL_PTR) {
+384     // Must be NULL
+385     const Type* t = val-&gt;bottom_type();
+386     assert(t == Type::TOP || t == TypePtr::NULL_PTR, &quot;must be NULL&quot;);
+387     // No post barrier if writing NULLx
+388     return;
+389   }
+390 
+391   if (use_ReduceInitialCardMarks() &amp;&amp; obj == kit-&gt;just_allocated_object(kit-&gt;control())) {
+392     // We can skip marks on a freshly-allocated object in Eden.
+393     // Keep this code in sync with new_deferred_store_barrier() in runtime.cpp.
+394     // That routine informs GC to take appropriate compensating steps,
+395     // upon a slow-path allocation, so as to make this card-mark
+396     // elision safe.
+397     return;
+398   }
+399 
+400   if (use_ReduceInitialCardMarks()
+401       &amp;&amp; g1_can_remove_post_barrier(kit, &amp;kit-&gt;gvn(), oop_store, adr)) {
+402     return;
+403   }
+404 
+405   if (!use_precise) {
+406     // All card marks for a (non-array) instance are in one place:
+407     adr = obj;
+408   }
+409   // (Else it&#39;s an array (or unknown), and we want more precise card marks.)
+410   assert(adr != NULL, &quot;&quot;);
+411 
+412   IdealKit ideal(kit, true);
+413 
+414   Node* tls = __ thread(); // ThreadLocalStorage
+415 
+416   Node* no_base = __ top();
+417   float likely = PROB_LIKELY_MAG(3);
+418   float unlikely = PROB_UNLIKELY_MAG(3);
+419   Node* young_card = __ ConI((jint)G1CardTable::g1_young_card_val());
+420   Node* dirty_card = __ ConI((jint)G1CardTable::dirty_card_val());
+421   Node* zeroX = __ ConX(0);
+422 
+423   const TypeFunc *tf = write_ref_field_post_entry_Type();
+424 
+425   // Offsets into the thread
+426   const int index_offset  = in_bytes(G1ThreadLocalData::dirty_card_queue_index_offset());
+427   const int buffer_offset = in_bytes(G1ThreadLocalData::dirty_card_queue_buffer_offset());
+428 
+429   // Pointers into the thread
+430 
+431   Node* buffer_adr = __ AddP(no_base, tls, __ ConX(buffer_offset));
+432   Node* index_adr =  __ AddP(no_base, tls, __ ConX(index_offset));
+433 
+434   // Now some values
+435   // Use ctrl to avoid hoisting these values past a safepoint, which could
+436   // potentially reset these fields in the JavaThread.
+437   Node* index  = __ load(__ ctrl(), index_adr, TypeX_X, TypeX_X-&gt;basic_type(), Compile::AliasIdxRaw);
+438   Node* buffer = __ load(__ ctrl(), buffer_adr, TypeRawPtr::NOTNULL, T_ADDRESS, Compile::AliasIdxRaw);
+439 
+440   // Convert the store obj pointer to an int prior to doing math on it
+441   // Must use ctrl to prevent &quot;integerized oop&quot; existing across safepoint
+442   Node* cast =  __ CastPX(__ ctrl(), adr);
+443 
+444   // Divide pointer by card size
+445   Node* card_offset = __ URShiftX( cast, __ ConI(CardTable::card_shift) );
+446 
+447   // Combine card table base and card offset
+448   Node* card_adr = __ AddP(no_base, byte_map_base_node(kit), card_offset );
+449 
+450   // If we know the value being stored does it cross regions?
+451 
+452   if (val != NULL) {
+453     // Does the store cause us to cross regions?
+454 
+455     // Should be able to do an unsigned compare of region_size instead of
+456     // and extra shift. Do we have an unsigned compare??
+457     // Node* region_size = __ ConI(1 &lt;&lt; HeapRegion::LogOfHRGrainBytes);
+458     Node* xor_res =  __ URShiftX ( __ XorX( cast,  __ CastPX(__ ctrl(), val)), __ ConI(HeapRegion::LogOfHRGrainBytes));
+459 
+460     // if (xor_res == 0) same region so skip
+461     __ if_then(xor_res, BoolTest::ne, zeroX, likely); {
+462 
+463       // No barrier if we are storing a NULL
+464       __ if_then(val, BoolTest::ne, kit-&gt;null(), likely); {
+465 
+466         // Ok must mark the card if not already dirty
+467 
+468         // load the original value of the card
+469         Node* card_val = __ load(__ ctrl(), card_adr, TypeInt::INT, T_BYTE, Compile::AliasIdxRaw);
+470 
+471         __ if_then(card_val, BoolTest::ne, young_card, unlikely); {
+472           kit-&gt;sync_kit(ideal);
+473           kit-&gt;insert_mem_bar(Op_MemBarVolatile, oop_store);
+474           __ sync_kit(kit);
+475 
+476           Node* card_val_reload = __ load(__ ctrl(), card_adr, TypeInt::INT, T_BYTE, Compile::AliasIdxRaw);
+477           __ if_then(card_val_reload, BoolTest::ne, dirty_card); {
+478             g1_mark_card(kit, ideal, card_adr, oop_store, alias_idx, index, index_adr, buffer, tf);
+479           } __ end_if();
+480         } __ end_if();
+481       } __ end_if();
+482     } __ end_if();
+483   } else {
+484     // The Object.clone() intrinsic uses this path if !ReduceInitialCardMarks.
+485     // We don&#39;t need a barrier here if the destination is a newly allocated object
+486     // in Eden. Otherwise, GC verification breaks because we assume that cards in Eden
+487     // are set to &#39;g1_young_gen&#39; (see G1CardTable::verify_g1_young_region()).
+488     assert(!use_ReduceInitialCardMarks(), &quot;can only happen with card marking&quot;);
+489     Node* card_val = __ load(__ ctrl(), card_adr, TypeInt::INT, T_BYTE, Compile::AliasIdxRaw);
+490     __ if_then(card_val, BoolTest::ne, young_card); {
+491       g1_mark_card(kit, ideal, card_adr, oop_store, alias_idx, index, index_adr, buffer, tf);
+492     } __ end_if();
+493   }
+494 
+495   // Final sync IdealKit and GraphKit.
+496   kit-&gt;final_sync(ideal);
+497 }
+498 
+499 // Helper that guards and inserts a pre-barrier.
+500 void G1BarrierSetC2::insert_pre_barrier(GraphKit* kit, Node* base_oop, Node* offset,
+501                                         Node* pre_val, bool need_mem_bar) const {
+502   // We could be accessing the referent field of a reference object. If so, when G1
+503   // is enabled, we need to log the value in the referent field in an SATB buffer.
+504   // This routine performs some compile time filters and generates suitable
+505   // runtime filters that guard the pre-barrier code.
+506   // Also add memory barrier for non volatile load from the referent field
+507   // to prevent commoning of loads across safepoint.
+508 
+509   // Some compile time checks.
+510 
+511   // If offset is a constant, is it java_lang_ref_Reference::_reference_offset?
+512   const TypeX* otype = offset-&gt;find_intptr_t_type();
+513   if (otype != NULL &amp;&amp; otype-&gt;is_con() &amp;&amp;
+514       otype-&gt;get_con() != java_lang_ref_Reference::referent_offset()) {
+515     // Constant offset but not the reference_offset so just return
+516     return;
+517   }
+518 
+519   // We only need to generate the runtime guards for instances.
+520   const TypeOopPtr* btype = base_oop-&gt;bottom_type()-&gt;isa_oopptr();
+521   if (btype != NULL) {
+522     if (btype-&gt;isa_aryptr()) {
+523       // Array type so nothing to do
+524       return;
+525     }
+526 
+527     const TypeInstPtr* itype = btype-&gt;isa_instptr();
+528     if (itype != NULL) {
+529       // Can the klass of base_oop be statically determined to be
+530       // _not_ a sub-class of Reference and _not_ Object?
+531       ciKlass* klass = itype-&gt;klass();
+532       if ( klass-&gt;is_loaded() &amp;&amp;
+533           !klass-&gt;is_subtype_of(kit-&gt;env()-&gt;Reference_klass()) &amp;&amp;
+534           !kit-&gt;env()-&gt;Object_klass()-&gt;is_subtype_of(klass)) {
+535         return;
+536       }
+537     }
+538   }
+539 
+540   // The compile time filters did not reject base_oop/offset so
+541   // we need to generate the following runtime filters
+542   //
+543   // if (offset == java_lang_ref_Reference::_reference_offset) {
+544   //   if (instance_of(base, java.lang.ref.Reference)) {
+545   //     pre_barrier(_, pre_val, ...);
+546   //   }
+547   // }
+548 
+549   float likely   = PROB_LIKELY(  0.999);
+550   float unlikely = PROB_UNLIKELY(0.999);
+551 
+552   IdealKit ideal(kit);
+553 
+554   Node* referent_off = __ ConX(java_lang_ref_Reference::referent_offset());
+555 
+556   __ if_then(offset, BoolTest::eq, referent_off, unlikely); {
+557       // Update graphKit memory and control from IdealKit.
+558       kit-&gt;sync_kit(ideal);
+559 
+560       Node* ref_klass_con = kit-&gt;makecon(TypeKlassPtr::make(kit-&gt;env()-&gt;Reference_klass()));
+561       Node* is_instof = kit-&gt;gen_instanceof(base_oop, ref_klass_con);
+562 
+563       // Update IdealKit memory and control from graphKit.
+564       __ sync_kit(kit);
+565 
+566       Node* one = __ ConI(1);
+567       // is_instof == 0 if base_oop == NULL
+568       __ if_then(is_instof, BoolTest::eq, one, unlikely); {
+569 
+570         // Update graphKit from IdeakKit.
+571         kit-&gt;sync_kit(ideal);
+572 
+573         // Use the pre-barrier to record the value in the referent field
+574         pre_barrier(kit, false /* do_load */,
+575                     __ ctrl(),
+576                     NULL /* obj */, NULL /* adr */, max_juint /* alias_idx */, NULL /* val */, NULL /* val_type */,
+577                     pre_val /* pre_val */,
+578                     T_OBJECT);
+579         if (need_mem_bar) {
+580           // Add memory barrier to prevent commoning reads from this field
+581           // across safepoint since GC can change its value.
+582           kit-&gt;insert_mem_bar(Op_MemBarCPUOrder);
+583         }
+584         // Update IdealKit from graphKit.
+585         __ sync_kit(kit);
+586 
+587       } __ end_if(); // _ref_type != ref_none
+588   } __ end_if(); // offset == referent_offset
+589 
+590   // Final sync IdealKit and GraphKit.
+591   kit-&gt;final_sync(ideal);
+592 }
+593 
+594 #undef __
+595 
+596 Node* G1BarrierSetC2::load_at_resolved(C2Access&amp; access, const Type* val_type) const {
+597   DecoratorSet decorators = access.decorators();
+598   Node* adr = access.addr().node();
+599   Node* obj = access.base();
+600 
+601   bool anonymous = (decorators &amp; C2_UNSAFE_ACCESS) != 0;
+602   bool mismatched = (decorators &amp; C2_MISMATCHED) != 0;
+603   bool unknown = (decorators &amp; ON_UNKNOWN_OOP_REF) != 0;
+604   bool in_heap = (decorators &amp; IN_HEAP) != 0;
+605   bool in_native = (decorators &amp; IN_NATIVE) != 0;
+606   bool on_weak = (decorators &amp; ON_WEAK_OOP_REF) != 0;
+607   bool is_unordered = (decorators &amp; MO_UNORDERED) != 0;
+608   bool is_mixed = !in_heap &amp;&amp; !in_native;
+609   bool need_cpu_mem_bar = !is_unordered || mismatched || is_mixed;
+610 
+611   Node* top = Compile::current()-&gt;top();
+612   Node* offset = adr-&gt;is_AddP() ? adr-&gt;in(AddPNode::Offset) : top;
+613   Node* load = CardTableBarrierSetC2::load_at_resolved(access, val_type);
+614 
+615   // If we are reading the value of the referent field of a Reference
+616   // object (either by using Unsafe directly or through reflection)
+617   // then, if G1 is enabled, we need to record the referent in an
+618   // SATB log buffer using the pre-barrier mechanism.
+619   // Also we need to add memory barrier to prevent commoning reads
+620   // from this field across safepoint since GC can change its value.
+621   bool need_read_barrier = in_heap &amp;&amp; (on_weak ||
+622                                        (unknown &amp;&amp; offset != top &amp;&amp; obj != top));
+623 
+624   if (!access.is_oop() || !need_read_barrier) {
+625     return load;
+626   }
+627 
+628   assert(access.is_parse_access(), &quot;entry not supported at optimization time&quot;);
+629   C2ParseAccess&amp; parse_access = static_cast&lt;C2ParseAccess&amp;&gt;(access);
+630   GraphKit* kit = parse_access.kit();
+631 
+632   if (on_weak) {
+633     // Use the pre-barrier to record the value in the referent field
+634     pre_barrier(kit, false /* do_load */,
+635                 kit-&gt;control(),
+636                 NULL /* obj */, NULL /* adr */, max_juint /* alias_idx */, NULL /* val */, NULL /* val_type */,
+637                 load /* pre_val */, T_OBJECT);
+638     // Add memory barrier to prevent commoning reads from this field
+639     // across safepoint since GC can change its value.
+640     kit-&gt;insert_mem_bar(Op_MemBarCPUOrder);
+641   } else if (unknown) {
+642     // We do not require a mem bar inside pre_barrier if need_mem_bar
+643     // is set: the barriers would be emitted by us.
+644     insert_pre_barrier(kit, obj, offset, load, !need_cpu_mem_bar);
+645   }
+646 
+647   return load;
+648 }
+649 
+650 bool G1BarrierSetC2::is_gc_barrier_node(Node* node) const {
+651   if (CardTableBarrierSetC2::is_gc_barrier_node(node)) {
+652     return true;
+653   }
+654   if (node-&gt;Opcode() != Op_CallLeaf) {
+655     return false;
+656   }
+657   CallLeafNode *call = node-&gt;as_CallLeaf();
+658   if (call-&gt;_name == NULL) {
+659     return false;
+660   }
+661 
+662   return strcmp(call-&gt;_name, &quot;write_ref_field_pre_entry&quot;) == 0 || strcmp(call-&gt;_name, &quot;write_ref_field_post_entry&quot;) == 0;
+663 }
+664 
+665 void G1BarrierSetC2::eliminate_gc_barrier(PhaseMacroExpand* macro, Node* node) const {
+666   assert(node-&gt;Opcode() == Op_CastP2X, &quot;ConvP2XNode required&quot;);
+667   assert(node-&gt;outcnt() &lt;= 2, &quot;expects 1 or 2 users: Xor and URShift nodes&quot;);
+668   // It could be only one user, URShift node, in Object.clone() intrinsic
+669   // but the new allocation is passed to arraycopy stub and it could not
+670   // be scalar replaced. So we don&#39;t check the case.
+671 
+672   // An other case of only one user (Xor) is when the value check for NULL
+673   // in G1 post barrier is folded after CCP so the code which used URShift
+674   // is removed.
+675 
+676   // Take Region node before eliminating post barrier since it also
+677   // eliminates CastP2X node when it has only one user.
+678   Node* this_region = node-&gt;in(0);
+679   assert(this_region != NULL, &quot;&quot;);
+680 
+681   // Remove G1 post barrier.
+682 
+683   // Search for CastP2X-&gt;Xor-&gt;URShift-&gt;Cmp path which
+684   // checks if the store done to a different from the value&#39;s region.
+685   // And replace Cmp with #0 (false) to collapse G1 post barrier.
+686   Node* xorx = node-&gt;find_out_with(Op_XorX);
+687   if (xorx != NULL) {
+688     Node* shift = xorx-&gt;unique_out();
+689     Node* cmpx = shift-&gt;unique_out();
+690     assert(cmpx-&gt;is_Cmp() &amp;&amp; cmpx-&gt;unique_out()-&gt;is_Bool() &amp;&amp;
+691     cmpx-&gt;unique_out()-&gt;as_Bool()-&gt;_test._test == BoolTest::ne,
+692     &quot;missing region check in G1 post barrier&quot;);
+693     macro-&gt;replace_node(cmpx, macro-&gt;makecon(TypeInt::CC_EQ));
+694 
+695     // Remove G1 pre barrier.
+696 
+697     // Search &quot;if (marking != 0)&quot; check and set it to &quot;false&quot;.
+698     // There is no G1 pre barrier if previous stored value is NULL
+699     // (for example, after initialization).
+700     if (this_region-&gt;is_Region() &amp;&amp; this_region-&gt;req() == 3) {
+701       int ind = 1;
+702       if (!this_region-&gt;in(ind)-&gt;is_IfFalse()) {
+703         ind = 2;
+704       }
+705       if (this_region-&gt;in(ind)-&gt;is_IfFalse() &amp;&amp;
+706           this_region-&gt;in(ind)-&gt;in(0)-&gt;Opcode() == Op_If) {
+707         Node* bol = this_region-&gt;in(ind)-&gt;in(0)-&gt;in(1);
+708         assert(bol-&gt;is_Bool(), &quot;&quot;);
+709         cmpx = bol-&gt;in(1);
+710         if (bol-&gt;as_Bool()-&gt;_test._test == BoolTest::ne &amp;&amp;
+711             cmpx-&gt;is_Cmp() &amp;&amp; cmpx-&gt;in(2) == macro-&gt;intcon(0) &amp;&amp;
+712             cmpx-&gt;in(1)-&gt;is_Load()) {
+713           Node* adr = cmpx-&gt;in(1)-&gt;as_Load()-&gt;in(MemNode::Address);
+714           const int marking_offset = in_bytes(G1ThreadLocalData::satb_mark_queue_active_offset());
+715           if (adr-&gt;is_AddP() &amp;&amp; adr-&gt;in(AddPNode::Base) == macro-&gt;top() &amp;&amp;
+716               adr-&gt;in(AddPNode::Address)-&gt;Opcode() == Op_ThreadLocal &amp;&amp;
+717               adr-&gt;in(AddPNode::Offset) == macro-&gt;MakeConX(marking_offset)) {
+718             macro-&gt;replace_node(cmpx, macro-&gt;makecon(TypeInt::CC_EQ));
+719           }
+720         }
+721       }
+722     }
+723   } else {
+724     assert(!use_ReduceInitialCardMarks(), &quot;can only happen with card marking&quot;);
+725     // This is a G1 post barrier emitted by the Object.clone() intrinsic.
+726     // Search for the CastP2X-&gt;URShiftX-&gt;AddP-&gt;LoadB-&gt;Cmp path which checks if the card
+727     // is marked as young_gen and replace the Cmp with 0 (false) to collapse the barrier.
+728     Node* shift = node-&gt;find_out_with(Op_URShiftX);
+729     assert(shift != NULL, &quot;missing G1 post barrier&quot;);
+730     Node* addp = shift-&gt;unique_out();
+731     Node* load = addp-&gt;find_out_with(Op_LoadB);
+732     assert(load != NULL, &quot;missing G1 post barrier&quot;);
+733     Node* cmpx = load-&gt;unique_out();
+734     assert(cmpx-&gt;is_Cmp() &amp;&amp; cmpx-&gt;unique_out()-&gt;is_Bool() &amp;&amp;
+735            cmpx-&gt;unique_out()-&gt;as_Bool()-&gt;_test._test == BoolTest::ne,
+736            &quot;missing card value check in G1 post barrier&quot;);
+737     macro-&gt;replace_node(cmpx, macro-&gt;makecon(TypeInt::CC_EQ));
+738     // There is no G1 pre barrier in this case
+739   }
+740   // Now CastP2X can be removed since it is used only on dead path
+741   // which currently still alive until igvn optimize it.
+742   assert(node-&gt;outcnt() == 0 || node-&gt;unique_out()-&gt;Opcode() == Op_URShiftX, &quot;&quot;);
+743   macro-&gt;replace_node(node, macro-&gt;top());
+744 }
+745 
+746 Node* G1BarrierSetC2::step_over_gc_barrier(Node* c) const {
+747   if (!use_ReduceInitialCardMarks() &amp;&amp;
+748       c != NULL &amp;&amp; c-&gt;is_Region() &amp;&amp; c-&gt;req() == 3) {
+749     for (uint i = 1; i &lt; c-&gt;req(); i++) {
+750       if (c-&gt;in(i) != NULL &amp;&amp; c-&gt;in(i)-&gt;is_Region() &amp;&amp;
+751           c-&gt;in(i)-&gt;req() == 3) {
+752         Node* r = c-&gt;in(i);
+753         for (uint j = 1; j &lt; r-&gt;req(); j++) {
+754           if (r-&gt;in(j) != NULL &amp;&amp; r-&gt;in(j)-&gt;is_Proj() &amp;&amp;
+755               r-&gt;in(j)-&gt;in(0) != NULL &amp;&amp;
+756               r-&gt;in(j)-&gt;in(0)-&gt;Opcode() == Op_CallLeaf &amp;&amp;
+757               r-&gt;in(j)-&gt;in(0)-&gt;as_Call()-&gt;entry_point() == CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::write_ref_field_post_entry)) {
+758             Node* call = r-&gt;in(j)-&gt;in(0);
+759             c = c-&gt;in(i == 1 ? 2 : 1);
+760             if (c != NULL) {
+761               c = c-&gt;in(0);
+762               if (c != NULL) {
+763                 c = c-&gt;in(0);
+764                 assert(call-&gt;in(0) == NULL ||
+765                        call-&gt;in(0)-&gt;in(0) == NULL ||
+766                        call-&gt;in(0)-&gt;in(0)-&gt;in(0) == NULL ||
+767                        call-&gt;in(0)-&gt;in(0)-&gt;in(0)-&gt;in(0) == NULL ||
+768                        call-&gt;in(0)-&gt;in(0)-&gt;in(0)-&gt;in(0)-&gt;in(0) == NULL ||
+769                        c == call-&gt;in(0)-&gt;in(0)-&gt;in(0)-&gt;in(0)-&gt;in(0), &quot;bad barrier shape&quot;);
+770                 return c;
+771               }
+772             }
+773           }
+774         }
+775       }
+776     }
+777   }
+778   return c;
+779 }
+780 
+781 #ifdef ASSERT
+782 void G1BarrierSetC2::verify_gc_barriers(Compile* compile, CompilePhase phase) const {
+783   if (phase != BarrierSetC2::BeforeCodeGen) {
+784     return;
+785   }
+786   // Verify G1 pre-barriers
+787   const int marking_offset = in_bytes(G1ThreadLocalData::satb_mark_queue_active_offset());
+788 
+789   Unique_Node_List visited;
+790   Node_List worklist;
+791   // We&#39;re going to walk control flow backwards starting from the Root
+792   worklist.push(compile-&gt;root());
+793   while (worklist.size() &gt; 0) {
+794     Node* x = worklist.pop();
+795     if (x == NULL || x == compile-&gt;top()) continue;
+796     if (visited.member(x)) {
+797       continue;
+798     } else {
+799       visited.push(x);
+800     }
+801 
+802     if (x-&gt;is_Region()) {
+803       for (uint i = 1; i &lt; x-&gt;req(); i++) {
+804         worklist.push(x-&gt;in(i));
+805       }
+806     } else {
+807       worklist.push(x-&gt;in(0));
+808       // We are looking for the pattern:
+809       //                            /-&gt;ThreadLocal
+810       // If-&gt;Bool-&gt;CmpI-&gt;LoadB-&gt;AddP-&gt;ConL(marking_offset)
+811       //              \-&gt;ConI(0)
+812       // We want to verify that the If and the LoadB have the same control
+813       // See GraphKit::g1_write_barrier_pre()
+814       if (x-&gt;is_If()) {
+815         IfNode *iff = x-&gt;as_If();
+816         if (iff-&gt;in(1)-&gt;is_Bool() &amp;&amp; iff-&gt;in(1)-&gt;in(1)-&gt;is_Cmp()) {
+817           CmpNode *cmp = iff-&gt;in(1)-&gt;in(1)-&gt;as_Cmp();
+818           if (cmp-&gt;Opcode() == Op_CmpI &amp;&amp; cmp-&gt;in(2)-&gt;is_Con() &amp;&amp; cmp-&gt;in(2)-&gt;bottom_type()-&gt;is_int()-&gt;get_con() == 0
+819               &amp;&amp; cmp-&gt;in(1)-&gt;is_Load()) {
+820             LoadNode* load = cmp-&gt;in(1)-&gt;as_Load();
+821             if (load-&gt;Opcode() == Op_LoadB &amp;&amp; load-&gt;in(2)-&gt;is_AddP() &amp;&amp; load-&gt;in(2)-&gt;in(2)-&gt;Opcode() == Op_ThreadLocal
+822                 &amp;&amp; load-&gt;in(2)-&gt;in(3)-&gt;is_Con()
+823                 &amp;&amp; load-&gt;in(2)-&gt;in(3)-&gt;bottom_type()-&gt;is_intptr_t()-&gt;get_con() == marking_offset) {
+824 
+825               Node* if_ctrl = iff-&gt;in(0);
+826               Node* load_ctrl = load-&gt;in(0);
+827 
+828               if (if_ctrl != load_ctrl) {
+829                 // Skip possible CProj-&gt;NeverBranch in infinite loops
+830                 if ((if_ctrl-&gt;is_Proj() &amp;&amp; if_ctrl-&gt;Opcode() == Op_CProj)
+831                     &amp;&amp; (if_ctrl-&gt;in(0)-&gt;is_MultiBranch() &amp;&amp; if_ctrl-&gt;in(0)-&gt;Opcode() == Op_NeverBranch)) {
+832                   if_ctrl = if_ctrl-&gt;in(0)-&gt;in(0);
+833                 }
+834               }
+835               assert(load_ctrl != NULL &amp;&amp; if_ctrl == load_ctrl, &quot;controls must match&quot;);
+836             }
+837           }
+838         }
+839       }
+840     }
+841   }
+842 }
+843 #endif
+844 
+845 bool G1BarrierSetC2::escape_add_to_con_graph(ConnectionGraph* conn_graph, PhaseGVN* gvn, Unique_Node_List* delayed_worklist, Node* n, uint opcode) const {
+846   if (opcode == Op_StoreP) {
+847     Node* adr = n-&gt;in(MemNode::Address);
+848     const Type* adr_type = gvn-&gt;type(adr);
+849     // Pointer stores in G1 barriers looks like unsafe access.
+850     // Ignore such stores to be able scalar replace non-escaping
+851     // allocations.
+852     if (adr_type-&gt;isa_rawptr() &amp;&amp; adr-&gt;is_AddP()) {
+853       Node* base = conn_graph-&gt;get_addp_base(adr);
+854       if (base-&gt;Opcode() == Op_LoadP &amp;&amp;
+855           base-&gt;in(MemNode::Address)-&gt;is_AddP()) {
+856         adr = base-&gt;in(MemNode::Address);
+857         Node* tls = conn_graph-&gt;get_addp_base(adr);
+858         if (tls-&gt;Opcode() == Op_ThreadLocal) {
+859           int offs = (int) gvn-&gt;find_intptr_t_con(adr-&gt;in(AddPNode::Offset), Type::OffsetBot);
+860           const int buf_offset = in_bytes(G1ThreadLocalData::satb_mark_queue_buffer_offset());
+861           if (offs == buf_offset) {
+862             return true; // G1 pre barrier previous oop value store.
+863           }
+864           if (offs == in_bytes(G1ThreadLocalData::dirty_card_queue_buffer_offset())) {
+865             return true; // G1 post barrier card address store.
+866           }
+867         }
+868       }
+869     }
+870   }
+871   return false;
+872 }
+<a name="2" id="anc2"></a><b style="font-size: large; color: red">--- EOF ---</b>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+</pre>
+<input id="eof" value="2" type="hidden" />
+</body>
+</html>
