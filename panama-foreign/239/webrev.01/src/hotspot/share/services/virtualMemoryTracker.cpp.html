@@ -1,0 +1,693 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>New src/hotspot/share/services/virtualMemoryTracker.cpp</title>
+    <link rel="stylesheet" href="../../../../style.css" />
+  </head>
+  <body>
+    <pre>
+  1 /*
+  2  * Copyright (c) 2013, 2020, Oracle and/or its affiliates. All rights reserved.
+  3  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  4  *
+  5  * This code is free software; you can redistribute it and/or modify it
+  6  * under the terms of the GNU General Public License version 2 only, as
+  7  * published by the Free Software Foundation.
+  8  *
+  9  * This code is distributed in the hope that it will be useful, but WITHOUT
+ 10  * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ 11  * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ 12  * version 2 for more details (a copy is included in the LICENSE file that
+ 13  * accompanied this code).
+ 14  *
+ 15  * You should have received a copy of the GNU General Public License version
+ 16  * 2 along with this work; if not, write to the Free Software Foundation,
+ 17  * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ 18  *
+ 19  * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ 20  * or visit www.oracle.com if you need additional information or have any
+ 21  * questions.
+ 22  *
+ 23  */
+ 24 #include &quot;precompiled.hpp&quot;
+ 25 
+ 26 #include &quot;logging/log.hpp&quot;
+ 27 #include &quot;memory/metaspace.hpp&quot;
+ 28 #include &quot;runtime/os.hpp&quot;
+ 29 #include &quot;runtime/threadCritical.hpp&quot;
+ 30 #include &quot;services/memTracker.hpp&quot;
+ 31 #include &quot;services/threadStackTracker.hpp&quot;
+ 32 #include &quot;services/virtualMemoryTracker.hpp&quot;
+ 33 #include &quot;utilities/ostream.hpp&quot;
+ 34 
+ 35 size_t VirtualMemorySummary::_snapshot[CALC_OBJ_SIZE_IN_TYPE(VirtualMemorySnapshot, size_t)];
+ 36 
+ 37 void VirtualMemorySummary::initialize() {
+ 38   assert(sizeof(_snapshot) &gt;= sizeof(VirtualMemorySnapshot), &quot;Sanity Check&quot;);
+ 39   // Use placement operator new to initialize static data area.
+ 40   ::new ((void*)_snapshot) VirtualMemorySnapshot();
+ 41 }
+ 42 
+ 43 void VirtualMemorySummary::snapshot(VirtualMemorySnapshot* s) {
+ 44   // Only if thread stack is backed by virtual memory
+ 45   if (ThreadStackTracker::track_as_vm()) {
+ 46     // Snapshot current thread stacks
+ 47     VirtualMemoryTracker::snapshot_thread_stacks();
+ 48   }
+ 49   as_snapshot()-&gt;copy_to(s);
+ 50 }
+ 51 
+ 52 SortedLinkedList&lt;ReservedMemoryRegion, compare_reserved_region_base&gt;* VirtualMemoryTracker::_reserved_regions;
+ 53 
+ 54 int compare_committed_region(const CommittedMemoryRegion&amp; r1, const CommittedMemoryRegion&amp; r2) {
+ 55   return r1.compare(r2);
+ 56 }
+ 57 
+ 58 int compare_reserved_region_base(const ReservedMemoryRegion&amp; r1, const ReservedMemoryRegion&amp; r2) {
+ 59   return r1.compare(r2);
+ 60 }
+ 61 
+ 62 static bool is_mergeable_with(CommittedMemoryRegion* rgn, address addr, size_t size, const NativeCallStack&amp; stack) {
+ 63   return rgn-&gt;adjacent_to(addr, size) &amp;&amp; rgn-&gt;call_stack()-&gt;equals(stack);
+ 64 }
+ 65 
+ 66 static bool is_same_as(CommittedMemoryRegion* rgn, address addr, size_t size, const NativeCallStack&amp; stack) {
+ 67   // It would have made sense to use rgn-&gt;equals(...), but equals returns true for overlapping regions.
+ 68   return rgn-&gt;same_region(addr, size) &amp;&amp; rgn-&gt;call_stack()-&gt;equals(stack);
+ 69 }
+ 70 
+ 71 static LinkedListNode&lt;CommittedMemoryRegion&gt;* find_preceding_node_from(LinkedListNode&lt;CommittedMemoryRegion&gt;* from, address addr) {
+ 72   LinkedListNode&lt;CommittedMemoryRegion&gt;* preceding = NULL;
+ 73 
+ 74   for (LinkedListNode&lt;CommittedMemoryRegion&gt;* node = from; node != NULL; node = node-&gt;next()) {
+ 75     CommittedMemoryRegion* rgn = node-&gt;data();
+ 76 
+ 77     // We searched past the region start.
+ 78     if (rgn-&gt;end() &gt; addr) {
+ 79       break;
+ 80     }
+ 81 
+ 82     preceding = node;
+ 83   }
+ 84 
+ 85   return preceding;
+ 86 }
+ 87 
+ 88 static bool try_merge_with(LinkedListNode&lt;CommittedMemoryRegion&gt;* node, address addr, size_t size, const NativeCallStack&amp; stack) {
+ 89   if (node != NULL) {
+ 90     CommittedMemoryRegion* rgn = node-&gt;data();
+ 91 
+ 92     if (is_mergeable_with(rgn, addr, size, stack)) {
+ 93       rgn-&gt;expand_region(addr, size);
+ 94       return true;
+ 95     }
+ 96   }
+ 97 
+ 98   return false;
+ 99 }
+100 
+101 static bool try_merge_with(LinkedListNode&lt;CommittedMemoryRegion&gt;* node, LinkedListNode&lt;CommittedMemoryRegion&gt;* other) {
+102   if (other == NULL) {
+103     return false;
+104   }
+105 
+106   CommittedMemoryRegion* rgn = other-&gt;data();
+107   return try_merge_with(node, rgn-&gt;base(), rgn-&gt;size(), *rgn-&gt;call_stack());
+108 }
+109 
+110 bool ReservedMemoryRegion::add_committed_region(address addr, size_t size, const NativeCallStack&amp; stack) {
+111   assert(addr != NULL, &quot;Invalid address&quot;);
+112   assert(size &gt; 0, &quot;Invalid size&quot;);
+113   assert(contain_region(addr, size), &quot;Not contain this region&quot;);
+114 
+115   // Find the region that fully precedes the [addr, addr + size) region.
+116   LinkedListNode&lt;CommittedMemoryRegion&gt;* prev = find_preceding_node_from(_committed_regions.head(), addr);
+117   LinkedListNode&lt;CommittedMemoryRegion&gt;* next = (prev != NULL ? prev-&gt;next() : _committed_regions.head());
+118 
+119   if (next != NULL) {
+120     // Ignore request if region already exists.
+121     if (is_same_as(next-&gt;data(), addr, size, stack)) {
+122       return true;
+123     }
+124 
+125     // The new region is after prev, and either overlaps with the
+126     // next region (and maybe more regions), or overlaps with no region.
+127     if (next-&gt;data()-&gt;overlap_region(addr, size)) {
+128       // Remove _all_ overlapping regions, and parts of regions,
+129       // in preparation for the addition of this new region.
+130       remove_uncommitted_region(addr, size);
+131 
+132       // The remove could have split a region into two and created a
+133       // new prev region. Need to reset the prev and next pointers.
+134       prev = find_preceding_node_from((prev != NULL ? prev : _committed_regions.head()), addr);
+135       next = (prev != NULL ? prev-&gt;next() : _committed_regions.head());
+136     }
+137   }
+138 
+139   // At this point the previous overlapping regions have been
+140   // cleared, and the full region is guaranteed to be inserted.
+141   VirtualMemorySummary::record_committed_memory(size, flag());
+142 
+143   // Try to merge with prev and possibly next.
+144   if (try_merge_with(prev, addr, size, stack)) {
+145     if (try_merge_with(prev, next)) {
+146       // prev was expanded to contain the new region
+147       // and next, need to remove next from the list
+148       _committed_regions.remove_after(prev);
+149     }
+150 
+151     return true;
+152   }
+153 
+154   // Didn&#39;t merge with prev, try with next.
+155   if (try_merge_with(next, addr, size, stack)) {
+156     return true;
+157   }
+158 
+159   // Couldn&#39;t merge with any regions - create a new region.
+160   return add_committed_region(CommittedMemoryRegion(addr, size, stack));
+161 }
+162 
+163 bool ReservedMemoryRegion::remove_uncommitted_region(LinkedListNode&lt;CommittedMemoryRegion&gt;* node,
+164   address addr, size_t size) {
+165   assert(addr != NULL, &quot;Invalid address&quot;);
+166   assert(size &gt; 0, &quot;Invalid size&quot;);
+167 
+168   CommittedMemoryRegion* rgn = node-&gt;data();
+169   assert(rgn-&gt;contain_region(addr, size), &quot;Has to be contained&quot;);
+170   assert(!rgn-&gt;same_region(addr, size), &quot;Can not be the same region&quot;);
+171 
+172   if (rgn-&gt;base() == addr ||
+173       rgn-&gt;end() == addr + size) {
+174     rgn-&gt;exclude_region(addr, size);
+175     return true;
+176   } else {
+177     // split this region
+178     address top =rgn-&gt;end();
+179     // use this region for lower part
+180     size_t exclude_size = rgn-&gt;end() - addr;
+181     rgn-&gt;exclude_region(addr, exclude_size);
+182 
+183     // higher part
+184     address high_base = addr + size;
+185     size_t  high_size = top - high_base;
+186 
+187     CommittedMemoryRegion high_rgn(high_base, high_size, *rgn-&gt;call_stack());
+188     LinkedListNode&lt;CommittedMemoryRegion&gt;* high_node = _committed_regions.add(high_rgn);
+189     assert(high_node == NULL || node-&gt;next() == high_node, &quot;Should be right after&quot;);
+190     return (high_node != NULL);
+191   }
+192 
+193   return false;
+194 }
+195 
+196 bool ReservedMemoryRegion::remove_uncommitted_region(address addr, size_t sz) {
+197   assert(addr != NULL, &quot;Invalid address&quot;);
+198   assert(sz &gt; 0, &quot;Invalid size&quot;);
+199 
+200   CommittedMemoryRegion del_rgn(addr, sz, *call_stack());
+201   address end = addr + sz;
+202 
+203   LinkedListNode&lt;CommittedMemoryRegion&gt;* head = _committed_regions.head();
+204   LinkedListNode&lt;CommittedMemoryRegion&gt;* prev = NULL;
+205   CommittedMemoryRegion* crgn;
+206 
+207   while (head != NULL) {
+208     crgn = head-&gt;data();
+209 
+210     if (crgn-&gt;same_region(addr, sz)) {
+211       VirtualMemorySummary::record_uncommitted_memory(crgn-&gt;size(), flag());
+212       _committed_regions.remove_after(prev);
+213       return true;
+214     }
+215 
+216     // del_rgn contains crgn
+217     if (del_rgn.contain_region(crgn-&gt;base(), crgn-&gt;size())) {
+218       VirtualMemorySummary::record_uncommitted_memory(crgn-&gt;size(), flag());
+219       head = head-&gt;next();
+220       _committed_regions.remove_after(prev);
+221       continue;  // don&#39;t update head or prev
+222     }
+223 
+224     // Found addr in the current crgn. There are 2 subcases:
+225     if (crgn-&gt;contain_address(addr)) {
+226 
+227       // (1) Found addr+size in current crgn as well. (del_rgn is contained in crgn)
+228       if (crgn-&gt;contain_address(end - 1)) {
+229         VirtualMemorySummary::record_uncommitted_memory(sz, flag());
+230         return remove_uncommitted_region(head, addr, sz); // done!
+231       } else {
+232         // (2) Did not find del_rgn&#39;s end in crgn.
+233         size_t size = crgn-&gt;end() - del_rgn.base();
+234         crgn-&gt;exclude_region(addr, size);
+235         VirtualMemorySummary::record_uncommitted_memory(size, flag());
+236       }
+237 
+238     } else if (crgn-&gt;contain_address(end - 1)) {
+239       // Found del_rgn&#39;s end, but not its base addr.
+240       size_t size = del_rgn.end() - crgn-&gt;base();
+241       crgn-&gt;exclude_region(crgn-&gt;base(), size);
+242       VirtualMemorySummary::record_uncommitted_memory(size, flag());
+243       return true;  // should be done if the list is sorted properly!
+244     }
+245 
+246     prev = head;
+247     head = head-&gt;next();
+248   }
+249 
+250   return true;
+251 }
+252 
+253 void ReservedMemoryRegion::move_committed_regions(address addr, ReservedMemoryRegion&amp; rgn) {
+254   assert(addr != NULL, &quot;Invalid address&quot;);
+255 
+256   // split committed regions
+257   LinkedListNode&lt;CommittedMemoryRegion&gt;* head =
+258     _committed_regions.head();
+259   LinkedListNode&lt;CommittedMemoryRegion&gt;* prev = NULL;
+260 
+261   while (head != NULL) {
+262     if (head-&gt;data()-&gt;base() &gt;= addr) {
+263       break;
+264     }
+265     prev = head;
+266     head = head-&gt;next();
+267   }
+268 
+269   if (head != NULL) {
+270     if (prev != NULL) {
+271       prev-&gt;set_next(head-&gt;next());
+272     } else {
+273       _committed_regions.set_head(NULL);
+274     }
+275   }
+276 
+277   rgn._committed_regions.set_head(head);
+278 }
+279 
+280 size_t ReservedMemoryRegion::committed_size() const {
+281   size_t committed = 0;
+282   LinkedListNode&lt;CommittedMemoryRegion&gt;* head =
+283     _committed_regions.head();
+284   while (head != NULL) {
+285     committed += head-&gt;data()-&gt;size();
+286     head = head-&gt;next();
+287   }
+288   return committed;
+289 }
+290 
+291 void ReservedMemoryRegion::set_flag(MEMFLAGS f) {
+292   assert((flag() == mtNone || flag() == f),
+293          &quot;Overwrite memory type for region [&quot; PTR_FORMAT &quot;-&quot; PTR_FORMAT &quot;), %u-&gt;%u.&quot;,
+294          p2i(base()), p2i(end()), (unsigned)flag(), (unsigned)f);
+295   if (flag() != f) {
+296     VirtualMemorySummary::move_reserved_memory(flag(), f, size());
+297     VirtualMemorySummary::move_committed_memory(flag(), f, committed_size());
+298     _flag = f;
+299   }
+300 }
+301 
+302 address ReservedMemoryRegion::thread_stack_uncommitted_bottom() const {
+303   assert(flag() == mtThreadStack, &quot;Only for thread stack&quot;);
+304   LinkedListNode&lt;CommittedMemoryRegion&gt;* head = _committed_regions.head();
+305   address bottom = base();
+306   address top = base() + size();
+307   while (head != NULL) {
+308     address committed_top = head-&gt;data()-&gt;base() + head-&gt;data()-&gt;size();
+309     if (committed_top &lt; top) {
+310       // committed stack guard pages, skip them
+311       bottom = head-&gt;data()-&gt;base() + head-&gt;data()-&gt;size();
+312       head = head-&gt;next();
+313     } else {
+314       assert(top == committed_top, &quot;Sanity&quot;);
+315       break;
+316     }
+317   }
+318 
+319   return bottom;
+320 }
+321 
+322 bool VirtualMemoryTracker::initialize(NMT_TrackingLevel level) {
+323   if (level &gt;= NMT_summary) {
+324     VirtualMemorySummary::initialize();
+325   }
+326   return true;
+327 }
+328 
+329 bool VirtualMemoryTracker::late_initialize(NMT_TrackingLevel level) {
+330   if (level &gt;= NMT_summary) {
+331     _reserved_regions = new (std::nothrow, ResourceObj::C_HEAP, mtNMT)
+332       SortedLinkedList&lt;ReservedMemoryRegion, compare_reserved_region_base&gt;();
+333     return (_reserved_regions != NULL);
+334   }
+335   return true;
+336 }
+337 
+338 bool VirtualMemoryTracker::add_reserved_region(address base_addr, size_t size,
+339     const NativeCallStack&amp; stack, MEMFLAGS flag) {
+340   assert(base_addr != NULL, &quot;Invalid address&quot;);
+341   assert(size &gt; 0, &quot;Invalid size&quot;);
+342   assert(_reserved_regions != NULL, &quot;Sanity check&quot;);
+343   ReservedMemoryRegion  rgn(base_addr, size, stack, flag);
+344   ReservedMemoryRegion* reserved_rgn = _reserved_regions-&gt;find(rgn);
+345 
+346   if (reserved_rgn == NULL) {
+347     VirtualMemorySummary::record_reserved_memory(size, flag);
+348     return _reserved_regions-&gt;add(rgn) != NULL;
+349   } else {
+350     if (reserved_rgn-&gt;same_region(base_addr, size)) {
+351       reserved_rgn-&gt;set_call_stack(stack);
+352       reserved_rgn-&gt;set_flag(flag);
+353       return true;
+354     } else {
+355       assert(reserved_rgn-&gt;overlap_region(base_addr, size), &quot;Must be&quot;);
+356 
+357       // Overlapped reservation.
+358       // It can happen when the regions are thread stacks, as JNI
+359       // thread does not detach from VM before exits, and leads to
+360       // leak JavaThread object
+361       if (reserved_rgn-&gt;flag() == mtThreadStack) {
+362         guarantee(!CheckJNICalls, &quot;Attached JNI thread exited without being detached&quot;);
+363         // Overwrite with new region
+364 
+365         // Release old region
+366         VirtualMemorySummary::record_uncommitted_memory(reserved_rgn-&gt;committed_size(), reserved_rgn-&gt;flag());
+367         VirtualMemorySummary::record_released_memory(reserved_rgn-&gt;size(), reserved_rgn-&gt;flag());
+368 
+369         // Add new region
+370         VirtualMemorySummary::record_reserved_memory(rgn.size(), flag);
+371 
+372         *reserved_rgn = rgn;
+373         return true;
+374       }
+375 
+376       // CDS mapping region.
+377       // CDS reserves the whole region for mapping CDS archive, then maps each section into the region.
+378       // NMT reports CDS as a whole.
+379       if (reserved_rgn-&gt;flag() == mtClassShared) {
+380         assert(reserved_rgn-&gt;contain_region(base_addr, size), &quot;Reserved CDS region should contain this mapping region&quot;);
+381         return true;
+382       }
+383 
+384       // Mapped CDS string region.
+385       // The string region(s) is part of the java heap.
+386       if (reserved_rgn-&gt;flag() == mtJavaHeap) {
+387         assert(reserved_rgn-&gt;contain_region(base_addr, size), &quot;Reserved heap region should contain this mapping region&quot;);
+388         return true;
+389       }
+390 
+391       // Print some more details. Don&#39;t use UL here to avoid circularities.
+392 #ifdef ASSERT
+393       tty-&gt;print_cr(&quot;Error: existing region: [&quot; PTR_FORMAT &quot;-&quot; PTR_FORMAT &quot;), flag %u.\n&quot;
+394                     &quot;       new region: [&quot; PTR_FORMAT &quot;-&quot; PTR_FORMAT &quot;), flag %u.&quot;,
+395                     p2i(reserved_rgn-&gt;base()), p2i(reserved_rgn-&gt;end()), (unsigned)reserved_rgn-&gt;flag(),
+396                     p2i(base_addr), p2i(base_addr + size), (unsigned)flag);
+397 #endif
+398       ShouldNotReachHere();
+399       return false;
+400     }
+401   }
+402 }
+403 
+404 void VirtualMemoryTracker::set_reserved_region_type(address addr, MEMFLAGS flag) {
+405   assert(addr != NULL, &quot;Invalid address&quot;);
+406   assert(_reserved_regions != NULL, &quot;Sanity check&quot;);
+407 
+408   ReservedMemoryRegion   rgn(addr, 1);
+409   ReservedMemoryRegion*  reserved_rgn = _reserved_regions-&gt;find(rgn);
+410   if (reserved_rgn != NULL) {
+411     assert(reserved_rgn-&gt;contain_address(addr), &quot;Containment&quot;);
+412     if (reserved_rgn-&gt;flag() != flag) {
+413       assert(reserved_rgn-&gt;flag() == mtNone, &quot;Overwrite memory type (should be mtNone, is: \&quot;%s\&quot;)&quot;,
+414              NMTUtil::flag_to_name(reserved_rgn-&gt;flag()));
+415       reserved_rgn-&gt;set_flag(flag);
+416     }
+417   }
+418 }
+419 
+420 bool VirtualMemoryTracker::add_committed_region(address addr, size_t size,
+421   const NativeCallStack&amp; stack) {
+422   assert(addr != NULL, &quot;Invalid address&quot;);
+423   assert(size &gt; 0, &quot;Invalid size&quot;);
+424   assert(_reserved_regions != NULL, &quot;Sanity check&quot;);
+425 
+426   ReservedMemoryRegion  rgn(addr, size);
+427   ReservedMemoryRegion* reserved_rgn = _reserved_regions-&gt;find(rgn);
+428 
+429   assert(reserved_rgn != NULL, &quot;No reserved region&quot;);
+430   assert(reserved_rgn-&gt;contain_region(addr, size), &quot;Not completely contained&quot;);
+431   bool result = reserved_rgn-&gt;add_committed_region(addr, size, stack);
+432   return result;
+433 }
+434 
+435 bool VirtualMemoryTracker::remove_uncommitted_region(address addr, size_t size) {
+436   assert(addr != NULL, &quot;Invalid address&quot;);
+437   assert(size &gt; 0, &quot;Invalid size&quot;);
+438   assert(_reserved_regions != NULL, &quot;Sanity check&quot;);
+439 
+440   ReservedMemoryRegion  rgn(addr, size);
+441   ReservedMemoryRegion* reserved_rgn = _reserved_regions-&gt;find(rgn);
+442   assert(reserved_rgn != NULL, &quot;No reserved region&quot;);
+443   assert(reserved_rgn-&gt;contain_region(addr, size), &quot;Not completely contained&quot;);
+444   bool result = reserved_rgn-&gt;remove_uncommitted_region(addr, size);
+445   return result;
+446 }
+447 
+448 bool VirtualMemoryTracker::remove_released_region(ReservedMemoryRegion* rgn) {
+449   assert(rgn != NULL, &quot;Sanity check&quot;);
+450   assert(_reserved_regions != NULL, &quot;Sanity check&quot;);
+451 
+452   // uncommit regions within the released region
+453   if (!rgn-&gt;remove_uncommitted_region(rgn-&gt;base(), rgn-&gt;size())) {
+454     return false;
+455   }
+456 
+457   VirtualMemorySummary::record_released_memory(rgn-&gt;size(), rgn-&gt;flag());
+458   return _reserved_regions-&gt;remove(*rgn);
+459 }
+460 
+461 bool VirtualMemoryTracker::remove_released_region(address addr, size_t size) {
+462   assert(addr != NULL, &quot;Invalid address&quot;);
+463   assert(size &gt; 0, &quot;Invalid size&quot;);
+464   assert(_reserved_regions != NULL, &quot;Sanity check&quot;);
+465 
+466   ReservedMemoryRegion  rgn(addr, size);
+467   ReservedMemoryRegion* reserved_rgn = _reserved_regions-&gt;find(rgn);
+468 
+469   assert(reserved_rgn != NULL, &quot;No reserved region&quot;);
+470   if (reserved_rgn-&gt;same_region(addr, size)) {
+471     return remove_released_region(reserved_rgn);
+472   }
+473 
+474   // uncommit regions within the released region
+475   if (!reserved_rgn-&gt;remove_uncommitted_region(addr, size)) {
+476     return false;
+477   }
+478 
+479   if (reserved_rgn-&gt;flag() == mtClassShared &amp;&amp;
+480       reserved_rgn-&gt;contain_region(addr, size)) {
+481     // This is an unmapped CDS region, which is part of the reserved shared
+482     // memory region.
+483     // See special handling in VirtualMemoryTracker::add_reserved_region also.
+484     return true;
+485   }
+486 
+487   VirtualMemorySummary::record_released_memory(size, reserved_rgn-&gt;flag());
+488 
+489   assert(reserved_rgn-&gt;contain_region(addr, size), &quot;Not completely contained&quot;);
+490   if (reserved_rgn-&gt;base() == addr ||
+491       reserved_rgn-&gt;end() == addr + size) {
+492       reserved_rgn-&gt;exclude_region(addr, size);
+493     return true;
+494   } else {
+495     address top = reserved_rgn-&gt;end();
+496     address high_base = addr + size;
+497     ReservedMemoryRegion high_rgn(high_base, top - high_base,
+498       *reserved_rgn-&gt;call_stack(), reserved_rgn-&gt;flag());
+499 
+500     // use original region for lower region
+501     reserved_rgn-&gt;exclude_region(addr, top - addr);
+502     LinkedListNode&lt;ReservedMemoryRegion&gt;* new_rgn = _reserved_regions-&gt;add(high_rgn);
+503     if (new_rgn == NULL) {
+504       return false;
+505     } else {
+506       reserved_rgn-&gt;move_committed_regions(addr, *new_rgn-&gt;data());
+507       return true;
+508     }
+509   }
+510 }
+511 
+512 // Given an existing memory mapping registered with NMT, split the mapping in
+513 //  two. The newly created two mappings will be registered under the call
+514 //  stack and the memory flags of the original section.
+515 bool VirtualMemoryTracker::split_reserved_region(address addr, size_t size, size_t split) {
+516 
+517   ReservedMemoryRegion  rgn(addr, size);
+518   ReservedMemoryRegion* reserved_rgn = _reserved_regions-&gt;find(rgn);
+519   assert(reserved_rgn-&gt;same_region(addr, size), &quot;Must be identical region&quot;);
+520   assert(reserved_rgn != NULL, &quot;No reserved region&quot;);
+521   assert(reserved_rgn-&gt;committed_size() == 0, &quot;Splitting committed region?&quot;);
+522 
+523   NativeCallStack original_stack = *reserved_rgn-&gt;call_stack();
+524   MEMFLAGS original_flags = reserved_rgn-&gt;flag();
+525 
+526   remove_released_region(reserved_rgn);
+527 
+528   // Now, create two new regions.
+529   add_reserved_region(addr, split, original_stack, original_flags);
+530   add_reserved_region(addr + split, size - split, original_stack, original_flags);
+531 
+532   return true;
+533 }
+534 
+535 
+536 // Iterate the range, find committed region within its bound.
+537 class RegionIterator : public StackObj {
+538 private:
+539   const address _start;
+540   const size_t  _size;
+541 
+542   address _current_start;
+543   size_t  _current_size;
+544 public:
+545   RegionIterator(address start, size_t size) :
+546     _start(start), _size(size), _current_start(start), _current_size(size) {
+547   }
+548 
+549   // return true if committed region is found
+550   bool next_committed(address&amp; start, size_t&amp; size);
+551 private:
+552   address end() const { return _start + _size; }
+553 };
+554 
+555 bool RegionIterator::next_committed(address&amp; committed_start, size_t&amp; committed_size) {
+556   if (end() &lt;= _current_start) return false;
+557 
+558   const size_t page_sz = os::vm_page_size();
+559   assert(_current_start + _current_size == end(), &quot;Must be&quot;);
+560   if (os::committed_in_range(_current_start, _current_size, committed_start, committed_size)) {
+561     assert(committed_start != NULL, &quot;Must be&quot;);
+562     assert(committed_size &gt; 0 &amp;&amp; is_aligned(committed_size, os::vm_page_size()), &quot;Must be&quot;);
+563 
+564     size_t remaining_size = (_current_start + _current_size) - (committed_start + committed_size);
+565     _current_start = committed_start + committed_size;
+566     _current_size = remaining_size;
+567     return true;
+568   } else {
+569     return false;
+570   }
+571 }
+572 
+573 // Walk all known thread stacks, snapshot their committed ranges.
+574 class SnapshotThreadStackWalker : public VirtualMemoryWalker {
+575 public:
+576   SnapshotThreadStackWalker() {}
+577 
+578   bool do_allocation_site(const ReservedMemoryRegion* rgn) {
+579     if (rgn-&gt;flag() == mtThreadStack) {
+580       address stack_bottom = rgn-&gt;thread_stack_uncommitted_bottom();
+581       address committed_start;
+582       size_t  committed_size;
+583       size_t stack_size = rgn-&gt;base() + rgn-&gt;size() - stack_bottom;
+584       // Align the size to work with full pages (Alpine and AIX stack top is not page aligned)
+585       size_t aligned_stack_size = align_up(stack_size, os::vm_page_size());
+586 
+587       ReservedMemoryRegion* region = const_cast&lt;ReservedMemoryRegion*&gt;(rgn);
+588       NativeCallStack ncs; // empty stack
+589 
+590       RegionIterator itr(stack_bottom, aligned_stack_size);
+591       DEBUG_ONLY(bool found_stack = false;)
+592       while (itr.next_committed(committed_start, committed_size)) {
+593         assert(committed_start != NULL, &quot;Should not be null&quot;);
+594         assert(committed_size &gt; 0, &quot;Should not be 0&quot;);
+595         // unaligned stack_size case: correct the region to fit the actual stack_size
+596         if (stack_bottom + stack_size &lt; committed_start + committed_size) {
+597           committed_size = stack_bottom + stack_size - committed_start;
+598         }
+599         region-&gt;add_committed_region(committed_start, committed_size, ncs);
+600         DEBUG_ONLY(found_stack = true;)
+601       }
+602 #ifdef ASSERT
+603       if (!found_stack) {
+604         log_debug(thread)(&quot;Thread exited without proper cleanup, may leak thread object&quot;);
+605       }
+606 #endif
+607     }
+608     return true;
+609   }
+610 };
+611 
+612 void VirtualMemoryTracker::snapshot_thread_stacks() {
+613   SnapshotThreadStackWalker walker;
+614   walk_virtual_memory(&amp;walker);
+615 }
+616 
+617 bool VirtualMemoryTracker::walk_virtual_memory(VirtualMemoryWalker* walker) {
+618   assert(_reserved_regions != NULL, &quot;Sanity check&quot;);
+619   ThreadCritical tc;
+620   // Check that the _reserved_regions haven&#39;t been deleted.
+621   if (_reserved_regions != NULL) {
+622     LinkedListNode&lt;ReservedMemoryRegion&gt;* head = _reserved_regions-&gt;head();
+623     while (head != NULL) {
+624       const ReservedMemoryRegion* rgn = head-&gt;peek();
+625       if (!walker-&gt;do_allocation_site(rgn)) {
+626         return false;
+627       }
+628       head = head-&gt;next();
+629     }
+630    }
+631   return true;
+632 }
+633 
+634 // Transition virtual memory tracking level.
+635 bool VirtualMemoryTracker::transition(NMT_TrackingLevel from, NMT_TrackingLevel to) {
+636   assert (from != NMT_minimal, &quot;cannot convert from the lowest tracking level to anything&quot;);
+637   if (to == NMT_minimal) {
+638     assert(from == NMT_summary || from == NMT_detail, &quot;Just check&quot;);
+639     // Clean up virtual memory tracking data structures.
+640     ThreadCritical tc;
+641     // Check for potential race with other thread calling transition
+642     if (_reserved_regions != NULL) {
+643       delete _reserved_regions;
+644       _reserved_regions = NULL;
+645     }
+646   }
+647 
+648   return true;
+649 }
+650 
+651 // Metaspace Support
+652 MetaspaceSnapshot::MetaspaceSnapshot() {
+653   for (int index = (int)Metaspace::ClassType; index &lt; (int)Metaspace::MetadataTypeCount; index ++) {
+654     Metaspace::MetadataType type = (Metaspace::MetadataType)index;
+655     assert_valid_metadata_type(type);
+656     _reserved_in_bytes[type]  = 0;
+657     _committed_in_bytes[type] = 0;
+658     _used_in_bytes[type]      = 0;
+659     _free_in_bytes[type]      = 0;
+660   }
+661 }
+662 
+663 void MetaspaceSnapshot::snapshot(Metaspace::MetadataType type, MetaspaceSnapshot&amp; mss) {
+664   assert_valid_metadata_type(type);
+665 
+666   mss._reserved_in_bytes[type]   = MetaspaceUtils::reserved_bytes(type);
+667   mss._committed_in_bytes[type]  = MetaspaceUtils::committed_bytes(type);
+668   mss._used_in_bytes[type]       = MetaspaceUtils::used_bytes(type);
+669 
+670   size_t free_in_bytes = (MetaspaceUtils::capacity_bytes(type) - MetaspaceUtils::used_bytes(type))
+671                        + MetaspaceUtils::free_chunks_total_bytes(type)
+672                        + MetaspaceUtils::free_in_vs_bytes(type);
+673   mss._free_in_bytes[type] = free_in_bytes;
+674 }
+675 
+676 void MetaspaceSnapshot::snapshot(MetaspaceSnapshot&amp; mss) {
+677   snapshot(Metaspace::ClassType, mss);
+678   if (Metaspace::using_class_space()) {
+679     snapshot(Metaspace::NonClassType, mss);
+680   }
+681 }
+    </pre>
+  </body>
+</html>
