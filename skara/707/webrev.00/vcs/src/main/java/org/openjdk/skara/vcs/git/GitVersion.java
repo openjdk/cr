@@ -97,7 +97,7 @@ public class GitVersion {
             case 25:
                 return security >= 3;
 
-            case 21:
+//            case 21:
             case 23:
             case 24:
                 return security >= 2;

@@ -37,11 +37,6 @@ public class GitVersionTest {
 
     static Stream<Arguments> supportedVersions() {
         return Stream.of(
-            arguments("git version 2.17.4", 2, 17, 4),
-            arguments("git version 2.18.3", 2, 18, 3),
-            arguments("git version 2.19.4", 2, 19, 4),
-            arguments("git version 2.20.3", 2, 20, 3),
-            arguments("git version 2.21.2", 2, 21, 2),
             arguments("git version 2.22.3", 2, 22, 3),
             arguments("git version 2.23.2", 2, 23, 2),
             arguments("git version 2.24.2", 2, 24, 2),
@@ -67,6 +62,11 @@ public class GitVersionTest {
 
     static Stream<Arguments> unsupportedVersions() {
         return Stream.of(
+            arguments("git version 2.17.4", 2, 17, 4),
+            arguments("git version 2.18.3", 2, 18, 3),
+            arguments("git version 2.19.4", 2, 19, 4),
+            arguments("git version 2.20.3", 2, 20, 3),
+            arguments("git version 2.21.2", 2, 21, 2),
             arguments("git version 2.21.1 (Apple Git-122.3) ", 2, 21, 1) // doesn't contain security fix
         );
     }
