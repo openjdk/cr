@@ -1,0 +1,414 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Old src/hotspot/share/prims/resolvedMethodTable.cpp</title>
+    <link rel="stylesheet" href="../../../../style.css" />
+  </head>
+  <body>
+    <pre>
+  1 /*
+  2  * Copyright (c) 2017, 2019, Oracle and/or its affiliates. All rights reserved.
+  3  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  4  *
+  5  * This code is free software; you can redistribute it and/or modify it
+  6  * under the terms of the GNU General Public License version 2 only, as
+  7  * published by the Free Software Foundation.
+  8  *
+  9  * This code is distributed in the hope that it will be useful, but WITHOUT
+ 10  * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ 11  * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ 12  * version 2 for more details (a copy is included in the LICENSE file that
+ 13  * accompanied this code).
+ 14  *
+ 15  * You should have received a copy of the GNU General Public License version
+ 16  * 2 along with this work; if not, write to the Free Software Foundation,
+ 17  * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ 18  *
+ 19  * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ 20  * or visit www.oracle.com if you need additional information or have any
+ 21  * questions.
+ 22  *
+ 23  */
+ 24 
+ 25 #include &quot;precompiled.hpp&quot;
+ 26 #include &quot;classfile/javaClasses.hpp&quot;
+ 27 #include &quot;gc/shared/oopStorage.inline.hpp&quot;
+ 28 #include &quot;gc/shared/oopStorageSet.hpp&quot;
+ 29 #include &quot;logging/log.hpp&quot;
+ 30 #include &quot;memory/allocation.hpp&quot;
+ 31 #include &quot;memory/resourceArea.hpp&quot;
+ 32 #include &quot;memory/universe.hpp&quot;
+ 33 #include &quot;oops/access.inline.hpp&quot;
+ 34 #include &quot;oops/method.hpp&quot;
+ 35 #include &quot;oops/oop.inline.hpp&quot;
+ 36 #include &quot;oops/weakHandle.inline.hpp&quot;
+ 37 #include &quot;prims/resolvedMethodTable.hpp&quot;
+ 38 #include &quot;runtime/atomic.hpp&quot;
+ 39 #include &quot;runtime/handles.inline.hpp&quot;
+ 40 #include &quot;runtime/interfaceSupport.inline.hpp&quot;
+ 41 #include &quot;runtime/mutexLocker.hpp&quot;
+ 42 #include &quot;runtime/safepointVerifiers.hpp&quot;
+ 43 #include &quot;runtime/timerTrace.hpp&quot;
+ 44 #include &quot;utilities/concurrentHashTable.inline.hpp&quot;
+ 45 #include &quot;utilities/concurrentHashTableTasks.inline.hpp&quot;
+ 46 #include &quot;utilities/macros.hpp&quot;
+ 47 
+ 48 // 2^24 is max size
+ 49 static const size_t END_SIZE = 24;
+ 50 // If a chain gets to 32 something might be wrong
+ 51 static const size_t GROW_HINT = 32;
+ 52 
+ 53 static const size_t ResolvedMethodTableSizeLog = 10;
+ 54 
+ 55 unsigned int method_hash(const Method* method) {
+ 56   unsigned int name_hash = method-&gt;name()-&gt;identity_hash();
+ 57   unsigned int signature_hash = method-&gt;signature()-&gt;identity_hash();
+ 58   return name_hash ^ signature_hash;
+ 59 }
+ 60 
+ 61 typedef ConcurrentHashTable&lt;ResolvedMethodTableConfig,
+ 62                             mtClass&gt; ResolvedMethodTableHash;
+ 63 
+ 64 class ResolvedMethodTableConfig : public AllStatic {
+ 65  private:
+ 66  public:
+ 67   typedef WeakHandle Value;
+ 68 
+ 69   static uintx get_hash(Value const&amp; value, bool* is_dead) {
+ 70     oop val_oop = value.peek();
+ 71     if (val_oop == NULL) {
+ 72       *is_dead = true;
+ 73       return 0;
+ 74     }
+ 75     *is_dead = false;
+ 76     Method* method = java_lang_invoke_ResolvedMethodName::vmtarget(val_oop);
+ 77     return method_hash(method);
+ 78   }
+ 79 
+ 80   // We use default allocation/deallocation but counted
+ 81   static void* allocate_node(size_t size, Value const&amp; value) {
+ 82     ResolvedMethodTable::item_added();
+ 83     return AllocateHeap(size, mtClass);
+ 84   }
+ 85   static void free_node(void* memory, Value const&amp; value) {
+ 86     value.release(ResolvedMethodTable::_oop_storage);
+ 87     FreeHeap(memory);
+ 88     ResolvedMethodTable::item_removed();
+ 89   }
+ 90 };
+ 91 
+ 92 static ResolvedMethodTableHash* _local_table           = NULL;
+ 93 static size_t                   _current_size          = (size_t)1 &lt;&lt; ResolvedMethodTableSizeLog;
+ 94 
+ 95 volatile bool            ResolvedMethodTable::_has_work              = false;
+ 96 OopStorage*              ResolvedMethodTable::_oop_storage;
+ 97 
+ 98 volatile size_t          _items_count           = 0;
+ 99 
+100 void ResolvedMethodTable::create_table() {
+101   _local_table  = new ResolvedMethodTableHash(ResolvedMethodTableSizeLog, END_SIZE, GROW_HINT);
+102   log_trace(membername, table)(&quot;Start size: &quot; SIZE_FORMAT &quot; (&quot; SIZE_FORMAT &quot;)&quot;,
+103                                _current_size, ResolvedMethodTableSizeLog);
+104   _oop_storage = OopStorageSet::create_weak(&quot;ResolvedMethodTable Weak&quot;);
+105   _oop_storage-&gt;register_num_dead_callback(&amp;gc_notification);
+106 }
+107 
+108 size_t ResolvedMethodTable::table_size() {
+109   return (size_t)1 &lt;&lt; _local_table-&gt;get_size_log2(Thread::current());
+110 }
+111 
+112 class ResolvedMethodTableLookup : StackObj {
+113  private:
+114   Thread*       _thread;
+115   uintx         _hash;
+116   const Method* _method;
+117   Handle        _found;
+118 
+119  public:
+120   ResolvedMethodTableLookup(Thread* thread, uintx hash, const Method* key)
+121     : _thread(thread), _hash(hash), _method(key) {
+122   }
+123   uintx get_hash() const {
+124     return _hash;
+125   }
+126   bool equals(WeakHandle* value, bool* is_dead) {
+127     oop val_oop = value-&gt;peek();
+128     if (val_oop == NULL) {
+129       // dead oop, mark this hash dead for cleaning
+130       *is_dead = true;
+131       return false;
+132     }
+133     bool equals = _method == java_lang_invoke_ResolvedMethodName::vmtarget(val_oop);
+134     if (!equals) {
+135       return false;
+136     }
+137     // Need to resolve weak handle and Handleize through possible safepoint.
+138     _found = Handle(_thread, value-&gt;resolve());
+139     return true;
+140   }
+141 };
+142 
+143 
+144 class ResolvedMethodGet : public StackObj {
+145   Thread*       _thread;
+146   const Method* _method;
+147   Handle        _return;
+148 public:
+149   ResolvedMethodGet(Thread* thread, const Method* method) : _thread(thread), _method(method) {}
+150   void operator()(WeakHandle* val) {
+151     oop result = val-&gt;resolve();
+152     assert(result != NULL, &quot;Result should be reachable&quot;);
+153     _return = Handle(_thread, result);
+154     log_get();
+155   }
+156   oop get_res_oop() {
+157     return _return();
+158   }
+159   void log_get() {
+160     LogTarget(Trace, membername, table) log;
+161     if (log.is_enabled()) {
+162       ResourceMark rm;
+163       log.print(&quot;ResolvedMethod entry found for %s&quot;,
+164                 _method-&gt;name_and_sig_as_C_string());
+165     }
+166   }
+167 };
+168 
+169 oop ResolvedMethodTable::find_method(const Method* method) {
+170   Thread* thread = Thread::current();
+171 
+172   ResolvedMethodTableLookup lookup(thread, method_hash(method), method);
+173   ResolvedMethodGet rmg(thread, method);
+174   _local_table-&gt;get(thread, lookup, rmg);
+175 
+176   return rmg.get_res_oop();
+177 }
+178 
+179 static void log_insert(const Method* method) {
+180   LogTarget(Debug, membername, table) log;
+181   if (log.is_enabled()) {
+182     ResourceMark rm;
+183     log.print(&quot;ResolvedMethod entry added for %s&quot;,
+184               method-&gt;name_and_sig_as_C_string());
+185   }
+186 }
+187 
+188 oop ResolvedMethodTable::add_method(const Method* method, Handle rmethod_name) {
+189   Thread* thread = Thread::current();
+190 
+191   ResolvedMethodTableLookup lookup(thread, method_hash(method), method);
+192   ResolvedMethodGet rmg(thread, method);
+193 
+194   while (true) {
+195     if (_local_table-&gt;get(thread, lookup, rmg)) {
+196       return rmg.get_res_oop();
+197     }
+198     WeakHandle wh(_oop_storage, rmethod_name);
+199     // The hash table takes ownership of the WeakHandle, even if it&#39;s not inserted.
+200     if (_local_table-&gt;insert(thread, lookup, wh)) {
+201       log_insert(method);
+202       return wh.resolve();
+203     }
+204   }
+205 }
+206 
+207 void ResolvedMethodTable::item_added() {
+208   Atomic::inc(&amp;_items_count);
+209 }
+210 
+211 void ResolvedMethodTable::item_removed() {
+212   Atomic::dec(&amp;_items_count);
+213   log_trace(membername, table) (&quot;ResolvedMethod entry removed&quot;);
+214 }
+215 
+216 double ResolvedMethodTable::get_load_factor() {
+217   return double(_items_count)/double(_current_size);
+218 }
+219 
+220 double ResolvedMethodTable::get_dead_factor(size_t num_dead) {
+221   return double(num_dead)/double(_current_size);
+222 }
+223 
+224 static const double PREF_AVG_LIST_LEN = 2.0;
+225 // If we have as many dead items as 50% of the number of bucket
+226 static const double CLEAN_DEAD_HIGH_WATER_MARK = 0.5;
+227 
+228 void ResolvedMethodTable::gc_notification(size_t num_dead) {
+229   log_trace(membername, table)(&quot;Uncleaned items:&quot; SIZE_FORMAT, num_dead);
+230 
+231   if (has_work()) {
+232     return;
+233   }
+234 
+235   double load_factor = get_load_factor();
+236   double dead_factor = get_dead_factor(num_dead);
+237   // We should clean/resize if we have more dead than alive,
+238   // more items than preferred load factor or
+239   // more dead items than water mark.
+240   if ((dead_factor &gt; load_factor) ||
+241       (load_factor &gt; PREF_AVG_LIST_LEN) ||
+242       (dead_factor &gt; CLEAN_DEAD_HIGH_WATER_MARK)) {
+243     log_debug(membername, table)(&quot;Concurrent work triggered, live factor: %g dead factor: %g&quot;,
+244                                  load_factor, dead_factor);
+245     trigger_concurrent_work();
+246   }
+247 }
+248 
+249 void ResolvedMethodTable::trigger_concurrent_work() {
+250   MutexLocker ml(Service_lock, Mutex::_no_safepoint_check_flag);
+251   Atomic::store(&amp;_has_work, true);
+252   Service_lock-&gt;notify_all();
+253 }
+254 
+255 bool ResolvedMethodTable::has_work() {
+256   return Atomic::load_acquire(&amp;_has_work);
+257 }
+258 
+259 void ResolvedMethodTable::do_concurrent_work(JavaThread* jt) {
+260   double load_factor = get_load_factor();
+261   log_debug(membername, table)(&quot;Concurrent work, live factor: %g&quot;, load_factor);
+262   // We prefer growing, since that also removes dead items
+263   if (load_factor &gt; PREF_AVG_LIST_LEN &amp;&amp; !_local_table-&gt;is_max_size_reached()) {
+264     grow(jt);
+265   } else {
+266     clean_dead_entries(jt);
+267   }
+268   Atomic::release_store(&amp;_has_work, false);
+269 }
+270 
+271 void ResolvedMethodTable::grow(JavaThread* jt) {
+272   ResolvedMethodTableHash::GrowTask gt(_local_table);
+273   if (!gt.prepare(jt)) {
+274     return;
+275   }
+276   log_trace(membername, table)(&quot;Started to grow&quot;);
+277   {
+278     TraceTime timer(&quot;Grow&quot;, TRACETIME_LOG(Debug, membername, table, perf));
+279     while (gt.do_task(jt)) {
+280       gt.pause(jt);
+281       {
+282         ThreadBlockInVM tbivm(jt);
+283       }
+284       gt.cont(jt);
+285     }
+286   }
+287   gt.done(jt);
+288   _current_size = table_size();
+289   log_info(membername, table)(&quot;Grown to size:&quot; SIZE_FORMAT, _current_size);
+290 }
+291 
+292 struct ResolvedMethodTableDoDelete : StackObj {
+293   void operator()(WeakHandle* val) {
+294     /* do nothing */
+295   }
+296 };
+297 
+298 struct ResolvedMethodTableDeleteCheck : StackObj {
+299   long _count;
+300   long _item;
+301   ResolvedMethodTableDeleteCheck() : _count(0), _item(0) {}
+302   bool operator()(WeakHandle* val) {
+303     ++_item;
+304     oop tmp = val-&gt;peek();
+305     if (tmp == NULL) {
+306       ++_count;
+307       return true;
+308     } else {
+309       return false;
+310     }
+311   }
+312 };
+313 
+314 void ResolvedMethodTable::clean_dead_entries(JavaThread* jt) {
+315   ResolvedMethodTableHash::BulkDeleteTask bdt(_local_table);
+316   if (!bdt.prepare(jt)) {
+317     return;
+318   }
+319   ResolvedMethodTableDeleteCheck stdc;
+320   ResolvedMethodTableDoDelete stdd;
+321   {
+322     TraceTime timer(&quot;Clean&quot;, TRACETIME_LOG(Debug, membername, table, perf));
+323     while(bdt.do_task(jt, stdc, stdd)) {
+324       bdt.pause(jt);
+325       {
+326         ThreadBlockInVM tbivm(jt);
+327       }
+328       bdt.cont(jt);
+329     }
+330     bdt.done(jt);
+331   }
+332   log_info(membername, table)(&quot;Cleaned %ld of %ld&quot;, stdc._count, stdc._item);
+333 }
+334 
+335 #if INCLUDE_JVMTI
+336 class AdjustMethodEntries : public StackObj {
+337   bool* _trace_name_printed;
+338 public:
+339   AdjustMethodEntries(bool* trace_name_printed) : _trace_name_printed(trace_name_printed) {};
+340   bool operator()(WeakHandle* entry) {
+341     oop mem_name = entry-&gt;peek();
+342     if (mem_name == NULL) {
+343       // Removed
+344       return true;
+345     }
+346 
+347     Method* old_method = (Method*)java_lang_invoke_ResolvedMethodName::vmtarget(mem_name);
+348 
+349     if (old_method-&gt;is_old()) {
+350 
+351       Method* new_method = (old_method-&gt;is_deleted()) ?
+352                             Universe::throw_no_such_method_error() :
+353                             old_method-&gt;get_new_method();
+354       java_lang_invoke_ResolvedMethodName::set_vmtarget(mem_name, new_method);
+355 
+356       ResourceMark rm;
+357       if (!(*_trace_name_printed)) {
+358         log_info(redefine, class, update)(&quot;adjust: name=%s&quot;, old_method-&gt;method_holder()-&gt;external_name());
+359          *_trace_name_printed = true;
+360       }
+361       log_debug(redefine, class, update, constantpool)
+362         (&quot;ResolvedMethod method update: %s(%s)&quot;,
+363          new_method-&gt;name()-&gt;as_C_string(), new_method-&gt;signature()-&gt;as_C_string());
+364     }
+365 
+366     return true;
+367   }
+368 };
+369 
+370 // It is called at safepoint only for RedefineClasses
+371 void ResolvedMethodTable::adjust_method_entries(bool * trace_name_printed) {
+372   assert(SafepointSynchronize::is_at_safepoint(), &quot;only called at safepoint&quot;);
+373   // For each entry in RMT, change to new method
+374   AdjustMethodEntries adjust(trace_name_printed);
+375   _local_table-&gt;do_safepoint_scan(adjust);
+376 }
+377 #endif // INCLUDE_JVMTI
+378 
+379 // Verification
+380 class VerifyResolvedMethod : StackObj {
+381  public:
+382   bool operator()(WeakHandle* val) {
+383     oop obj = val-&gt;peek();
+384     if (obj != NULL) {
+385       Method* method = (Method*)java_lang_invoke_ResolvedMethodName::vmtarget(obj);
+386       guarantee(method-&gt;is_method(), &quot;Must be&quot;);
+387       guarantee(!method-&gt;is_old(), &quot;Must be&quot;);
+388     }
+389     return true;
+390   };
+391 };
+392 
+393 size_t ResolvedMethodTable::items_count() {
+394   return _items_count;
+395 }
+396 
+397 void ResolvedMethodTable::verify() {
+398   VerifyResolvedMethod vcs;
+399   if (!_local_table-&gt;try_scan(Thread::current(), vcs)) {
+400     log_info(membername, table)(&quot;verify unavailable at this moment&quot;);
+401   }
+402 }
+    </pre>
+  </body>
+</html>
