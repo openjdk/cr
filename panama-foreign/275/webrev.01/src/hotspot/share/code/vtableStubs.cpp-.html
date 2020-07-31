@@ -1,0 +1,345 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Old src/hotspot/share/code/vtableStubs.cpp</title>
+    <link rel="stylesheet" href="../../../../style.css" />
+  </head>
+  <body>
+    <pre>
+  1 /*
+  2  * Copyright (c) 1997, 2019, Oracle and/or its affiliates. All rights reserved.
+  3  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  4  *
+  5  * This code is free software; you can redistribute it and/or modify it
+  6  * under the terms of the GNU General Public License version 2 only, as
+  7  * published by the Free Software Foundation.
+  8  *
+  9  * This code is distributed in the hope that it will be useful, but WITHOUT
+ 10  * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ 11  * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ 12  * version 2 for more details (a copy is included in the LICENSE file that
+ 13  * accompanied this code).
+ 14  *
+ 15  * You should have received a copy of the GNU General Public License version
+ 16  * 2 along with this work; if not, write to the Free Software Foundation,
+ 17  * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ 18  *
+ 19  * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ 20  * or visit www.oracle.com if you need additional information or have any
+ 21  * questions.
+ 22  *
+ 23  */
+ 24 
+ 25 #include &quot;precompiled.hpp&quot;
+ 26 #include &quot;code/vtableStubs.hpp&quot;
+ 27 #include &quot;compiler/compileBroker.hpp&quot;
+ 28 #include &quot;compiler/disassembler.hpp&quot;
+ 29 #include &quot;logging/log.hpp&quot;
+ 30 #include &quot;memory/allocation.inline.hpp&quot;
+ 31 #include &quot;memory/resourceArea.hpp&quot;
+ 32 #include &quot;oops/instanceKlass.hpp&quot;
+ 33 #include &quot;oops/klassVtable.hpp&quot;
+ 34 #include &quot;oops/oop.inline.hpp&quot;
+ 35 #include &quot;prims/forte.hpp&quot;
+ 36 #include &quot;prims/jvmtiExport.hpp&quot;
+ 37 #include &quot;runtime/handles.inline.hpp&quot;
+ 38 #include &quot;runtime/mutexLocker.hpp&quot;
+ 39 #include &quot;runtime/sharedRuntime.hpp&quot;
+ 40 #include &quot;utilities/align.hpp&quot;
+ 41 #include &quot;utilities/powerOfTwo.hpp&quot;
+ 42 #ifdef COMPILER2
+ 43 #include &quot;opto/matcher.hpp&quot;
+ 44 #endif
+ 45 
+ 46 // -----------------------------------------------------------------------------------------
+ 47 // Implementation of VtableStub
+ 48 
+ 49 address VtableStub::_chunk             = NULL;
+ 50 address VtableStub::_chunk_end         = NULL;
+ 51 VMReg   VtableStub::_receiver_location = VMRegImpl::Bad();
+ 52 
+ 53 
+ 54 void* VtableStub::operator new(size_t size, int code_size) throw() {
+ 55   assert_lock_strong(VtableStubs_lock);
+ 56   assert(size == sizeof(VtableStub), &quot;mismatched size&quot;);
+ 57   // compute real VtableStub size (rounded to nearest word)
+ 58   const int real_size = align_up(code_size + (int)sizeof(VtableStub), wordSize);
+ 59   // malloc them in chunks to minimize header overhead
+ 60   const int chunk_factor = 32;
+ 61   if (_chunk == NULL || _chunk + real_size &gt; _chunk_end) {
+ 62     const int bytes = chunk_factor * real_size + pd_code_alignment();
+ 63 
+ 64    // There is a dependency on the name of the blob in src/share/vm/prims/jvmtiCodeBlobEvents.cpp
+ 65    // If changing the name, update the other file accordingly.
+ 66     VtableBlob* blob = VtableBlob::create(&quot;vtable chunks&quot;, bytes);
+ 67     if (blob == NULL) {
+ 68       return NULL;
+ 69     }
+ 70     _chunk = blob-&gt;content_begin();
+ 71     _chunk_end = _chunk + bytes;
+ 72     Forte::register_stub(&quot;vtable stub&quot;, _chunk, _chunk_end);
+ 73     align_chunk();
+ 74   }
+ 75   assert(_chunk + real_size &lt;= _chunk_end, &quot;bad allocation&quot;);
+ 76   void* res = _chunk;
+ 77   _chunk += real_size;
+ 78   align_chunk();
+ 79  return res;
+ 80 }
+ 81 
+ 82 
+ 83 void VtableStub::print_on(outputStream* st) const {
+ 84   st-&gt;print(&quot;vtable stub (index = %d, receiver_location = &quot; INTX_FORMAT &quot;, code = [&quot; INTPTR_FORMAT &quot;, &quot; INTPTR_FORMAT &quot;])&quot;,
+ 85              index(), p2i(receiver_location()), p2i(code_begin()), p2i(code_end()));
+ 86 }
+ 87 
+ 88 void VtableStub::print() const { print_on(tty); }
+ 89 
+ 90 // -----------------------------------------------------------------------------------------
+ 91 // Implementation of VtableStubs
+ 92 //
+ 93 // For each hash value there&#39;s a linked list of vtable stubs (with that
+ 94 // hash value). Each list is anchored in a little hash _table, indexed
+ 95 // by that hash value.
+ 96 
+ 97 VtableStub* VtableStubs::_table[VtableStubs::N];
+ 98 int VtableStubs::_number_of_vtable_stubs = 0;
+ 99 int VtableStubs::_vtab_stub_size = 0;
+100 int VtableStubs::_itab_stub_size = 0;
+101 
+102 #if defined(PRODUCT)
+103   // These values are good for the PRODUCT case (no tracing).
+104   static const int first_vtableStub_size =  64;
+105   static const int first_itableStub_size = 256;
+106 #else
+107   // These values are good for the non-PRODUCT case (when tracing can be switched on).
+108   // To find out, run test workload with
+109   //   -Xlog:vtablestubs=Trace -XX:+CountCompiledCalls -XX:+DebugVtables
+110   // and use the reported &quot;estimate&quot; value.
+111   // Here is a list of observed worst-case values:
+112   //               vtable  itable
+113   // aarch64:         460     324
+114   // arm:               ?       ?
+115   // ppc (linux, BE): 404     288
+116   // ppc (linux, LE): 356     276
+117   // ppc (AIX):       416     296
+118   // s390x:           408     256
+119   // Solaris-sparc:   792     348
+120   // x86 (Linux):     670     309
+121   // x86 (MacOS):     682     321
+122   static const int first_vtableStub_size = 1024;
+123   static const int first_itableStub_size =  512;
+124 #endif
+125 
+126 
+127 void VtableStubs::initialize() {
+128   VtableStub::_receiver_location = SharedRuntime::name_for_receiver();
+129   {
+130     MutexLocker ml(VtableStubs_lock, Mutex::_no_safepoint_check_flag);
+131     assert(_number_of_vtable_stubs == 0, &quot;potential performance bug: VtableStubs initialized more than once&quot;);
+132     assert(is_power_of_2(int(N)), &quot;N must be a power of 2&quot;);
+133     for (int i = 0; i &lt; N; i++) {
+134       _table[i] = NULL;
+135     }
+136   }
+137 }
+138 
+139 
+140 int VtableStubs::code_size_limit(bool is_vtable_stub) {
+141   if (is_vtable_stub) {
+142     return _vtab_stub_size &gt; 0 ? _vtab_stub_size : first_vtableStub_size;
+143   } else { // itable stub
+144     return _itab_stub_size &gt; 0 ? _itab_stub_size : first_itableStub_size;
+145   }
+146 }   // code_size_limit
+147 
+148 
+149 void VtableStubs::check_and_set_size_limit(bool is_vtable_stub,
+150                                            int  code_size,
+151                                            int  padding) {
+152   const char* name = is_vtable_stub ? &quot;vtable&quot; : &quot;itable&quot;;
+153 
+154   guarantee(code_size &lt;= code_size_limit(is_vtable_stub),
+155             &quot;buffer overflow in %s stub, code_size is %d, limit is %d&quot;, name, code_size, code_size_limit(is_vtable_stub));
+156 
+157   if (is_vtable_stub) {
+158     if (log_is_enabled(Trace, vtablestubs)) {
+159       if ( (_vtab_stub_size &gt; 0) &amp;&amp; ((code_size + padding) &gt; _vtab_stub_size) ) {
+160         log_trace(vtablestubs)(&quot;%s size estimate needed adjustment from %d to %d bytes&quot;,
+161                                name, _vtab_stub_size, code_size + padding);
+162       }
+163     }
+164     if ( (code_size + padding) &gt; _vtab_stub_size ) {
+165       _vtab_stub_size = code_size + padding;
+166     }
+167   } else {  // itable stub
+168     if (log_is_enabled(Trace, vtablestubs)) {
+169       if ( (_itab_stub_size &gt; 0) &amp;&amp; ((code_size + padding) &gt; _itab_stub_size) ) {
+170         log_trace(vtablestubs)(&quot;%s size estimate needed adjustment from %d to %d bytes&quot;,
+171                                name, _itab_stub_size, code_size + padding);
+172       }
+173     }
+174     if ( (code_size + padding) &gt; _itab_stub_size ) {
+175       _itab_stub_size = code_size + padding;
+176     }
+177   }
+178   return;
+179 }   // check_and_set_size_limit
+180 
+181 
+182 void VtableStubs::bookkeeping(MacroAssembler* masm, outputStream* out, VtableStub* s,
+183                               address npe_addr, address ame_addr,   bool is_vtable_stub,
+184                               int     index,    int     slop_bytes, int  index_dependent_slop) {
+185   const char* name        = is_vtable_stub ? &quot;vtable&quot; : &quot;itable&quot;;
+186   const int   stub_length = code_size_limit(is_vtable_stub);
+187 
+188   if (log_is_enabled(Trace, vtablestubs)) {
+189     log_trace(vtablestubs)(&quot;%s #%d at &quot; PTR_FORMAT &quot;: size: %d, estimate: %d, slop area: %d&quot;,
+190                            name, index, p2i(s-&gt;code_begin()),
+191                            (int)(masm-&gt;pc() - s-&gt;code_begin()),
+192                            stub_length,
+193                            (int)(s-&gt;code_end() - masm-&gt;pc()));
+194   }
+195   guarantee(masm-&gt;pc() &lt;= s-&gt;code_end(), &quot;%s #%d: overflowed buffer, estimated len: %d, actual len: %d, overrun: %d&quot;,
+196                                          name, index, stub_length,
+197                                          (int)(masm-&gt;pc() - s-&gt;code_begin()),
+198                                          (int)(masm-&gt;pc() - s-&gt;code_end()));
+199   assert((masm-&gt;pc() + index_dependent_slop) &lt;= s-&gt;code_end(), &quot;%s #%d: spare space for 32-bit offset: required = %d, available = %d&quot;,
+200                                          name, index, index_dependent_slop,
+201                                          (int)(s-&gt;code_end() - masm-&gt;pc()));
+202 
+203   // After the first vtable/itable stub is generated, we have a much
+204   // better estimate for the stub size. Remember/update this
+205   // estimate after some sanity checks.
+206   check_and_set_size_limit(is_vtable_stub, masm-&gt;offset(), slop_bytes);
+207   s-&gt;set_exception_points(npe_addr, ame_addr);
+208 }
+209 
+210 
+211 address VtableStubs::find_stub(bool is_vtable_stub, int vtable_index) {
+212   assert(vtable_index &gt;= 0, &quot;must be positive&quot;);
+213 
+214   VtableStub* s;
+215   {
+216     MutexLocker ml(VtableStubs_lock, Mutex::_no_safepoint_check_flag);
+217     s = lookup(is_vtable_stub, vtable_index);
+218     if (s == NULL) {
+219       if (is_vtable_stub) {
+220         s = create_vtable_stub(vtable_index);
+221       } else {
+222         s = create_itable_stub(vtable_index);
+223       }
+224 
+225       // Creation of vtable or itable can fail if there is not enough free space in the code cache.
+226       if (s == NULL) {
+227         return NULL;
+228       }
+229 
+230       enter(is_vtable_stub, vtable_index, s);
+231       if (PrintAdapterHandlers) {
+232         tty-&gt;print_cr(&quot;Decoding VtableStub %s[%d]@&quot; INTX_FORMAT,
+233                       is_vtable_stub? &quot;vtbl&quot;: &quot;itbl&quot;, vtable_index, p2i(VtableStub::receiver_location()));
+234         Disassembler::decode(s-&gt;code_begin(), s-&gt;code_end());
+235       }
+236       // Notify JVMTI about this stub. The event will be recorded by the enclosing
+237       // JvmtiDynamicCodeEventCollector and posted when this thread has released
+238       // all locks. Only post this event if a new state is not required. Creating a new state would
+239       // cause a safepoint and the caller of this code has a NoSafepointVerifier.
+240       if (JvmtiExport::should_post_dynamic_code_generated()) {
+241         JvmtiExport::post_dynamic_code_generated_while_holding_locks(is_vtable_stub? &quot;vtable stub&quot;: &quot;itable stub&quot;,
+242                                                                      s-&gt;code_begin(), s-&gt;code_end());
+243       }
+244     }
+245   }
+246   return s-&gt;entry_point();
+247 }
+248 
+249 
+250 inline uint VtableStubs::hash(bool is_vtable_stub, int vtable_index){
+251   // Assumption: receiver_location &lt; 4 in most cases.
+252   int hash = ((vtable_index &lt;&lt; 2) ^ VtableStub::receiver_location()-&gt;value()) + vtable_index;
+253   return (is_vtable_stub ? ~hash : hash)  &amp; mask;
+254 }
+255 
+256 
+257 VtableStub* VtableStubs::lookup(bool is_vtable_stub, int vtable_index) {
+258   assert_lock_strong(VtableStubs_lock);
+259   unsigned hash = VtableStubs::hash(is_vtable_stub, vtable_index);
+260   VtableStub* s = _table[hash];
+261   while( s &amp;&amp; !s-&gt;matches(is_vtable_stub, vtable_index)) s = s-&gt;next();
+262   return s;
+263 }
+264 
+265 
+266 void VtableStubs::enter(bool is_vtable_stub, int vtable_index, VtableStub* s) {
+267   assert_lock_strong(VtableStubs_lock);
+268   assert(s-&gt;matches(is_vtable_stub, vtable_index), &quot;bad vtable stub&quot;);
+269   unsigned int h = VtableStubs::hash(is_vtable_stub, vtable_index);
+270   // enter s at the beginning of the corresponding list
+271   s-&gt;set_next(_table[h]);
+272   _table[h] = s;
+273   _number_of_vtable_stubs++;
+274 }
+275 
+276 VtableStub* VtableStubs::entry_point(address pc) {
+277   MutexLocker ml(VtableStubs_lock, Mutex::_no_safepoint_check_flag);
+278   VtableStub* stub = (VtableStub*)(pc - VtableStub::entry_offset());
+279   uint hash = VtableStubs::hash(stub-&gt;is_vtable_stub(), stub-&gt;index());
+280   VtableStub* s;
+281   for (s = _table[hash]; s != NULL &amp;&amp; s != stub; s = s-&gt;next()) {}
+282   return (s == stub) ? s : NULL;
+283 }
+284 
+285 bool VtableStubs::contains(address pc) {
+286   // simple solution for now - we may want to use
+287   // a faster way if this function is called often
+288   return stub_containing(pc) != NULL;
+289 }
+290 
+291 
+292 VtableStub* VtableStubs::stub_containing(address pc) {
+293   // Note: No locking needed since any change to the data structure
+294   //       happens with an atomic store into it (we don&#39;t care about
+295   //       consistency with the _number_of_vtable_stubs counter).
+296   for (int i = 0; i &lt; N; i++) {
+297     for (VtableStub* s = _table[i]; s != NULL; s = s-&gt;next()) {
+298       if (s-&gt;contains(pc)) return s;
+299     }
+300   }
+301   return NULL;
+302 }
+303 
+304 void vtableStubs_init() {
+305   VtableStubs::initialize();
+306 }
+307 
+308 void VtableStubs::vtable_stub_do(void f(VtableStub*)) {
+309     for (int i = 0; i &lt; N; i++) {
+310         for (VtableStub* s = _table[i]; s != NULL; s = s-&gt;next()) {
+311             f(s);
+312         }
+313     }
+314 }
+315 
+316 
+317 //-----------------------------------------------------------------------------------------------------
+318 // Non-product code
+319 #ifndef PRODUCT
+320 
+321 extern &quot;C&quot; void bad_compiled_vtable_index(JavaThread* thread, oop receiver, int index) {
+322   ResourceMark rm;
+323   HandleMark hm;
+324   Klass* klass = receiver-&gt;klass();
+325   InstanceKlass* ik = InstanceKlass::cast(klass);
+326   klassVtable vt = ik-&gt;vtable();
+327   ik-&gt;print();
+328   fatal(&quot;bad compiled vtable dispatch: receiver &quot; INTPTR_FORMAT &quot;, &quot;
+329         &quot;index %d (vtable length %d)&quot;,
+330         p2i(receiver), index, vt.length());
+331 }
+332 
+333 #endif // PRODUCT
+    </pre>
+  </body>
+</html>
