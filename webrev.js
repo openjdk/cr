@@ -552,7 +552,7 @@ async function renderPatch(state) {
 
 		// Context before
 		while ((srcIndex < hunk.src.lines.length && hunk.src.lines[srcIndex].startsWith(" ")) &&
-		       (dstIndex < hunk.dst.lines.length && hunk.dst.lnies[dstIndex].startsWith(" "))) {
+		       (dstIndex < hunk.dst.lines.length && hunk.dst.lines[dstIndex].startsWith(" "))) {
 			pre.append(hunk.src.lines[srcIndex], "\n");
 			srcIndex++;
 			dstIndex++;
