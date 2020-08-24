@@ -1,0 +1,1506 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Frames src/hotspot/share/opto/lcm.cpp</title>
+    <link rel="stylesheet" href="../../../../style.css" />
+    <script type="text/javascript" src="../../../../navigation.js"></script>
+  </head>
+<body onkeypress="keypress(event);">
+<a name="0"></a>
+<hr />
+<pre>   1 /*
+   2  * Copyright (c) 1998, 2020, Oracle and/or its affiliates. All rights reserved.
+   3  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+   4  *
+   5  * This code is free software; you can redistribute it and/or modify it
+   6  * under the terms of the GNU General Public License version 2 only, as
+   7  * published by the Free Software Foundation.
+   8  *
+   9  * This code is distributed in the hope that it will be useful, but WITHOUT
+  10  * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+  11  * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+  12  * version 2 for more details (a copy is included in the LICENSE file that
+  13  * accompanied this code).
+  14  *
+  15  * You should have received a copy of the GNU General Public License version
+  16  * 2 along with this work; if not, write to the Free Software Foundation,
+  17  * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+  18  *
+  19  * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+  20  * or visit www.oracle.com if you need additional information or have any
+  21  * questions.
+  22  *
+  23  */
+  24 
+  25 #include &quot;precompiled.hpp&quot;
+  26 #include &quot;asm/macroAssembler.inline.hpp&quot;
+  27 #include &quot;memory/allocation.inline.hpp&quot;
+  28 #include &quot;oops/compressedOops.hpp&quot;
+  29 #include &quot;opto/ad.hpp&quot;
+  30 #include &quot;opto/block.hpp&quot;
+  31 #include &quot;opto/c2compiler.hpp&quot;
+  32 #include &quot;opto/callnode.hpp&quot;
+  33 #include &quot;opto/cfgnode.hpp&quot;
+  34 #include &quot;opto/machnode.hpp&quot;
+  35 #include &quot;opto/runtime.hpp&quot;
+  36 #include &quot;opto/chaitin.hpp&quot;
+  37 #include &quot;runtime/sharedRuntime.hpp&quot;
+  38 
+  39 // Optimization - Graph Style
+  40 
+  41 // Check whether val is not-null-decoded compressed oop,
+  42 // i.e. will grab into the base of the heap if it represents NULL.
+  43 static bool accesses_heap_base_zone(Node *val) {
+  44   if (CompressedOops::base() != NULL) { // Implies UseCompressedOops.
+  45     if (val &amp;&amp; val-&gt;is_Mach()) {
+  46       if (val-&gt;as_Mach()-&gt;ideal_Opcode() == Op_DecodeN) {
+  47         // This assumes all Decodes with TypePtr::NotNull are matched to nodes that
+  48         // decode NULL to point to the heap base (Decode_NN).
+  49         if (val-&gt;bottom_type()-&gt;is_oopptr()-&gt;ptr() == TypePtr::NotNull) {
+  50           return true;
+  51         }
+  52       }
+  53       // Must recognize load operation with Decode matched in memory operand.
+  54       // We should not reach here exept for PPC/AIX, as os::zero_page_read_protected()
+  55       // returns true everywhere else. On PPC, no such memory operands
+  56       // exist, therefore we did not yet implement a check for such operands.
+  57       NOT_AIX(Unimplemented());
+  58     }
+  59   }
+  60   return false;
+  61 }
+  62 
+  63 static bool needs_explicit_null_check_for_read(Node *val) {
+  64   // On some OSes (AIX) the page at address 0 is only write protected.
+  65   // If so, only Store operations will trap.
+  66   if (os::zero_page_read_protected()) {
+  67     return false;  // Implicit null check will work.
+  68   }
+  69   // Also a read accessing the base of a heap-based compressed heap will trap.
+  70   if (accesses_heap_base_zone(val) &amp;&amp;         // Hits the base zone page.
+  71       CompressedOops::use_implicit_null_checks()) { // Base zone page is protected.
+  72     return false;
+  73   }
+  74 
+  75   return true;
+  76 }
+  77 
+  78 //------------------------------implicit_null_check----------------------------
+  79 // Detect implicit-null-check opportunities.  Basically, find NULL checks
+  80 // with suitable memory ops nearby.  Use the memory op to do the NULL check.
+  81 // I can generate a memory op if there is not one nearby.
+  82 // The proj is the control projection for the not-null case.
+  83 // The val is the pointer being checked for nullness or
+  84 // decodeHeapOop_not_null node if it did not fold into address.
+  85 void PhaseCFG::implicit_null_check(Block* block, Node *proj, Node *val, int allowed_reasons) {
+  86   // Assume if null check need for 0 offset then always needed
+  87   // Intel solaris doesn&#39;t support any null checks yet and no
+  88   // mechanism exists (yet) to set the switches at an os_cpu level
+  89   if( !ImplicitNullChecks || MacroAssembler::needs_explicit_null_check(0)) return;
+  90 
+  91   // Make sure the ptr-is-null path appears to be uncommon!
+  92   float f = block-&gt;end()-&gt;as_MachIf()-&gt;_prob;
+  93   if( proj-&gt;Opcode() == Op_IfTrue ) f = 1.0f - f;
+  94   if( f &gt; PROB_UNLIKELY_MAG(4) ) return;
+  95 
+  96   uint bidx = 0;                // Capture index of value into memop
+  97   bool was_store;               // Memory op is a store op
+  98 
+  99   // Get the successor block for if the test ptr is non-null
+ 100   Block* not_null_block;  // this one goes with the proj
+ 101   Block* null_block;
+ 102   if (block-&gt;get_node(block-&gt;number_of_nodes()-1) == proj) {
+ 103     null_block     = block-&gt;_succs[0];
+ 104     not_null_block = block-&gt;_succs[1];
+ 105   } else {
+ 106     assert(block-&gt;get_node(block-&gt;number_of_nodes()-2) == proj, &quot;proj is one or the other&quot;);
+ 107     not_null_block = block-&gt;_succs[0];
+ 108     null_block     = block-&gt;_succs[1];
+ 109   }
+ 110   while (null_block-&gt;is_Empty() == Block::empty_with_goto) {
+ 111     null_block     = null_block-&gt;_succs[0];
+ 112   }
+ 113 
+ 114   // Search the exception block for an uncommon trap.
+ 115   // (See Parse::do_if and Parse::do_ifnull for the reason
+ 116   // we need an uncommon trap.  Briefly, we need a way to
+ 117   // detect failure of this optimization, as in 6366351.)
+ 118   {
+ 119     bool found_trap = false;
+ 120     for (uint i1 = 0; i1 &lt; null_block-&gt;number_of_nodes(); i1++) {
+ 121       Node* nn = null_block-&gt;get_node(i1);
+ 122       if (nn-&gt;is_MachCall() &amp;&amp;
+ 123           nn-&gt;as_MachCall()-&gt;entry_point() == SharedRuntime::uncommon_trap_blob()-&gt;entry_point()) {
+ 124         const Type* trtype = nn-&gt;in(TypeFunc::Parms)-&gt;bottom_type();
+ 125         if (trtype-&gt;isa_int() &amp;&amp; trtype-&gt;is_int()-&gt;is_con()) {
+ 126           jint tr_con = trtype-&gt;is_int()-&gt;get_con();
+ 127           Deoptimization::DeoptReason reason = Deoptimization::trap_request_reason(tr_con);
+ 128           Deoptimization::DeoptAction action = Deoptimization::trap_request_action(tr_con);
+ 129           assert((int)reason &lt; (int)BitsPerInt, &quot;recode bit map&quot;);
+ 130           if (is_set_nth_bit(allowed_reasons, (int) reason)
+ 131               &amp;&amp; action != Deoptimization::Action_none) {
+ 132             // This uncommon trap is sure to recompile, eventually.
+ 133             // When that happens, C-&gt;too_many_traps will prevent
+ 134             // this transformation from happening again.
+ 135             found_trap = true;
+ 136           }
+ 137         }
+ 138         break;
+ 139       }
+ 140     }
+ 141     if (!found_trap) {
+ 142       // We did not find an uncommon trap.
+ 143       return;
+ 144     }
+ 145   }
+ 146 
+ 147   // Check for decodeHeapOop_not_null node which did not fold into address
+ 148   bool is_decoden = ((intptr_t)val) &amp; 1;
+ 149   val = (Node*)(((intptr_t)val) &amp; ~1);
+ 150 
+ 151   assert(!is_decoden || (val-&gt;in(0) == NULL) &amp;&amp; val-&gt;is_Mach() &amp;&amp;
+ 152          (val-&gt;as_Mach()-&gt;ideal_Opcode() == Op_DecodeN), &quot;sanity&quot;);
+ 153 
+ 154   // Search the successor block for a load or store who&#39;s base value is also
+ 155   // the tested value.  There may be several.
+ 156   MachNode *best = NULL;        // Best found so far
+ 157   for (DUIterator i = val-&gt;outs(); val-&gt;has_out(i); i++) {
+ 158     Node *m = val-&gt;out(i);
+ 159     if( !m-&gt;is_Mach() ) continue;
+ 160     MachNode *mach = m-&gt;as_Mach();
+ 161     was_store = false;
+ 162     int iop = mach-&gt;ideal_Opcode();
+ 163     switch( iop ) {
+ 164     case Op_LoadB:
+ 165     case Op_LoadUB:
+ 166     case Op_LoadUS:
+ 167     case Op_LoadD:
+ 168     case Op_LoadF:
+ 169     case Op_LoadI:
+ 170     case Op_LoadL:
+ 171     case Op_LoadP:
+ 172     case Op_LoadN:
+ 173     case Op_LoadS:
+ 174     case Op_LoadKlass:
+ 175     case Op_LoadNKlass:
+ 176     case Op_LoadRange:
+ 177     case Op_LoadD_unaligned:
+ 178     case Op_LoadL_unaligned:
+ 179       assert(mach-&gt;in(2) == val, &quot;should be address&quot;);
+ 180       break;
+ 181     case Op_StoreB:
+ 182     case Op_StoreC:
+ 183     case Op_StoreCM:
+ 184     case Op_StoreD:
+ 185     case Op_StoreF:
+ 186     case Op_StoreI:
+ 187     case Op_StoreL:
+ 188     case Op_StoreP:
+ 189     case Op_StoreN:
+ 190     case Op_StoreNKlass:
+ 191       was_store = true;         // Memory op is a store op
+ 192       // Stores will have their address in slot 2 (memory in slot 1).
+ 193       // If the value being nul-checked is in another slot, it means we
+ 194       // are storing the checked value, which does NOT check the value!
+ 195       if( mach-&gt;in(2) != val ) continue;
+ 196       break;                    // Found a memory op?
+ 197     case Op_StrComp:
+ 198     case Op_StrEquals:
+ 199     case Op_StrIndexOf:
+ 200     case Op_StrIndexOfChar:
+ 201     case Op_AryEq:
+ 202     case Op_StrInflatedCopy:
+ 203     case Op_StrCompressedCopy:
+ 204     case Op_EncodeISOArray:
+ 205     case Op_HasNegatives:
+ 206       // Not a legit memory op for implicit null check regardless of
+ 207       // embedded loads
+ 208       continue;
+ 209     default:                    // Also check for embedded loads
+ 210       if( !mach-&gt;needs_anti_dependence_check() )
+ 211         continue;               // Not an memory op; skip it
+ 212       if( must_clone[iop] ) {
+ 213         // Do not move nodes which produce flags because
+ 214         // RA will try to clone it to place near branch and
+ 215         // it will cause recompilation, see clone_node().
+ 216         continue;
+ 217       }
+ 218       {
+ 219         // Check that value is used in memory address in
+ 220         // instructions with embedded load (CmpP val1,(val2+off)).
+ 221         Node* base;
+ 222         Node* index;
+ 223         const MachOper* oper = mach-&gt;memory_inputs(base, index);
+ 224         if (oper == NULL || oper == (MachOper*)-1) {
+ 225           continue;             // Not an memory op; skip it
+ 226         }
+ 227         if (val == base ||
+ 228             (val == index &amp;&amp; val-&gt;bottom_type()-&gt;isa_narrowoop())) {
+ 229           break;                // Found it
+ 230         } else {
+ 231           continue;             // Skip it
+ 232         }
+ 233       }
+ 234       break;
+ 235     }
+ 236 
+ 237     // On some OSes (AIX) the page at address 0 is only write protected.
+ 238     // If so, only Store operations will trap.
+ 239     // But a read accessing the base of a heap-based compressed heap will trap.
+ 240     if (!was_store &amp;&amp; needs_explicit_null_check_for_read(val)) {
+ 241       continue;
+ 242     }
+ 243 
+ 244     // Check that node&#39;s control edge is not-null block&#39;s head or dominates it,
+ 245     // otherwise we can&#39;t hoist it because there are other control dependencies.
+ 246     Node* ctrl = mach-&gt;in(0);
+ 247     if (ctrl != NULL &amp;&amp; !(ctrl == not_null_block-&gt;head() ||
+ 248         get_block_for_node(ctrl)-&gt;dominates(not_null_block))) {
+ 249       continue;
+ 250     }
+ 251 
+ 252     // check if the offset is not too high for implicit exception
+ 253     {
+ 254       intptr_t offset = 0;
+ 255       const TypePtr *adr_type = NULL;  // Do not need this return value here
+ 256       const Node* base = mach-&gt;get_base_and_disp(offset, adr_type);
+ 257       if (base == NULL || base == NodeSentinel) {
+ 258         // Narrow oop address doesn&#39;t have base, only index.
+ 259         // Give up if offset is beyond page size or if heap base is not protected.
+ 260         if (val-&gt;bottom_type()-&gt;isa_narrowoop() &amp;&amp;
+ 261             (MacroAssembler::needs_explicit_null_check(offset) ||
+ 262              !CompressedOops::use_implicit_null_checks()))
+ 263           continue;
+ 264         // cannot reason about it; is probably not implicit null exception
+ 265       } else {
+ 266         const TypePtr* tptr;
+ 267         if ((UseCompressedOops || UseCompressedClassPointers) &amp;&amp;
+ 268             (CompressedOops::shift() == 0 || CompressedKlassPointers::shift() == 0)) {
+ 269           // 32-bits narrow oop can be the base of address expressions
+ 270           tptr = base-&gt;get_ptr_type();
+ 271         } else {
+ 272           // only regular oops are expected here
+ 273           tptr = base-&gt;bottom_type()-&gt;is_ptr();
+ 274         }
+ 275         // Give up if offset is not a compile-time constant.
+ 276         if (offset == Type::OffsetBot || tptr-&gt;_offset == Type::OffsetBot)
+ 277           continue;
+ 278         offset += tptr-&gt;_offset; // correct if base is offseted
+ 279         // Give up if reference is beyond page size.
+ 280         if (MacroAssembler::needs_explicit_null_check(offset))
+ 281           continue;
+ 282         // Give up if base is a decode node and the heap base is not protected.
+ 283         if (base-&gt;is_Mach() &amp;&amp; base-&gt;as_Mach()-&gt;ideal_Opcode() == Op_DecodeN &amp;&amp;
+ 284             !CompressedOops::use_implicit_null_checks())
+ 285           continue;
+ 286       }
+ 287     }
+ 288 
+ 289     // Check ctrl input to see if the null-check dominates the memory op
+ 290     Block *cb = get_block_for_node(mach);
+ 291     cb = cb-&gt;_idom;             // Always hoist at least 1 block
+ 292     if( !was_store ) {          // Stores can be hoisted only one block
+ 293       while( cb-&gt;_dom_depth &gt; (block-&gt;_dom_depth + 1))
+ 294         cb = cb-&gt;_idom;         // Hoist loads as far as we want
+ 295       // The non-null-block should dominate the memory op, too. Live
+ 296       // range spilling will insert a spill in the non-null-block if it is
+ 297       // needs to spill the memory op for an implicit null check.
+ 298       if (cb-&gt;_dom_depth == (block-&gt;_dom_depth + 1)) {
+ 299         if (cb != not_null_block) continue;
+ 300         cb = cb-&gt;_idom;
+ 301       }
+ 302     }
+ 303     if( cb != block ) continue;
+ 304 
+ 305     // Found a memory user; see if it can be hoisted to check-block
+ 306     uint vidx = 0;              // Capture index of value into memop
+ 307     uint j;
+ 308     for( j = mach-&gt;req()-1; j &gt; 0; j-- ) {
+ 309       if( mach-&gt;in(j) == val ) {
+ 310         vidx = j;
+ 311         // Ignore DecodeN val which could be hoisted to where needed.
+ 312         if( is_decoden ) continue;
+ 313       }
+ 314       // Block of memory-op input
+ 315       Block *inb = get_block_for_node(mach-&gt;in(j));
+ 316       Block *b = block;          // Start from nul check
+ 317       while( b != inb &amp;&amp; b-&gt;_dom_depth &gt; inb-&gt;_dom_depth )
+ 318         b = b-&gt;_idom;           // search upwards for input
+ 319       // See if input dominates null check
+ 320       if( b != inb )
+ 321         break;
+ 322     }
+ 323     if( j &gt; 0 )
+ 324       continue;
+ 325     Block *mb = get_block_for_node(mach);
+ 326     // Hoisting stores requires more checks for the anti-dependence case.
+ 327     // Give up hoisting if we have to move the store past any load.
+ 328     if( was_store ) {
+ 329       Block *b = mb;            // Start searching here for a local load
+ 330       // mach use (faulting) trying to hoist
+ 331       // n might be blocker to hoisting
+ 332       while( b != block ) {
+ 333         uint k;
+ 334         for( k = 1; k &lt; b-&gt;number_of_nodes(); k++ ) {
+ 335           Node *n = b-&gt;get_node(k);
+ 336           if( n-&gt;needs_anti_dependence_check() &amp;&amp;
+ 337               n-&gt;in(LoadNode::Memory) == mach-&gt;in(StoreNode::Memory) )
+ 338             break;              // Found anti-dependent load
+ 339         }
+ 340         if( k &lt; b-&gt;number_of_nodes() )
+ 341           break;                // Found anti-dependent load
+ 342         // Make sure control does not do a merge (would have to check allpaths)
+ 343         if( b-&gt;num_preds() != 2 ) break;
+ 344         b = get_block_for_node(b-&gt;pred(1)); // Move up to predecessor block
+ 345       }
+ 346       if( b != block ) continue;
+ 347     }
+ 348 
+ 349     // Make sure this memory op is not already being used for a NullCheck
+ 350     Node *e = mb-&gt;end();
+ 351     if( e-&gt;is_MachNullCheck() &amp;&amp; e-&gt;in(1) == mach )
+ 352       continue;                 // Already being used as a NULL check
+ 353 
+ 354     // Found a candidate!  Pick one with least dom depth - the highest
+ 355     // in the dom tree should be closest to the null check.
+ 356     if (best == NULL || get_block_for_node(mach)-&gt;_dom_depth &lt; get_block_for_node(best)-&gt;_dom_depth) {
+ 357       best = mach;
+ 358       bidx = vidx;
+ 359     }
+ 360   }
+ 361   // No candidate!
+ 362   if (best == NULL) {
+ 363     return;
+ 364   }
+ 365 
+ 366   // ---- Found an implicit null check
+ 367 #ifndef PRODUCT
+ 368   extern int implicit_null_checks;
+ 369   implicit_null_checks++;
+ 370 #endif
+ 371 
+ 372   if( is_decoden ) {
+ 373     // Check if we need to hoist decodeHeapOop_not_null first.
+ 374     Block *valb = get_block_for_node(val);
+ 375     if( block != valb &amp;&amp; block-&gt;_dom_depth &lt; valb-&gt;_dom_depth ) {
+ 376       // Hoist it up to the end of the test block.
+ 377       valb-&gt;find_remove(val);
+ 378       block-&gt;add_inst(val);
+ 379       map_node_to_block(val, block);
+ 380       // DecodeN on x86 may kill flags. Check for flag-killing projections
+ 381       // that also need to be hoisted.
+ 382       for (DUIterator_Fast jmax, j = val-&gt;fast_outs(jmax); j &lt; jmax; j++) {
+ 383         Node* n = val-&gt;fast_out(j);
+ 384         if( n-&gt;is_MachProj() ) {
+ 385           get_block_for_node(n)-&gt;find_remove(n);
+ 386           block-&gt;add_inst(n);
+ 387           map_node_to_block(n, block);
+ 388         }
+ 389       }
+ 390     }
+ 391   }
+ 392   // Hoist the memory candidate up to the end of the test block.
+ 393   Block *old_block = get_block_for_node(best);
+ 394   old_block-&gt;find_remove(best);
+ 395   block-&gt;add_inst(best);
+ 396   map_node_to_block(best, block);
+ 397 
+ 398   // Move the control dependence if it is pinned to not-null block.
+ 399   // Don&#39;t change it in other cases: NULL or dominating control.
+ 400   if (best-&gt;in(0) == not_null_block-&gt;head()) {
+ 401     // Set it to control edge of null check.
+ 402     best-&gt;set_req(0, proj-&gt;in(0)-&gt;in(0));
+ 403   }
+ 404 
+ 405   // Check for flag-killing projections that also need to be hoisted
+ 406   // Should be DU safe because no edge updates.
+ 407   for (DUIterator_Fast jmax, j = best-&gt;fast_outs(jmax); j &lt; jmax; j++) {
+ 408     Node* n = best-&gt;fast_out(j);
+ 409     if( n-&gt;is_MachProj() ) {
+ 410       get_block_for_node(n)-&gt;find_remove(n);
+ 411       block-&gt;add_inst(n);
+ 412       map_node_to_block(n, block);
+ 413     }
+ 414   }
+ 415 
+ 416   // proj==Op_True --&gt; ne test; proj==Op_False --&gt; eq test.
+ 417   // One of two graph shapes got matched:
+ 418   //   (IfTrue  (If (Bool NE (CmpP ptr NULL))))
+ 419   //   (IfFalse (If (Bool EQ (CmpP ptr NULL))))
+ 420   // NULL checks are always branch-if-eq.  If we see a IfTrue projection
+ 421   // then we are replacing a &#39;ne&#39; test with a &#39;eq&#39; NULL check test.
+ 422   // We need to flip the projections to keep the same semantics.
+ 423   if( proj-&gt;Opcode() == Op_IfTrue ) {
+ 424     // Swap order of projections in basic block to swap branch targets
+ 425     Node *tmp1 = block-&gt;get_node(block-&gt;end_idx()+1);
+ 426     Node *tmp2 = block-&gt;get_node(block-&gt;end_idx()+2);
+ 427     block-&gt;map_node(tmp2, block-&gt;end_idx()+1);
+ 428     block-&gt;map_node(tmp1, block-&gt;end_idx()+2);
+ 429     Node *tmp = new Node(C-&gt;top()); // Use not NULL input
+ 430     tmp1-&gt;replace_by(tmp);
+ 431     tmp2-&gt;replace_by(tmp1);
+ 432     tmp-&gt;replace_by(tmp2);
+ 433     tmp-&gt;destruct();
+ 434   }
+ 435 
+ 436   // Remove the existing null check; use a new implicit null check instead.
+ 437   // Since schedule-local needs precise def-use info, we need to correct
+ 438   // it as well.
+ 439   Node *old_tst = proj-&gt;in(0);
+ 440   MachNode *nul_chk = new MachNullCheckNode(old_tst-&gt;in(0),best,bidx);
+ 441   block-&gt;map_node(nul_chk, block-&gt;end_idx());
+ 442   map_node_to_block(nul_chk, block);
+ 443   // Redirect users of old_test to nul_chk
+ 444   for (DUIterator_Last i2min, i2 = old_tst-&gt;last_outs(i2min); i2 &gt;= i2min; --i2)
+ 445     old_tst-&gt;last_out(i2)-&gt;set_req(0, nul_chk);
+ 446   // Clean-up any dead code
+ 447   for (uint i3 = 0; i3 &lt; old_tst-&gt;req(); i3++) {
+ 448     Node* in = old_tst-&gt;in(i3);
+ 449     old_tst-&gt;set_req(i3, NULL);
+ 450     if (in-&gt;outcnt() == 0) {
+ 451       // Remove dead input node
+ 452       in-&gt;disconnect_inputs(NULL, C);
+ 453       block-&gt;find_remove(in);
+ 454     }
+ 455   }
+ 456 
+ 457   latency_from_uses(nul_chk);
+ 458   latency_from_uses(best);
+ 459 
+ 460   // insert anti-dependences to defs in this block
+ 461   if (! best-&gt;needs_anti_dependence_check()) {
+ 462     for (uint k = 1; k &lt; block-&gt;number_of_nodes(); k++) {
+ 463       Node *n = block-&gt;get_node(k);
+ 464       if (n-&gt;needs_anti_dependence_check() &amp;&amp;
+ 465           n-&gt;in(LoadNode::Memory) == best-&gt;in(StoreNode::Memory)) {
+ 466         // Found anti-dependent load
+ 467         insert_anti_dependences(block, n);
+ 468       }
+ 469     }
+ 470   }
+ 471 }
+ 472 
+ 473 
+ 474 //------------------------------select-----------------------------------------
+ 475 // Select a nice fellow from the worklist to schedule next. If there is only
+ 476 // one choice, then use it. Projections take top priority for correctness
+ 477 // reasons - if I see a projection, then it is next.  There are a number of
+ 478 // other special cases, for instructions that consume condition codes, et al.
+ 479 // These are chosen immediately. Some instructions are required to immediately
+ 480 // precede the last instruction in the block, and these are taken last. Of the
+ 481 // remaining cases (most), choose the instruction with the greatest latency
+ 482 // (that is, the most number of pseudo-cycles required to the end of the
+ 483 // routine). If there is a tie, choose the instruction with the most inputs.
+ 484 Node* PhaseCFG::select(
+ 485   Block* block,
+ 486   Node_List &amp;worklist,
+ 487   GrowableArray&lt;int&gt; &amp;ready_cnt,
+ 488   VectorSet &amp;next_call,
+ 489   uint sched_slot,
+ 490   intptr_t* recalc_pressure_nodes) {
+ 491 
+ 492   // If only a single entry on the stack, use it
+ 493   uint cnt = worklist.size();
+ 494   if (cnt == 1) {
+ 495     Node *n = worklist[0];
+ 496     worklist.map(0,worklist.pop());
+ 497     return n;
+ 498   }
+ 499 
+ 500   uint choice  = 0; // Bigger is most important
+ 501   uint latency = 0; // Bigger is scheduled first
+ 502   uint score   = 0; // Bigger is better
+ 503   int idx = -1;     // Index in worklist
+ 504   int cand_cnt = 0; // Candidate count
+ 505   bool block_size_threshold_ok = (block-&gt;number_of_nodes() &gt; 10) ? true : false;
+ 506 
+ 507   for( uint i=0; i&lt;cnt; i++ ) { // Inspect entire worklist
+ 508     // Order in worklist is used to break ties.
+ 509     // See caller for how this is used to delay scheduling
+ 510     // of induction variable increments to after the other
+ 511     // uses of the phi are scheduled.
+ 512     Node *n = worklist[i];      // Get Node on worklist
+ 513 
+ 514     int iop = n-&gt;is_Mach() ? n-&gt;as_Mach()-&gt;ideal_Opcode() : 0;
+ 515     if( n-&gt;is_Proj() ||         // Projections always win
+ 516         n-&gt;Opcode()== Op_Con || // So does constant &#39;Top&#39;
+ 517         iop == Op_CreateEx ||   // Create-exception must start block
+ 518         iop == Op_CheckCastPP
+ 519         ) {
+ 520       worklist.map(i,worklist.pop());
+ 521       return n;
+ 522     }
+ 523 
+ 524     // Final call in a block must be adjacent to &#39;catch&#39;
+ 525     Node *e = block-&gt;end();
+ 526     if( e-&gt;is_Catch() &amp;&amp; e-&gt;in(0)-&gt;in(0) == n )
+ 527       continue;
+ 528 
+ 529     // Memory op for an implicit null check has to be at the end of the block
+ 530     if( e-&gt;is_MachNullCheck() &amp;&amp; e-&gt;in(1) == n )
+ 531       continue;
+ 532 
+ 533     // Schedule IV increment last.
+ 534     if (e-&gt;is_Mach() &amp;&amp; e-&gt;as_Mach()-&gt;ideal_Opcode() == Op_CountedLoopEnd) {
+ 535       // Cmp might be matched into CountedLoopEnd node.
+ 536       Node *cmp = (e-&gt;in(1)-&gt;ideal_reg() == Op_RegFlags) ? e-&gt;in(1) : e;
+ 537       if (cmp-&gt;req() &gt; 1 &amp;&amp; cmp-&gt;in(1) == n &amp;&amp; n-&gt;is_iteratively_computed()) {
+ 538         continue;
+ 539       }
+ 540     }
+ 541 
+ 542     uint n_choice  = 2;
+ 543 
+ 544     // See if this instruction is consumed by a branch. If so, then (as the
+ 545     // branch is the last instruction in the basic block) force it to the
+ 546     // end of the basic block
+ 547     if ( must_clone[iop] ) {
+ 548       // See if any use is a branch
+ 549       bool found_machif = false;
+ 550 
+ 551       for (DUIterator_Fast jmax, j = n-&gt;fast_outs(jmax); j &lt; jmax; j++) {
+ 552         Node* use = n-&gt;fast_out(j);
+ 553 
+ 554         // The use is a conditional branch, make them adjacent
+ 555         if (use-&gt;is_MachIf() &amp;&amp; get_block_for_node(use) == block) {
+ 556           found_machif = true;
+ 557           break;
+ 558         }
+ 559 
+ 560         // More than this instruction pending for successor to be ready,
+ 561         // don&#39;t choose this if other opportunities are ready
+ 562         if (ready_cnt.at(use-&gt;_idx) &gt; 1)
+ 563           n_choice = 1;
+ 564       }
+ 565 
+ 566       // loop terminated, prefer not to use this instruction
+ 567       if (found_machif)
+ 568         continue;
+ 569     }
+ 570 
+ 571     // See if this has a predecessor that is &quot;must_clone&quot;, i.e. sets the
+ 572     // condition code. If so, choose this first
+ 573     for (uint j = 0; j &lt; n-&gt;req() ; j++) {
+ 574       Node *inn = n-&gt;in(j);
+ 575       if (inn) {
+ 576         if (inn-&gt;is_Mach() &amp;&amp; must_clone[inn-&gt;as_Mach()-&gt;ideal_Opcode()] ) {
+ 577           n_choice = 3;
+ 578           break;
+ 579         }
+ 580       }
+ 581     }
+ 582 
+ 583     // MachTemps should be scheduled last so they are near their uses
+ 584     if (n-&gt;is_MachTemp()) {
+ 585       n_choice = 1;
+ 586     }
+ 587 
+ 588     uint n_latency = get_latency_for_node(n);
+ 589     uint n_score = n-&gt;req();   // Many inputs get high score to break ties
+ 590 
+ 591     if (OptoRegScheduling &amp;&amp; block_size_threshold_ok) {
+ 592       if (recalc_pressure_nodes[n-&gt;_idx] == 0x7fff7fff) {
+ 593         _regalloc-&gt;_scratch_int_pressure.init(_regalloc-&gt;_sched_int_pressure.high_pressure_limit());
+ 594         _regalloc-&gt;_scratch_float_pressure.init(_regalloc-&gt;_sched_float_pressure.high_pressure_limit());
+ 595         // simulate the notion that we just picked this node to schedule
+ 596         n-&gt;add_flag(Node::Flag_is_scheduled);
+ 597         // now caculate its effect upon the graph if we did
+ 598         adjust_register_pressure(n, block, recalc_pressure_nodes, false);
+ 599         // return its state for finalize in case somebody else wins
+ 600         n-&gt;remove_flag(Node::Flag_is_scheduled);
+ 601         // now save the two final pressure components of register pressure, limiting pressure calcs to short size
+ 602         short int_pressure = (short)_regalloc-&gt;_scratch_int_pressure.current_pressure();
+ 603         short float_pressure = (short)_regalloc-&gt;_scratch_float_pressure.current_pressure();
+ 604         recalc_pressure_nodes[n-&gt;_idx] = int_pressure;
+ 605         recalc_pressure_nodes[n-&gt;_idx] |= (float_pressure &lt;&lt; 16);
+ 606       }
+ 607 
+ 608       if (_scheduling_for_pressure) {
+ 609         latency = n_latency;
+ 610         if (n_choice != 3) {
+ 611           // Now evaluate each register pressure component based on threshold in the score.
+ 612           // In general the defining register type will dominate the score, ergo we will not see register pressure grow on both banks
+ 613           // on a single instruction, but we might see it shrink on both banks.
+ 614           // For each use of register that has a register class that is over the high pressure limit, we build n_score up for
+ 615           // live ranges that terminate on this instruction.
+ 616           if (_regalloc-&gt;_sched_int_pressure.current_pressure() &gt; _regalloc-&gt;_sched_int_pressure.high_pressure_limit()) {
+ 617             short int_pressure = (short)recalc_pressure_nodes[n-&gt;_idx];
+ 618             n_score = (int_pressure &lt; 0) ? ((score + n_score) - int_pressure) : (int_pressure &gt; 0) ? 1 : n_score;
+ 619           }
+ 620           if (_regalloc-&gt;_sched_float_pressure.current_pressure() &gt; _regalloc-&gt;_sched_float_pressure.high_pressure_limit()) {
+ 621             short float_pressure = (short)(recalc_pressure_nodes[n-&gt;_idx] &gt;&gt; 16);
+ 622             n_score = (float_pressure &lt; 0) ? ((score + n_score) - float_pressure) : (float_pressure &gt; 0) ? 1 : n_score;
+ 623           }
+ 624         } else {
+ 625           // make sure we choose these candidates
+ 626           score = 0;
+ 627         }
+ 628       }
+ 629     }
+ 630 
+ 631     // Keep best latency found
+ 632     cand_cnt++;
+ 633     if (choice &lt; n_choice ||
+ 634         (choice == n_choice &amp;&amp;
+ 635          ((StressLCM &amp;&amp; Compile::randomized_select(cand_cnt)) ||
+ 636           (!StressLCM &amp;&amp;
+ 637            (latency &lt; n_latency ||
+ 638             (latency == n_latency &amp;&amp;
+ 639              (score &lt; n_score))))))) {
+ 640       choice  = n_choice;
+ 641       latency = n_latency;
+ 642       score   = n_score;
+ 643       idx     = i;               // Also keep index in worklist
+ 644     }
+ 645   } // End of for all ready nodes in worklist
+ 646 
+ 647   guarantee(idx &gt;= 0, &quot;index should be set&quot;);
+ 648   Node *n = worklist[(uint)idx];      // Get the winner
+ 649 
+ 650   worklist.map((uint)idx, worklist.pop());     // Compress worklist
+ 651   return n;
+ 652 }
+ 653 
+ 654 //-------------------------adjust_register_pressure----------------------------
+ 655 void PhaseCFG::adjust_register_pressure(Node* n, Block* block, intptr_t* recalc_pressure_nodes, bool finalize_mode) {
+ 656   PhaseLive* liveinfo = _regalloc-&gt;get_live();
+ 657   IndexSet* liveout = liveinfo-&gt;live(block);
+ 658   // first adjust the register pressure for the sources
+ 659   for (uint i = 1; i &lt; n-&gt;req(); i++) {
+ 660     bool lrg_ends = false;
+ 661     Node *src_n = n-&gt;in(i);
+ 662     if (src_n == NULL) continue;
+ 663     if (!src_n-&gt;is_Mach()) continue;
+ 664     uint src = _regalloc-&gt;_lrg_map.find(src_n);
+ 665     if (src == 0) continue;
+ 666     LRG&amp; lrg_src = _regalloc-&gt;lrgs(src);
+ 667     // detect if the live range ends or not
+ 668     if (liveout-&gt;member(src) == false) {
+ 669       lrg_ends = true;
+ 670       for (DUIterator_Fast jmax, j = src_n-&gt;fast_outs(jmax); j &lt; jmax; j++) {
+ 671         Node* m = src_n-&gt;fast_out(j); // Get user
+ 672         if (m == n) continue;
+ 673         if (!m-&gt;is_Mach()) continue;
+ 674         MachNode *mach = m-&gt;as_Mach();
+ 675         bool src_matches = false;
+ 676         int iop = mach-&gt;ideal_Opcode();
+ 677 
+ 678         switch (iop) {
+ 679         case Op_StoreB:
+ 680         case Op_StoreC:
+ 681         case Op_StoreCM:
+ 682         case Op_StoreD:
+ 683         case Op_StoreF:
+ 684         case Op_StoreI:
+ 685         case Op_StoreL:
+ 686         case Op_StoreP:
+ 687         case Op_StoreN:
+ 688         case Op_StoreVector:
+ 689         case Op_StoreNKlass:
+ 690           for (uint k = 1; k &lt; m-&gt;req(); k++) {
+ 691             Node *in = m-&gt;in(k);
+ 692             if (in == src_n) {
+ 693               src_matches = true;
+ 694               break;
+ 695             }
+ 696           }
+ 697           break;
+ 698 
+ 699         default:
+ 700           src_matches = true;
+ 701           break;
+ 702         }
+ 703 
+ 704         // If we have a store as our use, ignore the non source operands
+ 705         if (src_matches == false) continue;
+ 706 
+ 707         // Mark every unscheduled use which is not n with a recalculation
+ 708         if ((get_block_for_node(m) == block) &amp;&amp; (!m-&gt;is_scheduled())) {
+ 709           if (finalize_mode &amp;&amp; !m-&gt;is_Phi()) {
+ 710             recalc_pressure_nodes[m-&gt;_idx] = 0x7fff7fff;
+ 711           }
+ 712           lrg_ends = false;
+ 713         }
+ 714       }
+ 715     }
+ 716     // if none, this live range ends and we can adjust register pressure
+ 717     if (lrg_ends) {
+ 718       if (finalize_mode) {
+ 719         _regalloc-&gt;lower_pressure(block, 0, lrg_src, NULL, _regalloc-&gt;_sched_int_pressure, _regalloc-&gt;_sched_float_pressure);
+ 720       } else {
+ 721         _regalloc-&gt;lower_pressure(block, 0, lrg_src, NULL, _regalloc-&gt;_scratch_int_pressure, _regalloc-&gt;_scratch_float_pressure);
+ 722       }
+ 723     }
+ 724   }
+ 725 
+ 726   // now add the register pressure from the dest and evaluate which heuristic we should use:
+ 727   // 1.) The default, latency scheduling
+ 728   // 2.) Register pressure scheduling based on the high pressure limit threshold for int or float register stacks
+ 729   uint dst = _regalloc-&gt;_lrg_map.find(n);
+ 730   if (dst != 0) {
+ 731     LRG&amp; lrg_dst = _regalloc-&gt;lrgs(dst);
+ 732     if (finalize_mode) {
+ 733       _regalloc-&gt;raise_pressure(block, lrg_dst, _regalloc-&gt;_sched_int_pressure, _regalloc-&gt;_sched_float_pressure);
+ 734       // check to see if we fall over the register pressure cliff here
+ 735       if (_regalloc-&gt;_sched_int_pressure.current_pressure() &gt; _regalloc-&gt;_sched_int_pressure.high_pressure_limit()) {
+ 736         _scheduling_for_pressure = true;
+ 737       } else if (_regalloc-&gt;_sched_float_pressure.current_pressure() &gt; _regalloc-&gt;_sched_float_pressure.high_pressure_limit()) {
+ 738         _scheduling_for_pressure = true;
+ 739       } else {
+ 740         // restore latency scheduling mode
+ 741         _scheduling_for_pressure = false;
+ 742       }
+ 743     } else {
+ 744       _regalloc-&gt;raise_pressure(block, lrg_dst, _regalloc-&gt;_scratch_int_pressure, _regalloc-&gt;_scratch_float_pressure);
+ 745     }
+ 746   }
+ 747 }
+ 748 
+ 749 //------------------------------set_next_call----------------------------------
+ 750 void PhaseCFG::set_next_call(Block* block, Node* n, VectorSet&amp; next_call) {
+ 751   if( next_call.test_set(n-&gt;_idx) ) return;
+ 752   for( uint i=0; i&lt;n-&gt;len(); i++ ) {
+ 753     Node *m = n-&gt;in(i);
+ 754     if( !m ) continue;  // must see all nodes in block that precede call
+ 755     if (get_block_for_node(m) == block) {
+ 756       set_next_call(block, m, next_call);
+ 757     }
+ 758   }
+ 759 }
+ 760 
+ 761 //------------------------------needed_for_next_call---------------------------
+ 762 // Set the flag &#39;next_call&#39; for each Node that is needed for the next call to
+ 763 // be scheduled.  This flag lets me bias scheduling so Nodes needed for the
+ 764 // next subroutine call get priority - basically it moves things NOT needed
+ 765 // for the next call till after the call.  This prevents me from trying to
+ 766 // carry lots of stuff live across a call.
+ 767 void PhaseCFG::needed_for_next_call(Block* block, Node* this_call, VectorSet&amp; next_call) {
+ 768   // Find the next control-defining Node in this block
+ 769   Node* call = NULL;
+ 770   for (DUIterator_Fast imax, i = this_call-&gt;fast_outs(imax); i &lt; imax; i++) {
+ 771     Node* m = this_call-&gt;fast_out(i);
+ 772     if (get_block_for_node(m) == block &amp;&amp; // Local-block user
+ 773         m != this_call &amp;&amp;       // Not self-start node
+ 774         m-&gt;is_MachCall()) {
+ 775       call = m;
+ 776       break;
+ 777     }
+ 778   }
+ 779   if (call == NULL)  return;    // No next call (e.g., block end is near)
+ 780   // Set next-call for all inputs to this call
+ 781   set_next_call(block, call, next_call);
+ 782 }
+ 783 
+ 784 //------------------------------add_call_kills-------------------------------------
+ 785 // helper function that adds caller save registers to MachProjNode
+ 786 static void add_call_kills(MachProjNode *proj, RegMask&amp; regs, const char* save_policy, bool exclude_soe) {
+ 787   // Fill in the kill mask for the call
+ 788   for( OptoReg::Name r = OptoReg::Name(0); r &lt; _last_Mach_Reg; r=OptoReg::add(r,1) ) {
+ 789     if( !regs.Member(r) ) {     // Not already defined by the call
+ 790       // Save-on-call register?
+ 791       if ((save_policy[r] == &#39;C&#39;) ||
+ 792           (save_policy[r] == &#39;A&#39;) ||
+ 793           ((save_policy[r] == &#39;E&#39;) &amp;&amp; exclude_soe)) {
+ 794         proj-&gt;_rout.Insert(r);
+ 795       }
+ 796     }
+ 797   }
+ 798 }
+ 799 
+ 800 
+ 801 //------------------------------sched_call-------------------------------------
+ 802 uint PhaseCFG::sched_call(Block* block, uint node_cnt, Node_List&amp; worklist, GrowableArray&lt;int&gt;&amp; ready_cnt, MachCallNode* mcall, VectorSet&amp; next_call) {
+ 803   RegMask regs;
+ 804 
+ 805   // Schedule all the users of the call right now.  All the users are
+ 806   // projection Nodes, so they must be scheduled next to the call.
+ 807   // Collect all the defined registers.
+ 808   for (DUIterator_Fast imax, i = mcall-&gt;fast_outs(imax); i &lt; imax; i++) {
+ 809     Node* n = mcall-&gt;fast_out(i);
+ 810     assert( n-&gt;is_MachProj(), &quot;&quot; );
+ 811     int n_cnt = ready_cnt.at(n-&gt;_idx)-1;
+ 812     ready_cnt.at_put(n-&gt;_idx, n_cnt);
+ 813     assert( n_cnt == 0, &quot;&quot; );
+ 814     // Schedule next to call
+ 815     block-&gt;map_node(n, node_cnt++);
+ 816     // Collect defined registers
+ 817     regs.OR(n-&gt;out_RegMask());
+ 818     // Check for scheduling the next control-definer
+ 819     if( n-&gt;bottom_type() == Type::CONTROL )
+ 820       // Warm up next pile of heuristic bits
+ 821       needed_for_next_call(block, n, next_call);
+ 822 
+ 823     // Children of projections are now all ready
+ 824     for (DUIterator_Fast jmax, j = n-&gt;fast_outs(jmax); j &lt; jmax; j++) {
+ 825       Node* m = n-&gt;fast_out(j); // Get user
+ 826       if(get_block_for_node(m) != block) {
+ 827         continue;
+ 828       }
+ 829       if( m-&gt;is_Phi() ) continue;
+ 830       int m_cnt = ready_cnt.at(m-&gt;_idx) - 1;
+ 831       ready_cnt.at_put(m-&gt;_idx, m_cnt);
+ 832       if( m_cnt == 0 )
+ 833         worklist.push(m);
+ 834     }
+ 835 
+ 836   }
+ 837 
+ 838   // Act as if the call defines the Frame Pointer.
+ 839   // Certainly the FP is alive and well after the call.
+ 840   regs.Insert(_matcher.c_frame_pointer());
+ 841 
+ 842   // Set all registers killed and not already defined by the call.
+ 843   uint r_cnt = mcall-&gt;tf()-&gt;range()-&gt;cnt();
+ 844   int op = mcall-&gt;ideal_Opcode();
+ 845   MachProjNode *proj = new MachProjNode( mcall, r_cnt+1, RegMask::Empty, MachProjNode::fat_proj );
+ 846   map_node_to_block(proj, block);
+ 847   block-&gt;insert_node(proj, node_cnt++);
+ 848 
+ 849   // Select the right register save policy.
+ 850   const char *save_policy = NULL;
+ 851   switch (op) {
+ 852     case Op_CallRuntime:
+ 853     case Op_CallLeaf:
+ 854     case Op_CallLeafNoFP:
+ 855       // Calling C code so use C calling convention
+ 856       save_policy = _matcher._c_reg_save_policy;
+ 857       break;
+ 858 
+ 859     case Op_CallStaticJava:
+ 860     case Op_CallDynamicJava:
+ 861       // Calling Java code so use Java calling convention
+ 862       save_policy = _matcher._register_save_policy;
+ 863       break;
+ 864     case Op_CallNative:
+ 865       // FIXME compute actual save policy based on nep-&gt;abi
+ 866       save_policy = _matcher._c_reg_save_policy;
+ 867       break;
+ 868 
+ 869     default:
+ 870       ShouldNotReachHere();
+ 871   }
+ 872 
+ 873   // When using CallRuntime mark SOE registers as killed by the call
+ 874   // so values that could show up in the RegisterMap aren&#39;t live in a
+ 875   // callee saved register since the register wouldn&#39;t know where to
+ 876   // find them.  CallLeaf and CallLeafNoFP are ok because they can&#39;t
+ 877   // have debug info on them.  Strictly speaking this only needs to be
+ 878   // done for oops since idealreg2debugmask takes care of debug info
+ 879   // references but there no way to handle oops differently than other
+ 880   // pointers as far as the kill mask goes.
+<a name="1" id="anc1"></a><span class="line-modified"> 881   bool exclude_soe = op == Op_CallRuntime;</span>
+
+
+
+
+
+
+
+ 882 
+ 883   // If the call is a MethodHandle invoke, we need to exclude the
+ 884   // register which is used to save the SP value over MH invokes from
+ 885   // the mask.  Otherwise this register could be used for
+ 886   // deoptimization information.
+ 887   if (op == Op_CallStaticJava) {
+ 888     MachCallStaticJavaNode* mcallstaticjava = (MachCallStaticJavaNode*) mcall;
+ 889     if (mcallstaticjava-&gt;_method_handle_invoke)
+ 890       proj-&gt;_rout.OR(Matcher::method_handle_invoke_SP_save_mask());
+ 891   }
+ 892 
+ 893   add_call_kills(proj, regs, save_policy, exclude_soe);
+ 894 
+ 895   return node_cnt;
+ 896 }
+ 897 
+ 898 
+ 899 //------------------------------schedule_local---------------------------------
+ 900 // Topological sort within a block.  Someday become a real scheduler.
+ 901 bool PhaseCFG::schedule_local(Block* block, GrowableArray&lt;int&gt;&amp; ready_cnt, VectorSet&amp; next_call, intptr_t *recalc_pressure_nodes) {
+ 902   // Already &quot;sorted&quot; are the block start Node (as the first entry), and
+ 903   // the block-ending Node and any trailing control projections.  We leave
+ 904   // these alone.  PhiNodes and ParmNodes are made to follow the block start
+ 905   // Node.  Everything else gets topo-sorted.
+ 906 
+ 907 #ifndef PRODUCT
+ 908     if (trace_opto_pipelining()) {
+ 909       tty-&gt;print_cr(&quot;# --- schedule_local B%d, before: ---&quot;, block-&gt;_pre_order);
+ 910       for (uint i = 0;i &lt; block-&gt;number_of_nodes(); i++) {
+ 911         tty-&gt;print(&quot;# &quot;);
+ 912         block-&gt;get_node(i)-&gt;fast_dump();
+ 913       }
+ 914       tty-&gt;print_cr(&quot;#&quot;);
+ 915     }
+ 916 #endif
+ 917 
+ 918   // RootNode is already sorted
+ 919   if (block-&gt;number_of_nodes() == 1) {
+ 920     return true;
+ 921   }
+ 922 
+ 923   bool block_size_threshold_ok = (block-&gt;number_of_nodes() &gt; 10) ? true : false;
+ 924 
+ 925   // We track the uses of local definitions as input dependences so that
+ 926   // we know when a given instruction is avialable to be scheduled.
+ 927   uint i;
+ 928   if (OptoRegScheduling &amp;&amp; block_size_threshold_ok) {
+ 929     for (i = 1; i &lt; block-&gt;number_of_nodes(); i++) { // setup nodes for pressure calc
+ 930       Node *n = block-&gt;get_node(i);
+ 931       n-&gt;remove_flag(Node::Flag_is_scheduled);
+ 932       if (!n-&gt;is_Phi()) {
+ 933         recalc_pressure_nodes[n-&gt;_idx] = 0x7fff7fff;
+ 934       }
+ 935     }
+ 936   }
+ 937 
+ 938   // Move PhiNodes and ParmNodes from 1 to cnt up to the start
+ 939   uint node_cnt = block-&gt;end_idx();
+ 940   uint phi_cnt = 1;
+ 941   for( i = 1; i&lt;node_cnt; i++ ) { // Scan for Phi
+ 942     Node *n = block-&gt;get_node(i);
+ 943     if( n-&gt;is_Phi() ||          // Found a PhiNode or ParmNode
+ 944         (n-&gt;is_Proj()  &amp;&amp; n-&gt;in(0) == block-&gt;head()) ) {
+ 945       // Move guy at &#39;phi_cnt&#39; to the end; makes a hole at phi_cnt
+ 946       block-&gt;map_node(block-&gt;get_node(phi_cnt), i);
+ 947       block-&gt;map_node(n, phi_cnt++);  // swap Phi/Parm up front
+ 948       if (OptoRegScheduling &amp;&amp; block_size_threshold_ok) {
+ 949         // mark n as scheduled
+ 950         n-&gt;add_flag(Node::Flag_is_scheduled);
+ 951       }
+ 952     } else {                    // All others
+ 953       // Count block-local inputs to &#39;n&#39;
+ 954       uint cnt = n-&gt;len();      // Input count
+ 955       uint local = 0;
+ 956       for( uint j=0; j&lt;cnt; j++ ) {
+ 957         Node *m = n-&gt;in(j);
+ 958         if( m &amp;&amp; get_block_for_node(m) == block &amp;&amp; !m-&gt;is_top() )
+ 959           local++;              // One more block-local input
+ 960       }
+ 961       ready_cnt.at_put(n-&gt;_idx, local); // Count em up
+ 962 
+ 963 #ifdef ASSERT
+ 964       if (UseG1GC) {
+ 965         if( n-&gt;is_Mach() &amp;&amp; n-&gt;as_Mach()-&gt;ideal_Opcode() == Op_StoreCM ) {
+ 966           // Check the precedence edges
+ 967           for (uint prec = n-&gt;req(); prec &lt; n-&gt;len(); prec++) {
+ 968             Node* oop_store = n-&gt;in(prec);
+ 969             if (oop_store != NULL) {
+ 970               assert(get_block_for_node(oop_store)-&gt;_dom_depth &lt;= block-&gt;_dom_depth, &quot;oop_store must dominate card-mark&quot;);
+ 971             }
+ 972           }
+ 973         }
+ 974       }
+ 975 #endif
+ 976 
+ 977       // A few node types require changing a required edge to a precedence edge
+ 978       // before allocation.
+ 979       if( n-&gt;is_Mach() &amp;&amp; n-&gt;req() &gt; TypeFunc::Parms &amp;&amp;
+ 980           (n-&gt;as_Mach()-&gt;ideal_Opcode() == Op_MemBarAcquire ||
+ 981            n-&gt;as_Mach()-&gt;ideal_Opcode() == Op_MemBarVolatile) ) {
+ 982         // MemBarAcquire could be created without Precedent edge.
+ 983         // del_req() replaces the specified edge with the last input edge
+ 984         // and then removes the last edge. If the specified edge &gt; number of
+ 985         // edges the last edge will be moved outside of the input edges array
+ 986         // and the edge will be lost. This is why this code should be
+ 987         // executed only when Precedent (== TypeFunc::Parms) edge is present.
+ 988         Node *x = n-&gt;in(TypeFunc::Parms);
+ 989         if (x != NULL &amp;&amp; get_block_for_node(x) == block &amp;&amp; n-&gt;find_prec_edge(x) != -1) {
+ 990           // Old edge to node within same block will get removed, but no precedence
+ 991           // edge will get added because it already exists. Update ready count.
+ 992           int cnt = ready_cnt.at(n-&gt;_idx);
+ 993           assert(cnt &gt; 1, &quot;MemBar node %d must not get ready here&quot;, n-&gt;_idx);
+ 994           ready_cnt.at_put(n-&gt;_idx, cnt-1);
+ 995         }
+ 996         n-&gt;del_req(TypeFunc::Parms);
+ 997         n-&gt;add_prec(x);
+ 998       }
+ 999     }
+1000   }
+1001   for(uint i2=i; i2&lt; block-&gt;number_of_nodes(); i2++ ) // Trailing guys get zapped count
+1002     ready_cnt.at_put(block-&gt;get_node(i2)-&gt;_idx, 0);
+1003 
+1004   // All the prescheduled guys do not hold back internal nodes
+1005   uint i3;
+1006   for (i3 = 0; i3 &lt; phi_cnt; i3++) {  // For all pre-scheduled
+1007     Node *n = block-&gt;get_node(i3);       // Get pre-scheduled
+1008     for (DUIterator_Fast jmax, j = n-&gt;fast_outs(jmax); j &lt; jmax; j++) {
+1009       Node* m = n-&gt;fast_out(j);
+1010       if (get_block_for_node(m) == block) { // Local-block user
+1011         int m_cnt = ready_cnt.at(m-&gt;_idx)-1;
+1012         if (OptoRegScheduling &amp;&amp; block_size_threshold_ok) {
+1013           // mark m as scheduled
+1014           if (m_cnt &lt; 0) {
+1015             m-&gt;add_flag(Node::Flag_is_scheduled);
+1016           }
+1017         }
+1018         ready_cnt.at_put(m-&gt;_idx, m_cnt);   // Fix ready count
+1019       }
+1020     }
+1021   }
+1022 
+1023   Node_List delay;
+1024   // Make a worklist
+1025   Node_List worklist;
+1026   for(uint i4=i3; i4&lt;node_cnt; i4++ ) {    // Put ready guys on worklist
+1027     Node *m = block-&gt;get_node(i4);
+1028     if( !ready_cnt.at(m-&gt;_idx) ) {   // Zero ready count?
+1029       if (m-&gt;is_iteratively_computed()) {
+1030         // Push induction variable increments last to allow other uses
+1031         // of the phi to be scheduled first. The select() method breaks
+1032         // ties in scheduling by worklist order.
+1033         delay.push(m);
+1034       } else if (m-&gt;is_Mach() &amp;&amp; m-&gt;as_Mach()-&gt;ideal_Opcode() == Op_CreateEx) {
+1035         // Force the CreateEx to the top of the list so it&#39;s processed
+1036         // first and ends up at the start of the block.
+1037         worklist.insert(0, m);
+1038       } else {
+1039         worklist.push(m);         // Then on to worklist!
+1040       }
+1041     }
+1042   }
+1043   while (delay.size()) {
+1044     Node* d = delay.pop();
+1045     worklist.push(d);
+1046   }
+1047 
+1048   if (OptoRegScheduling &amp;&amp; block_size_threshold_ok) {
+1049     // To stage register pressure calculations we need to examine the live set variables
+1050     // breaking them up by register class to compartmentalize the calculations.
+1051     uint float_pressure = Matcher::float_pressure(FLOATPRESSURE);
+1052     _regalloc-&gt;_sched_int_pressure.init(INTPRESSURE);
+1053     _regalloc-&gt;_sched_float_pressure.init(float_pressure);
+1054     _regalloc-&gt;_scratch_int_pressure.init(INTPRESSURE);
+1055     _regalloc-&gt;_scratch_float_pressure.init(float_pressure);
+1056 
+1057     _regalloc-&gt;compute_entry_block_pressure(block);
+1058   }
+1059 
+1060   // Warm up the &#39;next_call&#39; heuristic bits
+1061   needed_for_next_call(block, block-&gt;head(), next_call);
+1062 
+1063 #ifndef PRODUCT
+1064     if (trace_opto_pipelining()) {
+1065       for (uint j=0; j&lt; block-&gt;number_of_nodes(); j++) {
+1066         Node     *n = block-&gt;get_node(j);
+1067         int     idx = n-&gt;_idx;
+1068         tty-&gt;print(&quot;#   ready cnt:%3d  &quot;, ready_cnt.at(idx));
+1069         tty-&gt;print(&quot;latency:%3d  &quot;, get_latency_for_node(n));
+1070         tty-&gt;print(&quot;%4d: %s\n&quot;, idx, n-&gt;Name());
+1071       }
+1072     }
+1073 #endif
+1074 
+1075   uint max_idx = (uint)ready_cnt.length();
+1076   // Pull from worklist and schedule
+1077   while( worklist.size() ) {    // Worklist is not ready
+1078 
+1079 #ifndef PRODUCT
+1080     if (trace_opto_pipelining()) {
+1081       tty-&gt;print(&quot;#   ready list:&quot;);
+1082       for( uint i=0; i&lt;worklist.size(); i++ ) { // Inspect entire worklist
+1083         Node *n = worklist[i];      // Get Node on worklist
+1084         tty-&gt;print(&quot; %d&quot;, n-&gt;_idx);
+1085       }
+1086       tty-&gt;cr();
+1087     }
+1088 #endif
+1089 
+1090     // Select and pop a ready guy from worklist
+1091     Node* n = select(block, worklist, ready_cnt, next_call, phi_cnt, recalc_pressure_nodes);
+1092     block-&gt;map_node(n, phi_cnt++);    // Schedule him next
+1093 
+1094     if (OptoRegScheduling &amp;&amp; block_size_threshold_ok) {
+1095       n-&gt;add_flag(Node::Flag_is_scheduled);
+1096 
+1097       // Now adjust the resister pressure with the node we selected
+1098       if (!n-&gt;is_Phi()) {
+1099         adjust_register_pressure(n, block, recalc_pressure_nodes, true);
+1100       }
+1101     }
+1102 
+1103 #ifndef PRODUCT
+1104     if (trace_opto_pipelining()) {
+1105       tty-&gt;print(&quot;#    select %d: %s&quot;, n-&gt;_idx, n-&gt;Name());
+1106       tty-&gt;print(&quot;, latency:%d&quot;, get_latency_for_node(n));
+1107       n-&gt;dump();
+1108       if (Verbose) {
+1109         tty-&gt;print(&quot;#   ready list:&quot;);
+1110         for( uint i=0; i&lt;worklist.size(); i++ ) { // Inspect entire worklist
+1111           Node *n = worklist[i];      // Get Node on worklist
+1112           tty-&gt;print(&quot; %d&quot;, n-&gt;_idx);
+1113         }
+1114         tty-&gt;cr();
+1115       }
+1116     }
+1117 
+1118 #endif
+1119     if( n-&gt;is_MachCall() ) {
+1120       MachCallNode *mcall = n-&gt;as_MachCall();
+1121       phi_cnt = sched_call(block, phi_cnt, worklist, ready_cnt, mcall, next_call);
+1122       continue;
+1123     }
+1124 
+1125     if (n-&gt;is_Mach() &amp;&amp; n-&gt;as_Mach()-&gt;has_call()) {
+1126       RegMask regs;
+1127       regs.Insert(_matcher.c_frame_pointer());
+1128       regs.OR(n-&gt;out_RegMask());
+1129 
+1130       MachProjNode *proj = new MachProjNode( n, 1, RegMask::Empty, MachProjNode::fat_proj );
+1131       map_node_to_block(proj, block);
+1132       block-&gt;insert_node(proj, phi_cnt++);
+1133 
+1134       add_call_kills(proj, regs, _matcher._c_reg_save_policy, false);
+1135     }
+1136 
+1137     // Children are now all ready
+1138     for (DUIterator_Fast i5max, i5 = n-&gt;fast_outs(i5max); i5 &lt; i5max; i5++) {
+1139       Node* m = n-&gt;fast_out(i5); // Get user
+1140       if (get_block_for_node(m) != block) {
+1141         continue;
+1142       }
+1143       if( m-&gt;is_Phi() ) continue;
+1144       if (m-&gt;_idx &gt;= max_idx) { // new node, skip it
+1145         assert(m-&gt;is_MachProj() &amp;&amp; n-&gt;is_Mach() &amp;&amp; n-&gt;as_Mach()-&gt;has_call(), &quot;unexpected node types&quot;);
+1146         continue;
+1147       }
+1148       int m_cnt = ready_cnt.at(m-&gt;_idx) - 1;
+1149       ready_cnt.at_put(m-&gt;_idx, m_cnt);
+1150       if( m_cnt == 0 )
+1151         worklist.push(m);
+1152     }
+1153   }
+1154 
+1155   if( phi_cnt != block-&gt;end_idx() ) {
+1156     // did not schedule all.  Retry, Bailout, or Die
+1157     if (C-&gt;subsume_loads() == true &amp;&amp; !C-&gt;failing()) {
+1158       // Retry with subsume_loads == false
+1159       // If this is the first failure, the sentinel string will &quot;stick&quot;
+1160       // to the Compile object, and the C2Compiler will see it and retry.
+1161       C-&gt;record_failure(C2Compiler::retry_no_subsuming_loads());
+1162     } else {
+1163       assert(false, &quot;graph should be schedulable&quot;);
+1164     }
+1165     // assert( phi_cnt == end_idx(), &quot;did not schedule all&quot; );
+1166     return false;
+1167   }
+1168 
+1169   if (OptoRegScheduling &amp;&amp; block_size_threshold_ok) {
+1170     _regalloc-&gt;compute_exit_block_pressure(block);
+1171     block-&gt;_reg_pressure = _regalloc-&gt;_sched_int_pressure.final_pressure();
+1172     block-&gt;_freg_pressure = _regalloc-&gt;_sched_float_pressure.final_pressure();
+1173   }
+1174 
+1175 #ifndef PRODUCT
+1176   if (trace_opto_pipelining()) {
+1177     tty-&gt;print_cr(&quot;#&quot;);
+1178     tty-&gt;print_cr(&quot;# after schedule_local&quot;);
+1179     for (uint i = 0;i &lt; block-&gt;number_of_nodes();i++) {
+1180       tty-&gt;print(&quot;# &quot;);
+1181       block-&gt;get_node(i)-&gt;fast_dump();
+1182     }
+1183     tty-&gt;print_cr(&quot;# &quot;);
+1184 
+1185     if (OptoRegScheduling &amp;&amp; block_size_threshold_ok) {
+1186       tty-&gt;print_cr(&quot;# pressure info : %d&quot;, block-&gt;_pre_order);
+1187       _regalloc-&gt;print_pressure_info(_regalloc-&gt;_sched_int_pressure, &quot;int register info&quot;);
+1188       _regalloc-&gt;print_pressure_info(_regalloc-&gt;_sched_float_pressure, &quot;float register info&quot;);
+1189     }
+1190     tty-&gt;cr();
+1191   }
+1192 #endif
+1193 
+1194   return true;
+1195 }
+1196 
+1197 //--------------------------catch_cleanup_fix_all_inputs-----------------------
+1198 static void catch_cleanup_fix_all_inputs(Node *use, Node *old_def, Node *new_def) {
+1199   for (uint l = 0; l &lt; use-&gt;len(); l++) {
+1200     if (use-&gt;in(l) == old_def) {
+1201       if (l &lt; use-&gt;req()) {
+1202         use-&gt;set_req(l, new_def);
+1203       } else {
+1204         use-&gt;rm_prec(l);
+1205         use-&gt;add_prec(new_def);
+1206         l--;
+1207       }
+1208     }
+1209   }
+1210 }
+1211 
+1212 //------------------------------catch_cleanup_find_cloned_def------------------
+1213 Node* PhaseCFG::catch_cleanup_find_cloned_def(Block *use_blk, Node *def, Block *def_blk, int n_clone_idx) {
+1214   assert( use_blk != def_blk, &quot;Inter-block cleanup only&quot;);
+1215 
+1216   // The use is some block below the Catch.  Find and return the clone of the def
+1217   // that dominates the use. If there is no clone in a dominating block, then
+1218   // create a phi for the def in a dominating block.
+1219 
+1220   // Find which successor block dominates this use.  The successor
+1221   // blocks must all be single-entry (from the Catch only; I will have
+1222   // split blocks to make this so), hence they all dominate.
+1223   while( use_blk-&gt;_dom_depth &gt; def_blk-&gt;_dom_depth+1 )
+1224     use_blk = use_blk-&gt;_idom;
+1225 
+1226   // Find the successor
+1227   Node *fixup = NULL;
+1228 
+1229   uint j;
+1230   for( j = 0; j &lt; def_blk-&gt;_num_succs; j++ )
+1231     if( use_blk == def_blk-&gt;_succs[j] )
+1232       break;
+1233 
+1234   if( j == def_blk-&gt;_num_succs ) {
+1235     // Block at same level in dom-tree is not a successor.  It needs a
+1236     // PhiNode, the PhiNode uses from the def and IT&#39;s uses need fixup.
+1237     Node_Array inputs = new Node_List();
+1238     for(uint k = 1; k &lt; use_blk-&gt;num_preds(); k++) {
+1239       Block* block = get_block_for_node(use_blk-&gt;pred(k));
+1240       inputs.map(k, catch_cleanup_find_cloned_def(block, def, def_blk, n_clone_idx));
+1241     }
+1242 
+1243     // Check to see if the use_blk already has an identical phi inserted.
+1244     // If it exists, it will be at the first position since all uses of a
+1245     // def are processed together.
+1246     Node *phi = use_blk-&gt;get_node(1);
+1247     if( phi-&gt;is_Phi() ) {
+1248       fixup = phi;
+1249       for (uint k = 1; k &lt; use_blk-&gt;num_preds(); k++) {
+1250         if (phi-&gt;in(k) != inputs[k]) {
+1251           // Not a match
+1252           fixup = NULL;
+1253           break;
+1254         }
+1255       }
+1256     }
+1257 
+1258     // If an existing PhiNode was not found, make a new one.
+1259     if (fixup == NULL) {
+1260       Node *new_phi = PhiNode::make(use_blk-&gt;head(), def);
+1261       use_blk-&gt;insert_node(new_phi, 1);
+1262       map_node_to_block(new_phi, use_blk);
+1263       for (uint k = 1; k &lt; use_blk-&gt;num_preds(); k++) {
+1264         new_phi-&gt;set_req(k, inputs[k]);
+1265       }
+1266       fixup = new_phi;
+1267     }
+1268 
+1269   } else {
+1270     // Found the use just below the Catch.  Make it use the clone.
+1271     fixup = use_blk-&gt;get_node(n_clone_idx);
+1272   }
+1273 
+1274   return fixup;
+1275 }
+1276 
+1277 //--------------------------catch_cleanup_intra_block--------------------------
+1278 // Fix all input edges in use that reference &quot;def&quot;.  The use is in the same
+1279 // block as the def and both have been cloned in each successor block.
+1280 static void catch_cleanup_intra_block(Node *use, Node *def, Block *blk, int beg, int n_clone_idx) {
+1281 
+1282   // Both the use and def have been cloned. For each successor block,
+1283   // get the clone of the use, and make its input the clone of the def
+1284   // found in that block.
+1285 
+1286   uint use_idx = blk-&gt;find_node(use);
+1287   uint offset_idx = use_idx - beg;
+1288   for( uint k = 0; k &lt; blk-&gt;_num_succs; k++ ) {
+1289     // Get clone in each successor block
+1290     Block *sb = blk-&gt;_succs[k];
+1291     Node *clone = sb-&gt;get_node(offset_idx+1);
+1292     assert( clone-&gt;Opcode() == use-&gt;Opcode(), &quot;&quot; );
+1293 
+1294     // Make use-clone reference the def-clone
+1295     catch_cleanup_fix_all_inputs(clone, def, sb-&gt;get_node(n_clone_idx));
+1296   }
+1297 }
+1298 
+1299 //------------------------------catch_cleanup_inter_block---------------------
+1300 // Fix all input edges in use that reference &quot;def&quot;.  The use is in a different
+1301 // block than the def.
+1302 void PhaseCFG::catch_cleanup_inter_block(Node *use, Block *use_blk, Node *def, Block *def_blk, int n_clone_idx) {
+1303   if( !use_blk ) return;        // Can happen if the use is a precedence edge
+1304 
+1305   Node *new_def = catch_cleanup_find_cloned_def(use_blk, def, def_blk, n_clone_idx);
+1306   catch_cleanup_fix_all_inputs(use, def, new_def);
+1307 }
+1308 
+1309 //------------------------------call_catch_cleanup-----------------------------
+1310 // If we inserted any instructions between a Call and his CatchNode,
+1311 // clone the instructions on all paths below the Catch.
+1312 void PhaseCFG::call_catch_cleanup(Block* block) {
+1313 
+1314   // End of region to clone
+1315   uint end = block-&gt;end_idx();
+1316   if( !block-&gt;get_node(end)-&gt;is_Catch() ) return;
+1317   // Start of region to clone
+1318   uint beg = end;
+1319   while(!block-&gt;get_node(beg-1)-&gt;is_MachProj() ||
+1320         !block-&gt;get_node(beg-1)-&gt;in(0)-&gt;is_MachCall() ) {
+1321     beg--;
+1322     assert(beg &gt; 0,&quot;Catch cleanup walking beyond block boundary&quot;);
+1323   }
+1324   // Range of inserted instructions is [beg, end)
+1325   if( beg == end ) return;
+1326 
+1327   // Clone along all Catch output paths.  Clone area between the &#39;beg&#39; and
+1328   // &#39;end&#39; indices.
+1329   for( uint i = 0; i &lt; block-&gt;_num_succs; i++ ) {
+1330     Block *sb = block-&gt;_succs[i];
+1331     // Clone the entire area; ignoring the edge fixup for now.
+1332     for( uint j = end; j &gt; beg; j-- ) {
+1333       Node *clone = block-&gt;get_node(j-1)-&gt;clone();
+1334       sb-&gt;insert_node(clone, 1);
+1335       map_node_to_block(clone, sb);
+1336       if (clone-&gt;needs_anti_dependence_check()) {
+1337         insert_anti_dependences(sb, clone);
+1338       }
+1339     }
+1340   }
+1341 
+1342 
+1343   // Fixup edges.  Check the def-use info per cloned Node
+1344   for(uint i2 = beg; i2 &lt; end; i2++ ) {
+1345     uint n_clone_idx = i2-beg+1; // Index of clone of n in each successor block
+1346     Node *n = block-&gt;get_node(i2);        // Node that got cloned
+1347     // Need DU safe iterator because of edge manipulation in calls.
+1348     Unique_Node_List* out = new Unique_Node_List();
+1349     for (DUIterator_Fast j1max, j1 = n-&gt;fast_outs(j1max); j1 &lt; j1max; j1++) {
+1350       out-&gt;push(n-&gt;fast_out(j1));
+1351     }
+1352     uint max = out-&gt;size();
+1353     for (uint j = 0; j &lt; max; j++) {// For all users
+1354       Node *use = out-&gt;pop();
+1355       Block *buse = get_block_for_node(use);
+1356       if( use-&gt;is_Phi() ) {
+1357         for( uint k = 1; k &lt; use-&gt;req(); k++ )
+1358           if( use-&gt;in(k) == n ) {
+1359             Block* b = get_block_for_node(buse-&gt;pred(k));
+1360             Node *fixup = catch_cleanup_find_cloned_def(b, n, block, n_clone_idx);
+1361             use-&gt;set_req(k, fixup);
+1362           }
+1363       } else {
+1364         if (block == buse) {
+1365           catch_cleanup_intra_block(use, n, block, beg, n_clone_idx);
+1366         } else {
+1367           catch_cleanup_inter_block(use, buse, n, block, n_clone_idx);
+1368         }
+1369       }
+1370     } // End for all users
+1371 
+1372   } // End of for all Nodes in cloned area
+1373 
+1374   // Remove the now-dead cloned ops
+1375   for(uint i3 = beg; i3 &lt; end; i3++ ) {
+1376     block-&gt;get_node(beg)-&gt;disconnect_inputs(NULL, C);
+1377     block-&gt;remove_node(beg);
+1378   }
+1379 
+1380   // If the successor blocks have a CreateEx node, move it back to the top
+1381   for(uint i4 = 0; i4 &lt; block-&gt;_num_succs; i4++ ) {
+1382     Block *sb = block-&gt;_succs[i4];
+1383     uint new_cnt = end - beg;
+1384     // Remove any newly created, but dead, nodes.
+1385     for( uint j = new_cnt; j &gt; 0; j-- ) {
+1386       Node *n = sb-&gt;get_node(j);
+1387       if (n-&gt;outcnt() == 0 &amp;&amp;
+1388           (!n-&gt;is_Proj() || n-&gt;as_Proj()-&gt;in(0)-&gt;outcnt() == 1) ){
+1389         n-&gt;disconnect_inputs(NULL, C);
+1390         sb-&gt;remove_node(j);
+1391         new_cnt--;
+1392       }
+1393     }
+1394     // If any newly created nodes remain, move the CreateEx node to the top
+1395     if (new_cnt &gt; 0) {
+1396       Node *cex = sb-&gt;get_node(1+new_cnt);
+1397       if( cex-&gt;is_Mach() &amp;&amp; cex-&gt;as_Mach()-&gt;ideal_Opcode() == Op_CreateEx ) {
+1398         sb-&gt;remove_node(1+new_cnt);
+1399         sb-&gt;insert_node(cex, 1);
+1400       }
+1401     }
+1402   }
+1403 }
+<a name="2" id="anc2"></a><b style="font-size: large; color: red">--- EOF ---</b>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+</pre>
+<input id="eof" value="2" type="hidden" />
+</body>
+</html>
