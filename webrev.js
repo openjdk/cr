@@ -1032,7 +1032,7 @@ async function renderCdiff(state) {
 	body().style.margin = "8px";
 	const index = state.index;
 	if (state.cache.cdiffs[index] !== null) {
-		body().append(state.cache.udiffs[index]);
+		body().append(state.cache.cdiffs[index]);
 		return;
 	}
 
