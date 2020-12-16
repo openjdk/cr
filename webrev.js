@@ -921,7 +921,7 @@ async function renderNew(state) {
 	}
 	const lines = await state.head.content[index];
 	const pre = create("pre");
-	pre.innerHTML = addLineNumbers(lines).join('\n');
+	pre.append(addLineNumbers(lines).join('\n'));
 	state.cache["new"][index] = pre;
 	body().append(pre);
 }
@@ -935,7 +935,7 @@ async function renderOld(state) {
 	}
 	const lines = await state.base.content[index];
 	const pre = create("pre");
-	pre.innerHTML = addLineNumbers(lines).join('\n');
+	pre.append(addLineNumbers(lines).join('\n'));
 	state.cache.old[index] = pre;
 	body().append(pre);
 }
