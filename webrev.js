@@ -479,11 +479,12 @@ function framesScrollToPrevHunk() {
 
 function framesScrollToNextHunk() {
 	state.hunk = state.hunk + 1;
-	if (state.hunk > state.hunks.length + 1) {
-		state.hunk = state.hunks.length + 1;
+	const eof = hunks(state).length + 1;
+	if (state.hunk > eof) {
+		state.hunk = eof;
 	}
 
-	const display = state.hunk === (state.hunks.length + 1) ? "EOF" : String(state.hunk);
+	const display = state.hunk === eof ? "EOF" : String(state.hunk);
 	get("display").value = display;
 
 	const lhs = get("lhs");
