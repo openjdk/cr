@@ -1129,12 +1129,17 @@ async function renderSdiff(state) {
         const onlyAdditions = hasOnlyAdditions(hunk, context);
         let srcIndex = 0;
         let dstIndex = 0;
+        const maxSrcLinenoWidth = String(hunk.src.start + hunk.src.lines.length).length;
+        const maxDstLinenoWidth = String(hunk.dst.start + hunk.dst.lines.length).length;
+
         while (hunk.src.lines[srcIndex].startsWith(" ") && hunk.dst.lines[dstIndex].startsWith(" ")) {
             const line = hunk.src.lines[srcIndex];
             const lhsLineno = String(hunk.src.start + srcIndex);
+            const lhsPadding = maxSrcLinenoWidth - lhsLineno.length;
             const rhsLineno = String(hunk.dst.start + dstIndex);
-            lhsContent.append(lhsLineno, " ", line.substring(1), "\n");
-            rhsContent.append(rhsLineno, " ", line.substring(1), "\n");
+            const rhsPadding = maxDstLinenoWidth - rhsLineno.length;
+            lhsContent.append(" ".repeat(lhsPadding), lhsLineno, " ", line.substring(1), "\n");
+            rhsContent.append(" ".repeat(rhsPadding), rhsLineno, " ", line.substring(1), "\n");
             srcIndex++;
             dstIndex++;
         }
@@ -1145,7 +1150,8 @@ async function renderSdiff(state) {
                 const span = create("span");
                 span.className = onlyDeletions ? "line-removed" : "line-modified";
                 const lineno = String(hunk.src.start + srcIndex);
-                span.append(lineno, " ", line.substring(1), "\n");
+                const padding = maxSrcLinenoWidth - lineno.length;
+                span.append(" ".repeat(padding), lineno, " ", line.substring(1), "\n");
                 lhsContent.append(span);
                 srcIndex++;
                 addedSrcLines++;
@@ -1156,7 +1162,8 @@ async function renderSdiff(state) {
                 const span = create("span");
                 span.className = onlyAdditions ? "line-added" : "line-modified";
                 const lineno = String(hunk.dst.start + dstIndex);
-                span.append(lineno, " ", line.substring(1), "\n");
+                const padding = maxDstLinenoWidth - lineno.length;
+                span.append(" ".repeat(padding), lineno, " ", line.substring(1), "\n");
                 rhsContent.append(span);
                 dstIndex++;
                 addedDstLines++;
@@ -1174,9 +1181,11 @@ async function renderSdiff(state) {
                 const line = hunk.src.lines[srcIndex];
                 const span = create("span");
                 const lhsLineno = String(hunk.src.start + srcIndex);
+                const lhsPadding = maxSrcLinenoWidth - lhsLineno.length;
                 const rhsLineno = String(hunk.dst.start + dstIndex);
-                lhsContent.append(lhsLineno, " ", line.substring(1), "\n");
-                rhsContent.append(rhsLineno, " ", line.substring(1), "\n");
+                const rhsPadding = maxDstLinenoWidth - rhsLineno.length;
+                lhsContent.append(" ".repeat(lhsPadding), lhsLineno, " ", line.substring(1), "\n");
+                rhsContent.append(" ".repeat(rhsPadding), rhsLineno, " ", line.substring(1), "\n");
                 srcIndex++;
                 dstIndex++;
             }
