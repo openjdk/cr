@@ -227,41 +227,42 @@ async function renderIndex(state) {
     const files = state.comparison.files;
     for (let i = 0; i < files.length; i++) {
         const file = files[i];
+        const filename = file.filename;
         const p = create("p");
         const code = create("code");
         if (file.status === "modified" || file.status === "copied" || file.status === "renamed") {
             const cdiff = create("a");
-            cdiff.href = "#cdiff-" + i;
+            cdiff.href = "#cdiff-" + i + "-" + filename;
             cdiff.innerHTML = "Cdiffs";
             code.append(cdiff, " ");
 
             const udiff = create("a");
-            udiff.href = "#udiff-" + i;
+            udiff.href = "#udiff-" + i + "-" + filename;
             udiff.innerHTML = "Udiffs";
             code.append(udiff, " ");
 
             const sdiff = create("a");
-            sdiff.href = "#sdiff-" + i;
+            sdiff.href = "#sdiff-" + i + "-" + filename;
             sdiff.innerHTML = "Sdiffs";
             code.append(sdiff, " ");
 
             const frames = create("a");
-            frames.href = "#frames-" + i;
+            frames.href = "#frames-" + i + "-" + filename;
             frames.innerHTML = "Frames";
             code.append(frames, " ");
 
             const oldFile = create("a");
-            oldFile.href = "#old-" + i;
+            oldFile.href = "#old-" + i + "-" + filename;
             oldFile.innerHTML = "Old";
             code.append(oldFile, " ");
 
             const newFile = create("a");
-            newFile.href = "#new-" + i;
+            newFile.href = "#new-" + i + "-" + filename;
             newFile.innerHTML = "New";
             code.append(newFile, " ");
 
             const patchFile = create("a");
-            patchFile.href = "#patch-" + i;
+            patchFile.href = "#patch-" + i + "-" + filename;
             patchFile.innerHTML = "Patch";
             code.append(patchFile, " ");
 
@@ -290,12 +291,12 @@ async function renderIndex(state) {
             code.append("--- ");
 
             const newFile = create("a");
-            newFile.href = "#new-" + i;
+            newFile.href = "#new-" + i + "-" + filename;
             newFile.innerHTML = "New";
             code.append(newFile, " ");
 
             const patchFile = create("a");
-            patchFile.href = "#patch-" + i;
+            patchFile.href = "#patch-" + i + "-" + filename;
             patchFile.innerHTML = "Patch";
             code.append(patchFile, " ");
 
@@ -318,14 +319,14 @@ async function renderIndex(state) {
             code.append("------ ");
 
             const oldFile = create("a");
-            oldFile.href = "#old-" + i;
+            oldFile.href = "#old-" + i + "-" + filename;
             oldFile.innerHTML = "Old";
             code.append(oldFile, " ");
 
             code.append("--- ");
 
             const patchFile = create("a");
-            patchFile.href = "#patch-" + i;
+            patchFile.href = "#patch-" + i + "-" + filename;
             patchFile.innerHTML = "Patch";
             code.append(patchFile, " ");
 
@@ -393,10 +394,12 @@ function createNavigation(view, index) {
     const files = state.comparison.files;
     const center = create("center");
     let prevModified = -1;
+    let prevFilename = "";
     for (let i = index - 1; i >= 0; i--) {
         const s = files[i].status;
         if (s === "modified" || s === "renamed" || s === "copied") {
             prevModified = i;
+            prevFilename = files[i].filename;
             break;
         }
     }
@@ -407,7 +410,7 @@ function createNavigation(view, index) {
     } else {
         const prev = create("a");
         prev.innerHTML = "&lt; prev";
-        prev.href = "#" + view + "-" + prevModified;
+        prev.href = "#" + view + "-" + prevModified + "-" + prevFilename;
         center.append(prev);
     }
 
@@ -423,10 +426,12 @@ function createNavigation(view, index) {
     center.append(" ", indexLink, " ");
 
     let nextModified = -1;
+    let nextFilename = "";
     for (let i = index + 1; i < files.length; i++) {
         const s = files[i].status;
         if (s === "modified" || s === "copied" || s === "renamed") {
             nextModified = i;
+            nextFilename = files[i].filename;
             break;
         }
     }
@@ -436,7 +441,7 @@ function createNavigation(view, index) {
         center.append(next);
     } else {
         const next = create("a");
-        next.href = "#" + view + "-" + nextModified;
+        next.href = "#" + view + "-" + nextModified + "-" + nextFilename;
         next.innerHTML = "next &gt;";
         center.append(next);
     }
