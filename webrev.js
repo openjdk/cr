@@ -55,11 +55,10 @@ function render(state) {
     body().removeEventListener("keydown", framesOnKeyDown);
     body().style.margin = 0;
     if (state.view !== "index") {
-        if (state.head.content[state.index] === null) {
-            fetchFileAtHead(state);
-        }
-        if (state.base.content[state.index] === null) {
-            fetchFileAtBase(state);
+        if (state.head.content[state.index] === null || state.base.content[state.index] === null) {
+            const content = fetchFileContent(state);
+            state.head.content[state.index] = content.head;
+            state.base.content[state.index] = content.base;
         }
     }
     if (state.view === "index") {
@@ -1363,6 +1362,38 @@ function removeContext(patch) {
     return hunks;
 }
 
+function reverse(hunks) {
+    const reversed = new Array();
+    for (let hunk of hunks) {
+        var srcLines = hunk.dst.lines.map(l => '-' + l.substring(1));
+        var dstLines = hunk.src.lines.map(l => '+' + l.substring(1));
+        reversed.push(new Hunk(hunk.dst.start, hunk.dst.lines, hunk.src.start, hunk.src.lines));
+    }
+    return reversed;
+}
+
+function apply(hunks, lines) {
+    const newLines = new Array();
+
+    let last = 1;
+    for (let i = 0; i < hunks.length; i++) {
+        const hunk = hunks[i];
+        for (let j = last; j < hunk.src.start; j++) {
+            newLines.push(lines[j - 1]);
+        }
+        for (let line of hunk.dst.lines) {
+            newLines.push(line.substring(1));
+        }
+        last = hunk.src.start + hunk.src.lines.length;
+    }
+
+    for (let i = last; i <= lines.length; i++) {
+        newLines.push(lines[i - 1]);
+    }
+
+    return newLines;
+}
+
 function renderFromFragment(fragment) {
     if (fragment === "") {
         state.view = "index";
@@ -1385,13 +1416,15 @@ async function fetchMetadata(repo, prId, range) {
             });
 }
 
-async function fetchComparison(repo, prId, range, metadata) {
+async function fetchComparison(repo, prId, range, metadataPromise) {
     const raw = "https://raw.githubusercontent.com/openjdk/webrevs";
     const ref = "master";
-    const api = "https://api.github.com/repos/" + metadata.base.repo.full_name + "/compare/" +
-            metadata.base.sha + "..." + metadata.head.sha;
     return fetch(raw + "/" + ref + "/" + repo + "/" + prId + "/" + range + "/comparison.json")
-            .then(r => r.ok ? r : fetch(api))
+            .then(r => r.ok ?
+                r :
+                metadataPromise.then(m => fetch("https://api.github.com/repos/" + m.base.repo.full_name + "/compare/" +
+                                                m.base.sha + "..." + m.head.sha)))
+
             .then(r => r.json());
 }
 
@@ -1400,6 +1433,16 @@ async function fetchCommits(repo, prId, range) {
     const raw = "https://raw.githubusercontent.com/openjdk/webrevs";
     const ref = "master";
     return fetch(raw + "/" + ref + "/" + repo + "/" + prId + "/" + range + "/commits.json").then(r => r.json());
+}
+
+function fetchFileContent(state) {
+    const reverseHunks = reverse(hunks(state));
+    const headContent = fetchFileAtHead(state);
+    const baseContent = headContent.then(lines => apply(reverseHunks, lines));
+    return {
+        "base": baseContent,
+        "head": headContent
+    };
 }
 
 function fetchFileAtHead(state) {
@@ -1413,23 +1456,7 @@ function fetchFileAtHead(state) {
     const sha = state.metadata.head.sha;
     const full_name = state.metadata.head.repo.full_name;
     const url = raw_url + "/" + full_name + "/" + sha + "/" + file.filename;
-    state.head.content[index] = fetch(url).then(r => r.text()).then(text => text.split('\n'));
-}
-
-function fetchFileAtBase(state) {
-    const index = state.index;
-    const file = state.comparison.files[index];
-    if (file.status === "added") {
-        return;
-    }
-
-    const raw_url = "https://raw.githubusercontent.com";
-    const sha = state.metadata.base.sha;
-    const full_name = state.metadata.base.repo.full_name;
-    const filename = file.status === "copied" || file.status === "renamed" ?
-        file.previous_filename : file.filename;
-    const url = raw_url + "/" + full_name + "/" + sha + "/" + filename;
-    state.base.content[index] = fetch(url).then(r => r.text()).then(text => text.split('\n'));
+    return fetch(url).then(r => r.text()).then(text => text.split('\n'));
 }
 
 async function init() {
@@ -1440,44 +1467,21 @@ async function init() {
 
     document.title = "webrev - " + repo + "/" + prId + "/" + range;
 
-    const metadata = await fetchMetadata(repo, prId, range);
-    const comparison = await fetchComparison(repo, prId, range, metadata);
+    const metadata = fetchMetadata(repo, prId, range);
+    const comparison = fetchComparison(repo, prId, range, metadata);
+    const commits = fetchCommits(repo, prId, range);
 
-    state.metadata = metadata;
-    state.comparison = comparison;
-    state.commits = fetchCommits(repo, prId, range);
+    state.metadata = await metadata;
+    state.comparison = await comparison;
+    state.commits = await commits;
 
     const files = state.comparison.files;
     const raw_url = "https://raw.githubusercontent.com";
 
     state.head.content = new Array(files.length);
     state.head.content.fill(null);
-    const num_files_to_prefetch = Math.min(files.length, 25);
-    const head_sha = state.metadata.head.sha;
-    const head_full_name = state.metadata.head.repo.full_name;
-    for (let i = 0; i < num_files_to_prefetch; i++) {
-        if (files[i].status === "deleted") {
-            continue;
-        } else {
-            const url = raw_url + "/" + head_full_name + "/" + head_sha + "/" + files[i].filename;
-            state.head.content[i] = fetch(url).then(r => r.text()).then(text => text.split('\n'));
-        }
-    }
     state.base.content = new Array(files.length);
     state.base.content.fill(null);
-    const base_sha = state.metadata.base.sha;
-    const base_full_name = state.metadata.base.repo.full_name;
-    for (let i = 0; i < num_files_to_prefetch; i++) {
-        const file = files[i];
-        if (file.status === "added") {
-            continue;
-        } else {
-            const filename = file.status === "copied" || file.status === "renamed" ?
-                file.previous_filename : file.filename;
-            const url = raw_url + "/" + base_full_name + "/" + base_sha + "/" + filename;
-            state.base.content[i] = fetch(url).then(r => r.text()).then(text => text.split('\n'));
-        }
-    }
 
     state.cache.cdiffs = new Array(files.length);
     state.cache.cdiffs.fill(null);
@@ -1499,6 +1503,15 @@ async function init() {
 
     state.cache.patch = new Array(files.length);
     state.cache.patch.fill(null);
+
+    // Pre-fetch base and head content for up to 25 files
+    for (let i = 0; i < Math.min(files.length, 25); i++) {
+        state.index = i;
+        const content = fetchFileContent(state);
+        state.head.content[i] = content.head;
+        state.base.content[i] = content.base;
+    }
+    state.index = -1;
 }
 
 const setup = init();
